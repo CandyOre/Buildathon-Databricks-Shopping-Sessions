@@ -74,19 +74,86 @@ pub struct Event {
 
 const EXTENDED: u32 = 1 << 31;
 
+#[derive(Clone, Copy)]
 struct EntryId {
     id: u64,
     ingested: u32,
     position: u32,
 }
 
-#[derive(Default)]
-struct IdRun {
-    rows: Vec<EntryId>,
+// A chunk owns one backing allocation for the common prefixes of all shards.
+// Only a shard that outgrows its prefix allocates a separate continuation.
+// T is Copy, so uninitialized padding never contains values requiring Drop.
+struct ShardSlab<T: Copy> {
+    slots: Vec<std::mem::MaybeUninit<T>>,
+    stride: usize,
+    used: [usize; SHARDS],
+    overflow: [Vec<T>; SHARDS],
+}
+
+impl<T: Copy> ShardSlab<T> {
+    fn new(stride: usize) -> Self {
+        // A zero capacity hint is valid for an empty input. chunks_exact_mut
+        // still needs a positive stride to produce one slice per shard.
+        let stride = stride.max(1);
+        let capacity = stride
+            .checked_mul(SHARDS)
+            .expect("shard slab capacity overflow");
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, std::mem::MaybeUninit::uninit);
+        Self {
+            slots,
+            stride,
+            used: [0; SHARDS],
+            overflow: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, shard: usize, row: T) -> u32 {
+        let index = self.used[shard];
+        if index < self.stride {
+            self.slots[shard * self.stride + index].write(row);
+        } else {
+            self.overflow[shard].push(row);
+        }
+        self.used[shard] += 1;
+        index as u32
+    }
+
+    fn fragment(&self, shard: usize) -> (&[T], &[T]) {
+        let start = shard * self.stride;
+        let count = self.used[shard].min(self.stride);
+        // push writes each lane before advancing used. Padding is never read.
+        let raw = &self.slots[start..start + count];
+        let prefix = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<T>(), raw.len()) };
+        (prefix, &self.overflow[shard])
+    }
+
+    fn fragments_mut(&mut self) -> impl Iterator<Item = (&mut [T], &mut [T])> {
+        let stride = self.stride;
+        self.slots
+            .chunks_exact_mut(stride)
+            .zip(self.overflow.iter_mut())
+            .zip(&self.used)
+            .map(move |((slots, overflow), &count)| {
+                let count = count.min(stride);
+                // Every yielded slice belongs to a different shard. Its prefix
+                // is initialized by push; its continuation is an ordinary Vec.
+                let prefix = unsafe {
+                    std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<T>(), count)
+                };
+                (prefix, overflow.as_mut_slice())
+            })
+    }
+}
+
+struct ChunkIds {
+    rows: ShardSlab<EntryId>,
     far_ingests: Vec<i64>,
 }
 
-impl IdRun {
+impl ChunkIds {
     fn push(&mut self, id: u64, ingested: i64, position: u32, origin_seconds: i64) {
         let offset = (ingested.div_euclid(1000) - origin_seconds) as u64;
         let ingested = if offset < u64::from(EXTENDED) {
@@ -96,11 +163,35 @@ impl IdRun {
             self.far_ingests.push(ingested);
             EXTENDED | index
         };
-        self.rows.push(EntryId {
-            id,
-            ingested,
-            position,
-        });
+        self.rows.push(
+            id as usize % SHARDS,
+            EntryId {
+                id,
+                ingested,
+                position,
+            },
+        );
+    }
+
+    fn run(&self, shard: usize) -> IdRun<'_> {
+        let (prefix, overflow) = self.rows.fragment(shard);
+        IdRun {
+            prefix,
+            overflow,
+            far_ingests: &self.far_ingests,
+        }
+    }
+}
+
+struct IdRun<'a> {
+    prefix: &'a [EntryId],
+    overflow: &'a [EntryId],
+    far_ingests: &'a [i64],
+}
+
+impl IdRun<'_> {
+    fn rows(&self) -> impl Iterator<Item = &EntryId> {
+        self.prefix.iter().chain(self.overflow)
     }
 
     fn ingest_time(&self, value: u32, origin_seconds: i64) -> i64 {
@@ -112,22 +203,19 @@ impl IdRun {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PersonEvent {
     person: u32,
     time: u32,
 }
 
-#[derive(Default)]
-struct PersonRun {
-    rows: Vec<PersonEvent>,
+struct ChunkPeople {
+    rows: ShardSlab<PersonEvent>,
     extra: Vec<(Event, Option<Purchase>)>,
 }
 
-impl PersonRun {
+impl ChunkPeople {
     fn push(&mut self, person: u32, time: i64, purchase: Option<Purchase>, start: i64) -> u32 {
-        // Each run belongs to one 4 MiB input chunk; a position plus a shard
-        // index fits in 32 bits even when every byte ends a row.
-        let at = self.rows.len() as u32;
         let offset = time.wrapping_sub(start) as u64;
         let row = if person < EXTENDED && offset <= u64::from(u32::MAX) && purchase.is_none() {
             PersonEvent {
@@ -149,15 +237,37 @@ impl PersonRun {
                 time: index,
             }
         };
-        self.rows.push(row);
-        at * SHARDS as u32 + person % SHARDS as u32
+        let shard = person as usize % SHARDS;
+        // Chunk::scan owns only records starting in its 4 MiB byte range.
+        // Even if a final record crosses many chunks, this index is below
+        // 2^22, so the encoded position is below 2^29 for SHARDS = 128.
+        self.rows.push(shard, row) * SHARDS as u32 + shard as u32
+    }
+}
+
+struct PersonRun<'a> {
+    prefix: &'a mut [PersonEvent],
+    overflow: &'a mut [PersonEvent],
+    extra: &'a [(Event, Option<Purchase>)],
+}
+
+impl PersonRun<'_> {
+    fn rows(&self) -> impl Iterator<Item = &PersonEvent> {
+        self.prefix.iter().chain(self.overflow.iter())
+    }
+
+    fn at(&mut self, index: usize) -> &mut PersonEvent {
+        if index < self.prefix.len() {
+            &mut self.prefix[index]
+        } else {
+            &mut self.overflow[index - self.prefix.len()]
+        }
     }
 }
 
 pub struct Candidates {
     compact_times: bool,
-    by_id: Vec<Vec<IdRun>>,
-    by_person: Vec<Vec<PersonRun>>,
+    blocks: Vec<(ChunkIds, ChunkPeople)>,
     start: i64,
     origin_seconds: i64,
 }
@@ -202,8 +312,17 @@ pub fn read_events(
     let parsed: Vec<_> = chunks(&data.join("events"))?
         .into_par_iter()
         .map_init(PersonCache::default, |people, chunk| {
-            let mut id_runs = shards::<IdRun>();
-            let mut person_runs = shards::<PersonRun>();
+            // Approximate only the backing capacity. Arbitrary CSV lengths and
+            // shard skew are handled by the exact per-shard continuation.
+            let stride = chunk.byte_len().div_ceil(70 * SHARDS) + 8;
+            let mut id_rows = ChunkIds {
+                rows: ShardSlab::new(stride),
+                far_ingests: Vec::new(),
+            };
+            let mut people_rows = ChunkPeople {
+                rows: ShardSlab::new(stride),
+                extra: Vec::new(),
+            };
             chunk.scan_parsed(|[id, user, ts, ingested, kind, product, price]| {
                 if id.is_empty() {
                     return;
@@ -215,7 +334,6 @@ pub fn read_events(
                 // by an odd number. Using the mixed value as the ID stays exact.
                 let mixed = (id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 let id = mixed ^ (mixed >> 31);
-                let shard = id as usize % SHARDS;
                 let mut valid = || {
                     if user.is_empty() || product.is_empty() {
                         return None;
@@ -233,8 +351,7 @@ pub fn read_events(
                             }
                             let category = dimensions
                                 .products
-                                .get(text(product))
-                                .copied()
+                                .lookup(product)
                                 .unwrap_or(dimensions.unknown_category);
                             Some(Purchase {
                                 category,
@@ -251,32 +368,21 @@ pub fn read_events(
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
                 let position = valid().map_or(u32::MAX, |(time, person, purchase)| {
-                    person_runs[person as usize % SHARDS].push(person, time, purchase, window.start)
+                    people_rows.push(person, time, purchase, window.start)
                 });
-                id_runs[shard].push(id, ingested, position, origin_seconds);
+                id_rows.push(id, ingested, position, origin_seconds);
             })?;
-            Ok::<_, anyhow::Error>((id_runs, person_runs))
+            Ok::<_, anyhow::Error>((id_rows, people_rows))
         })
         .collect::<Result<_>>()?;
 
-    let mut by_id = shards::<Vec<IdRun>>();
-    let mut by_person = shards::<Vec<PersonRun>>();
-    for (ids, people) in parsed {
-        for (to, run) in by_id.iter_mut().zip(ids) {
-            to.push(run);
-        }
-        for (to, run) in by_person.iter_mut().zip(people) {
-            to.push(run);
-        }
-    }
     Ok(Candidates {
         compact_times: window
             .end
             .checked_sub(window.start)
             .and_then(|v| u32::try_from(v).ok())
             .is_some(),
-        by_id,
-        by_person,
+        blocks: parsed,
         start: window.start,
         origin_seconds,
     })
@@ -284,14 +390,17 @@ pub fn read_events(
 
 // A bucket hit proves an ID is unique if no other row hit that bucket. Only
 // repeated buckets need exact equality checks and earliest-ingest selection.
-fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u32)> {
-    let rows: usize = fragments.iter().map(|batch| batch.rows.len()).sum();
+fn losing_positions(fragments: Vec<IdRun<'_>>, origin_seconds: i64) -> Vec<(usize, u32)> {
+    let rows: usize = fragments
+        .iter()
+        .map(|batch| batch.prefix.len() + batch.overflow.len())
+        .sum();
     let buckets = (8 * rows).next_power_of_two().max(64);
     let mut occupied = vec![0_u64; buckets / 64];
     let mut repeated = vec![0_u64; buckets / 64];
     let bucket = |id: u64| (id as usize / SHARDS) & (buckets - 1);
     for batch in &fragments {
-        for row in &batch.rows {
+        for row in batch.rows() {
             let slot = bucket(row.id);
             let bit = 1_u64 << (slot % 64);
             let seen = &mut occupied[slot / 64];
@@ -304,7 +413,7 @@ fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u
     let mut losers = Vec::new();
     let mut winners = AHashMap::<u64, (i64, usize, u32)>::new();
     for (chunk, batch) in fragments.iter().enumerate() {
-        for row in &batch.rows {
+        for row in batch.rows() {
             let slot = bucket(row.id);
             if repeated[slot / 64] & (1_u64 << (slot % 64)) != 0 {
                 let current = (
@@ -338,34 +447,58 @@ pub fn dedup_and_sessionize(
     candidates: Candidates,
     width: usize,
 ) -> (Vec<crate::aggregate::SessionBatch>, usize) {
-    let losses: Vec<_> = candidates
-        .by_id
+    let losses: Vec<_> = (0..SHARDS)
         .into_par_iter()
-        .map(|shard| losing_positions(shard, candidates.origin_seconds))
+        .map(|shard| {
+            let runs = candidates
+                .blocks
+                .iter()
+                .map(|(ids, _)| ids.run(shard))
+                .collect();
+            losing_positions(runs, candidates.origin_seconds)
+        })
         .collect();
+    let mut people: Vec<_> = candidates
+        .blocks
+        .into_iter()
+        .map(|(_, rows)| rows)
+        .collect();
+    let mut person_runs = shards::<Vec<PersonRun<'_>>>();
+    for block in &mut people {
+        let extra = block.extra.as_slice();
+        for (to, (prefix, overflow)) in person_runs.iter_mut().zip(block.rows.fragments_mut()) {
+            to.push(PersonRun {
+                prefix,
+                overflow,
+                extra,
+            });
+        }
+    }
     let mut by_person = shards::<Vec<(usize, usize)>>();
     for loss in losses {
         for (chunk, position) in loss {
             by_person[position as usize % SHARDS].push((chunk, position as usize / SHARDS));
         }
     }
-    let events: Vec<_> = candidates
-        .by_person
+    let events: Vec<_> = person_runs
         .into_par_iter()
         .zip(by_person)
         .enumerate()
         .map(|(shard, (mut fragments, losers))| {
-            let size: usize = fragments.iter().map(|run| run.rows.len()).sum();
+            let size: usize = fragments
+                .iter()
+                .map(|run| run.prefix.len() + run.overflow.len())
+                .sum();
             let length = size - losers.len();
             for (chunk, position) in losers {
-                fragments[chunk].rows[position].person = INVALID_PERSON;
+                fragments[chunk].at(position).person = INVALID_PERSON;
             }
             if candidates.compact_times && use_counting_sort(length, width) {
                 // Count each user's offsets and purchases independently. Once converted to
                 // prefix sums, these counters also serve as the next free positions.
                 let mut ends = vec![(0u32, 0u32); width];
                 for run in &fragments {
-                    for row in &run.rows {
+                    for row in run.rows() {
                         let (person, purchase) = match row.person {
                             INVALID_PERSON => continue,
                             EXTENDED => {
@@ -391,7 +524,7 @@ pub fn dedup_and_sessionize(
                 let ts_dst = times.spare_capacity_mut();
                 let sale_dst = sales.spare_capacity_mut();
                 for run in fragments {
-                    for row in run.rows {
+                    for row in run.rows() {
                         if row.person == INVALID_PERSON {
                             continue;
                         }
@@ -431,7 +564,7 @@ pub fn dedup_and_sessionize(
                 purchases: Vec::new(),
             };
             for run in fragments {
-                for row in run.rows {
+                for row in run.rows() {
                     let event = match row.person {
                         INVALID_PERSON => continue,
                         EXTENDED => {
@@ -542,7 +675,7 @@ pub fn read_clicks(
                     return;
                 }
                 let proposal = people.prepare(users, aliases, user);
-                let Some(&campaign) = dimensions.campaign_ids.get(text(campaign)) else {
+                let Some(campaign) = dimensions.campaign_ids.lookup(campaign) else {
                     return;
                 };
                 let Some(time) = calendar.parse(ts) else {
@@ -649,5 +782,78 @@ mod grouping_tests {
             actual.sort_unstable();
             assert_eq!(actual, expected);
         }
+    }
+}
+#[cfg(test)]
+mod shard_slab_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_slab_with_zero_hint_exposes_every_disjoint_shard() {
+        let mut slab = ShardSlab::<u32>::new(0);
+        assert_eq!(
+            slab.fragments_mut()
+                .filter(|(a, b)| a.is_empty() && b.is_empty())
+                .count(),
+            SHARDS
+        );
+        for i in 0..2048 {
+            slab.push(SHARDS - 1, i);
+        }
+        for (shard, (prefix, overflow)) in slab.fragments_mut().enumerate() {
+            if shard + 1 < SHARDS {
+                assert!(prefix.is_empty() && overflow.is_empty());
+            } else {
+                assert_eq!(prefix.len(), 1);
+                assert_eq!(prefix[0], 0);
+                assert!(overflow.iter().copied().eq(1..2048));
+            }
+        }
+    }
+
+    #[test]
+    fn a_skewed_chunk_keeps_offsets_across_both_sides_of_the_spill() {
+        let mut slab = ShardSlab::new(3);
+        let mut expected = vec![Vec::new(); SHARDS];
+        for i in 0..1000usize {
+            let shard = if i % 5 == 0 { i % SHARDS } else { 7 };
+            assert_eq!(slab.push(shard, i), expected[shard].len() as u32);
+            expected[shard].push(i);
+        }
+        for (shard, (prefix, overflow)) in slab.fragments_mut().enumerate() {
+            assert_eq!(prefix.len(), expected[shard].len().min(3));
+            for (value, &original) in prefix.iter_mut().chain(overflow).zip(&expected[shard]) {
+                assert_eq!(*value, original);
+                *value += 1;
+            }
+        }
+        for (shard, values) in expected.iter().enumerate() {
+            let (prefix, overflow) = slab.fragment(shard);
+            assert_eq!(
+                prefix.iter().chain(overflow).copied().collect::<Vec<_>>(),
+                values.iter().map(|value| value + 1).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn earliest_invalid_can_remove_rows_in_a_different_chunks_overflow() {
+        let mut blocks: Vec<_> = (0..2)
+            .map(|_| ChunkIds {
+                rows: ShardSlab::new(1),
+                far_ingests: Vec::new(),
+            })
+            .collect();
+        let shard = 7;
+        let a = SHARDS as u64 + shard as u64;
+        let b = 2 * SHARDS as u64 + shard as u64;
+        blocks[0].push(a, 90_000, 21, 0);
+        blocks[0].push(b, 91_000, 22, 0);
+        blocks[0].push(a, 89_000, 23, 0);
+        blocks[1].push(b, -10_000, u32::MAX, 0);
+        blocks[1].push(a, 88_000, 24, 0);
+        let mut losers = losing_positions(blocks.iter().map(|c| c.run(shard)).collect(), 0);
+        losers.sort_unstable();
+        assert_eq!(losers, vec![(0, 21), (0, 22), (0, 23)]);
     }
 }

@@ -354,12 +354,65 @@ pub fn text(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("input fields must be UTF-8")
 }
 
+pub struct DimIndex<const CAMPAIGN: bool> {
+    dense: Vec<u32>,
+    other: AHashMap<String, u32>,
+}
+impl<const C: bool> DimIndex<C> {
+    #[inline]
+    fn number(name: &[u8]) -> Option<usize> {
+        let d = if C {
+            name.strip_prefix(b"c_")?
+        } else {
+            name.strip_prefix(b"p")?
+        };
+        if d.len() > 7 || d.is_empty() || (d[0] == b'0' && d.len() != 1) {
+            return None;
+        }
+        let mut n = 0;
+        for &c in d {
+            let x = c.wrapping_sub(b'0');
+            if x > 9 {
+                return None;
+            }
+            n = n * 10 + usize::from(x);
+        }
+        Some(n)
+    }
+    #[inline]
+    pub fn lookup(&self, name: &[u8]) -> Option<u32> {
+        if let Some(id) = Self::number(name).and_then(|n| self.dense.get(n)) {
+            return (*id != u32::MAX).then_some(*id);
+        }
+        self.other.get(text(name)).copied()
+    }
+}
+impl<const C: bool> FromIterator<(String, u32)> for DimIndex<C> {
+    fn from_iter<T: IntoIterator<Item = (String, u32)>>(iter: T) -> Self {
+        let rows: Vec<_> = iter.into_iter().collect();
+        let limit = rows.len().saturating_mul(4).min(2_000_000);
+        let mut dense = Vec::new();
+        let mut other = AHashMap::default();
+        for (s, id) in rows {
+            if let Some(n) = Self::number(s.as_bytes()).filter(|&n| n <= limit) {
+                if n >= dense.len() {
+                    dense.resize(n + 1, u32::MAX);
+                }
+                dense[n] = id;
+            } else {
+                other.insert(s, id);
+            }
+        }
+        Self { dense, other }
+    }
+}
+
 pub struct Dimensions {
     pub categories: Vec<String>,
-    pub products: AHashMap<String, u32>,
+    pub products: DimIndex<false>,
     pub unknown_category: u32,
     pub campaigns: Vec<(String, String)>,
-    pub campaign_ids: AHashMap<String, u32>,
+    pub campaign_ids: DimIndex<true>,
 }
 
 impl Dimensions {
@@ -409,6 +462,7 @@ impl Dimensions {
 #[derive(Default)]
 struct NameShard {
     offset: usize,
+    keys: Vec<u64>,
     ids: AHashMap<Arc<str>, u32>,
     names: Vec<Arc<str>>,
 }
@@ -418,7 +472,8 @@ impl NameShard {
         if let Some(&id) = self.ids.get(name) {
             return id;
         }
-        let id = id_for(shard, self.offset + self.names.len());
+        let id = id_for(shard, self.offset + self.keys.len());
+        self.keys.push(EXTERNAL_NAME | self.names.len() as u64);
         let name: Arc<str> = name.into();
         self.ids.insert(name.clone(), id);
         self.names.push(name);
@@ -452,6 +507,17 @@ impl Names {
         self.shards[shard].lock().unwrap().intern(shard, name)
     }
 
+    fn register_bounded(&self, key: u64, hash: usize, limit: u64) -> Option<u32> {
+        let shard = hash % SHARDS;
+        let mut state = self.shards[shard].lock().unwrap();
+        let id = id_for(shard, state.offset + state.keys.len());
+        if u64::from(id) >= limit {
+            return None;
+        }
+        state.keys.push(key);
+        Some(id)
+    }
+
     pub fn into_names(self) -> Vec<Vec<Arc<str>>> {
         self.shards
             .into_iter()
@@ -464,7 +530,7 @@ impl Names {
             .iter()
             .map(|shard| {
                 let state = shard.lock().unwrap();
-                state.offset + state.names.len()
+                state.offset + state.keys.len()
             })
             .max()
             .unwrap_or(0)
@@ -474,24 +540,35 @@ impl Names {
         let table = self.packed.take().expect("link graph must be initialized");
         PersonNames {
             table,
-            external: self.into_names(),
+            dynamic: self
+                .shards
+                .into_iter()
+                .map(|s| {
+                    let state = s.into_inner().unwrap();
+                    (state.offset, state.keys, state.names)
+                })
+                .collect(),
         }
     }
 }
 
 pub struct PersonNames {
     table: Arc<NameTable>,
-    external: Vec<Vec<Arc<str>>>,
+    dynamic: Vec<(usize, Vec<u64>, Vec<Arc<str>>)>,
 }
 
 impl PersonNames {
     pub fn get<'a>(&'a self, id: u32, buffer: &'a mut [u8; 9]) -> &'a str {
-        if (id as usize) < self.table.entries.len() {
-            let key = self.table.entries[id as usize].key.load(Ordering::Relaxed);
+        if let Some(&key) = self.table.canonical.get(id as usize) {
             self.table.spelling(key, buffer)
         } else {
-            let external = id as usize - self.table.entries.len();
-            &self.external[external % SHARDS][external / SHARDS]
+            let (offset, keys, names) = &self.dynamic[id as usize % SHARDS];
+            let key = keys[id as usize / SHARDS - *offset];
+            if key >= EXTERNAL_NAME {
+                &names[key as u32 as usize]
+            } else {
+                unpack_name(key, buffer)
+            }
         }
     }
 }
@@ -511,19 +588,36 @@ pub fn name_for<T: AsRef<[Arc<str>]>>(names: &[T], id: u32) -> &str {
 // The high 32 bits cannot be all ones for any packed UTF-8 key.
 const EXTERNAL_NAME: u64 = 0xffff_ffff_0000_0000;
 const EMPTY_KEY: u64 = u64::MAX;
-const MAX_PROBES: usize = 16;
-
 struct Entry {
     key: AtomicU64,
-    // Starts as the slot itself. Once the graph is flattened, it is the
-    // canonical person's slot, also the public person ID.
+    // During union this is a slot. After flattening it is a dense public person ID.
     parent: AtomicU32,
 }
 
-struct NameTable {
+struct LinkGraph {
     entries: Vec<Entry>,
     external_names: Vec<Vec<Arc<str>>>,
+}
+
+struct NameTable {
+    directory: Directory,
+    canonical: Vec<u64>,
+    external_names: Vec<Vec<Arc<str>>>,
     overflow: AHashMap<u64, u32>,
+}
+
+impl NameTable {
+    fn spelling<'a>(&'a self, key: u64, buffer: &'a mut [u8; 9]) -> &'a str {
+        linked_spelling(&self.external_names, key, buffer)
+    }
+}
+
+fn linked_spelling<'a>(names: &'a [Vec<Arc<str>>], key: u64, buffer: &'a mut [u8; 9]) -> &'a str {
+    if key >= EXTERNAL_NAME {
+        name_for(names, key as u32)
+    } else {
+        unpack_name(key, buffer)
+    }
 }
 
 pub struct Aliases {
@@ -531,7 +625,167 @@ pub struct Aliases {
     external: Vec<AHashMap<Arc<str>, u32>>,
 }
 
-impl NameTable {
+// A short ASCII spelling needs 57 bits, including the U/u discriminator.
+// The lookup word is reversibly mixed. The bucket address supplies its low
+// bits, so the stored quotient and the returned dense ID share one u64.
+#[repr(align(64))]
+struct Line([AtomicU64; 8]);
+struct Directory {
+    lines: Vec<Line>,
+    address_bits: u32,
+    id_mask: u64,
+}
+const RESERVED: u64 = u64::MAX - 1;
+const CLOSED: u64 = u64::MAX - 2;
+const ASCII_WORD: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+#[inline]
+fn ascii_code(key: u64) -> Option<u64> {
+    let suffix = key & !(1 << 63);
+    if suffix & !ASCII_WORD != 0 {
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("bmi2") {
+        return Some(
+            unsafe { std::arch::x86_64::_pext_u64(suffix, ASCII_WORD) } | ((key >> 63) << 56),
+        );
+    }
+    let pairs = (suffix & 0x007f_007f_007f_007f) | ((suffix >> 1) & 0x3f80_3f80_3f80_3f80);
+    let quads = (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
+    Some((quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000) | ((key >> 63) << 56))
+}
+#[inline]
+fn mixed_word(key: u64) -> Option<u64> {
+    let x = ascii_code(key)?;
+    let x = ((x ^ (x >> 25)).wrapping_mul(0xa24b_aed4_963e_e407)) & ((1u64 << 57) - 1);
+    Some(x ^ (x >> 24))
+}
+
+impl Directory {
+    fn new(slots: usize) -> Self {
+        let buckets = slots / 8;
+        let address_bits = buckets.trailing_zeros();
+        let lines = (0..buckets)
+            .into_par_iter()
+            .map(|_| Line(std::array::from_fn(|_| AtomicU64::new(EMPTY_KEY))))
+            .collect();
+        Self {
+            lines,
+            address_bits,
+            id_mask: (1u64 << (address_bits + 6)) - 1,
+        }
+    }
+
+    #[inline]
+    fn home(&self, mixed: u64) -> usize {
+        mixed as usize & (self.lines.len() - 1)
+    }
+
+    #[inline]
+    fn alternate(&self, home: usize, quotient: u64) -> usize {
+        let delta = (quotient ^ (quotient >> 23)).wrapping_mul(0x94d0_49bb_1331_11eb) as usize;
+        home ^ ((delta | 1) & (self.lines.len() - 1))
+    }
+
+    fn locations(&self, mixed: u64) -> [(usize, u64); 2] {
+        let home = self.home(mixed);
+        let quotient = mixed >> self.address_bits;
+        let tag = quotient << (self.address_bits + 7);
+        [
+            (home, tag),
+            (self.alternate(home, quotient), tag | (self.id_mask + 1)),
+        ]
+    }
+
+    fn fill(&self, mixed: u64, id: u32) -> bool {
+        for (index, tag) in self.locations(mixed) {
+            for cell in &self.lines[index].0 {
+                if cell.load(Ordering::Relaxed) == EMPTY_KEY
+                    && cell
+                        .compare_exchange(
+                            EMPTY_KEY,
+                            tag | u64::from(id),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn lookup_line(
+        &self,
+        line: &Line,
+        tag: u64,
+        key: u64,
+        mixed: u64,
+        bytes: &[u8],
+        users: &Names,
+    ) -> Option<u32> {
+        // All real IDs are strictly below the last three values in the ID
+        // field. XOR therefore checks both the complete quotient and the
+        // sentinel exclusion with a single unsigned comparison.
+        let limit = self.id_mask - 2;
+        for cell in &line.0 {
+            loop {
+                let word = cell.load(Ordering::Acquire);
+                let id = word ^ tag;
+                if id < limit {
+                    return Some(id as u32);
+                }
+                if word <= CLOSED {
+                    break;
+                }
+                if word == RESERVED {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if cell
+                    .compare_exchange(EMPTY_KEY, RESERVED, Ordering::Acquire, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Some(id) = users.register_bounded(key, mixed as usize, limit) {
+                    cell.store(tag | u64::from(id), Ordering::Release);
+                    return Some(id);
+                }
+                cell.store(CLOSED, Ordering::Release);
+                return Some(users.intern(text(bytes)));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn lookup(
+        &self,
+        mixed: u64,
+        key: u64,
+        bytes: &[u8],
+        spill: &AHashMap<u64, u32>,
+        users: &Names,
+    ) -> u32 {
+        let home = self.home(mixed);
+        let quotient = mixed >> self.address_bits;
+        let tag = quotient << (self.address_bits + 7);
+        if let Some(id) = self.lookup_line(&self.lines[home], tag, key, mixed, bytes, users) {
+            return id;
+        }
+        let other = self.alternate(home, quotient);
+        let tag = tag | (self.id_mask + 1);
+        self.lookup_line(&self.lines[other], tag, key, mixed, bytes, users)
+            .or_else(|| spill.get(&key).copied())
+            .unwrap_or_else(|| users.intern(text(bytes)))
+    }
+}
+
+impl LinkGraph {
     fn new(edges: usize, external_names: Vec<Vec<Arc<str>>>) -> Self {
         // There are at most two distinct endpoints per edge. Leave a free slot
         // for the terminating search, even when every endpoint is distinct.
@@ -547,15 +801,6 @@ impl NameTable {
         Self {
             entries,
             external_names,
-            overflow: AHashMap::default(),
-        }
-    }
-
-    fn spelling<'a>(&'a self, key: u64, buffer: &'a mut [u8; 9]) -> &'a str {
-        if key >= EXTERNAL_NAME {
-            name_for(&self.external_names, key as u32)
-        } else {
-            unpack_name(key, buffer)
         }
     }
 
@@ -614,7 +859,8 @@ impl NameTable {
             let left_first = if a < EXTERNAL_NAME && b < EXTERNAL_NAME {
                 a < b
             } else {
-                self.spelling(a, &mut [0; 9]) < self.spelling(b, &mut [0; 9])
+                linked_spelling(&self.external_names, a, &mut [0; 9])
+                    < linked_spelling(&self.external_names, b, &mut [0; 9])
             };
             let (lower, higher) = if left_first {
                 (left, right)
@@ -633,9 +879,9 @@ impl NameTable {
         }
     }
 
-    fn finish(&mut self, hash: &RandomState) {
-        let mask = self.entries.len() - 1;
-        let beyond: Vec<_> = self
+    fn finish(self, external: &mut [AHashMap<Arc<str>, u32>], hash: &RandomState) -> NameTable {
+        // Flatten all physical parents before reading any as final roots.
+        let roots: Vec<_> = self
             .entries
             .par_iter()
             .enumerate()
@@ -646,40 +892,53 @@ impl NameTable {
                 }
                 let root = self.root(index as u32);
                 entry.parent.store(root, Ordering::Relaxed);
-                let distance = index.wrapping_sub(hash.hash_one(key) as usize) & mask;
-                (distance >= MAX_PROBES).then_some((key, root))
+                (root as usize == index).then_some((index, key))
             })
             .collect();
-        self.overflow = beyond.into_iter().collect();
-    }
+        let mut dense = vec![0u32; self.entries.len()];
+        let canonical: Vec<_> = roots
+            .into_iter()
+            .enumerate()
+            .map(|(id, (slot, key))| {
+                dense[slot] = id as u32;
+                key
+            })
+            .collect();
 
-    fn resolve(&self, key: u64, hash: usize, bytes: &[u8], users: &Names) -> u32 {
-        let mask = self.entries.len() - 1;
-        for step in 0..MAX_PROBES {
-            let slot = &self.entries[hash.wrapping_add(step) & mask];
-            let stored = slot.key.load(Ordering::Relaxed);
-            if stored == key {
-                return slot.parent.load(Ordering::Relaxed);
-            }
-            if stored == EMPTY_KEY {
-                // Keys never move. Every link in overflow already had a full
-                // probe range at construction, so this spelling is unlinked.
-                match slot.key.compare_exchange(
-                    EMPTY_KEY,
-                    key,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return slot.parent.load(Ordering::Relaxed),
-                    Err(raced) if raced == key => return slot.parent.load(Ordering::Relaxed),
-                    Err(_) => {}
+        // Each root owns at least one occupied slot. The directory reserves
+        // more than eight IDs per graph slot, so all linked IDs fit.
+        let directory = Directory::new(self.entries.len());
+        assert!(canonical.len() as u64 <= directory.id_mask - 2);
+        let spilled: Vec<_> = self
+            .entries
+            .par_iter()
+            .filter_map(|entry| {
+                let key = entry.key.load(Ordering::Relaxed);
+                if key >= EXTERNAL_NAME {
+                    return None;
                 }
+                let id = dense[entry.parent.load(Ordering::Relaxed) as usize];
+                if mixed_word(key).is_some_and(|mixed| directory.fill(mixed, id)) {
+                    None
+                } else {
+                    Some((key, id))
+                }
+            })
+            .collect();
+        external.par_iter_mut().for_each(|names| {
+            for id in names.values_mut() {
+                let key = EXTERNAL_NAME | u64::from(*id);
+                let slot = self.slot_for_link(key, hash.hash_one(key) as usize);
+                let root = self.entries[slot as usize].parent.load(Ordering::Relaxed);
+                *id = dense[root as usize];
             }
+        });
+        NameTable {
+            directory,
+            canonical,
+            external_names: self.external_names,
+            overflow: spilled.into_iter().collect(),
         }
-        self.overflow
-            .get(&key)
-            .copied()
-            .unwrap_or_else(|| users.intern(text(bytes)))
     }
 }
 
@@ -746,37 +1005,39 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
             (state.ids, state.names)
         })
         .unzip();
-    let mut table = NameTable::new(edge_count, external_names);
-    for shard in &mut users.shards {
-        shard.get_mut().unwrap().offset = table.entries.len() / SHARDS;
-    }
+    let graph = LinkGraph::new(edge_count, external_names);
     batches.into_par_iter().for_each(|edges| {
         edges.par_chunks(4096).for_each(|part| {
             for &(left, right) in part {
-                let a = table.slot_for_link(left, users.hash.hash_one(left) as usize);
-                let b = table.slot_for_link(right, users.hash.hash_one(right) as usize);
-                table.join(a, b);
+                let a = graph.slot_for_link(left, users.hash.hash_one(left) as usize);
+                let b = graph.slot_for_link(right, users.hash.hash_one(right) as usize);
+                graph.join(a, b);
             }
         });
     });
-    table.finish(&users.hash);
-    external.par_iter_mut().for_each(|ids| {
-        for id in ids.values_mut() {
-            let key = EXTERNAL_NAME | u64::from(*id);
-            let slot = table.slot_for_link(key, users.hash.hash_one(key) as usize);
-            *id = table.entries[slot as usize].parent.load(Ordering::Relaxed);
-        }
-    });
+    let table = graph.finish(&mut external, &users.hash);
+    let dynamic_start = table.canonical.len().div_ceil(SHARDS);
+    for shard in &mut users.shards {
+        shard.get_mut().unwrap().offset = dynamic_start;
+    }
     let table = Arc::new(table);
     users.packed = Some(Arc::clone(&table));
     Ok(Aliases { table, external })
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct CachedPerson {
     key: u64,
     person: u32,
-    occupied: bool,
+}
+
+impl Default for CachedPerson {
+    fn default() -> Self {
+        Self {
+            key: EMPTY_KEY,
+            person: 0,
+        }
+    }
 }
 
 pub struct PersonCache(Vec<CachedPerson>);
@@ -790,30 +1051,34 @@ impl Default for PersonCache {
 #[derive(Clone, Copy)]
 pub enum Prepared {
     Ready(u32),
-    Search(u64, usize),
+    Compact(u64, u64),
+    Spill(u64),
     External,
 }
+
 impl PersonCache {
     #[inline]
-    pub fn prepare(&self, users: &Names, aliases: &Aliases, bytes: &[u8]) -> Prepared {
+    pub fn prepare(&self, _users: &Names, aliases: &Aliases, bytes: &[u8]) -> Prepared {
         let Some(key) = packed_name(bytes) else {
             return Prepared::External;
         };
-        let hash = users.hash.hash_one(key) as usize;
-        let entry = &self.0[hash & (self.0.len() - 1)];
-        if entry.occupied && entry.key == key {
+        let Some(mixed) = mixed_word(key) else {
+            return Prepared::Spill(key);
+        };
+        let entry = &self.0[mixed as usize & (self.0.len() - 1)];
+        if entry.key == key {
             return Prepared::Ready(entry.person);
         }
-        let index = hash & (aliases.table.entries.len() - 1);
-        let slot = &aliases.table.entries[index];
+        let directory = &aliases.table.directory;
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                (slot as *const Entry).cast(),
+                (&directory.lines[directory.home(mixed)] as *const Line).cast(),
             );
         }
-        Prepared::Search(key, hash)
+        Prepared::Compact(key, mixed)
     }
+
     #[inline]
     pub fn prepared(
         &mut self,
@@ -822,46 +1087,36 @@ impl PersonCache {
         aliases: &Aliases,
         bytes: &[u8],
     ) -> u32 {
+        let table = &aliases.table;
         match job {
             Prepared::Ready(id) => id,
-            Prepared::External => self.resolve(users, aliases, bytes),
-            Prepared::Search(key, hash) => {
-                let person = aliases.table.resolve(key, hash, bytes, users);
-                let index = hash & (self.0.len() - 1);
-                self.0[index] = CachedPerson {
-                    key,
-                    person,
-                    occupied: true,
-                };
-                person
+            Prepared::Compact(key, mixed) => {
+                let id = table
+                    .directory
+                    .lookup(mixed, key, bytes, &table.overflow, users);
+                let slot = mixed as usize & (self.0.len() - 1);
+                self.0[slot] = CachedPerson { key, person: id };
+                id
+            }
+            Prepared::Spill(key) => table
+                .overflow
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| users.intern(text(bytes))),
+            Prepared::External => {
+                let shard = users.hash.hash_one(bytes) as usize % SHARDS;
+                let name = text(bytes);
+                aliases.external[shard]
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| users.intern_in(shard, name))
             }
         }
     }
-}
-impl PersonCache {
-    pub fn resolve(&mut self, users: &Names, aliases: &Aliases, bytes: &[u8]) -> u32 {
-        debug_assert!(!bytes.is_empty());
-        let Some(key) = packed_name(bytes) else {
-            let shard = users.hash.hash_one(bytes) as usize % SHARDS;
-            let name = text(bytes);
-            return aliases.external[shard]
-                .get(name)
-                .copied()
-                .unwrap_or_else(|| users.intern_in(shard, name));
-        };
-        let hash = users.hash.hash_one(key) as usize;
-        let slot = hash % self.0.len();
-        let entry = &mut self.0[slot];
-        if entry.occupied && entry.key == key {
-            return entry.person;
-        }
-        let person = aliases.table.resolve(key, hash, bytes, users);
-        *entry = CachedPerson {
-            key,
-            person,
-            occupied: true,
-        };
-        person
+
+    #[cfg(test)]
+    fn resolve(&mut self, users: &Names, aliases: &Aliases, bytes: &[u8]) -> u32 {
+        self.prepared(self.prepare(users, aliases, bytes), users, aliases, bytes)
     }
 }
 
@@ -870,19 +1125,44 @@ mod person_tests {
     use super::*;
 
     #[test]
+    fn directory_quotient_and_side_encode_the_complete_key() {
+        let dir = Directory::new(1 << 16);
+        for i in 0..10000 {
+            let name = format!("u{i:07x}");
+            let key = packed_name(name.as_bytes()).unwrap();
+            let bytes = (key & !(1 << 63)).to_be_bytes();
+            let reference = bytes
+                .into_iter()
+                .fold(0u64, |value, b| (value << 7) | u64::from(b))
+                | ((key >> 63) << 56);
+            assert_eq!(ascii_code(key), Some(reference));
+            let mixed = mixed_word(key).unwrap();
+            let locations = dir.locations(mixed);
+            assert_ne!(locations[0].0, locations[1].0);
+            assert_ne!(locations[0].1, locations[1].1);
+            assert_eq!(
+                (locations[0].1 >> (dir.address_bits + 7)) << dir.address_bits
+                    | locations[0].0 as u64,
+                mixed
+            );
+        }
+    }
+
+    #[test]
     fn local_cache_keeps_linked_and_unlinked_ids_exact_on_collision() {
         let mut users = Names::default();
-        let table = NameTable::new(1, Vec::new());
+        let table = NameTable {
+            directory: Directory::new(1024),
+            canonical: vec![EXTERNAL_NAME],
+            external_names: vec![vec![Arc::from("canonical")]],
+            overflow: AHashMap::default(),
+        };
         for shard in &mut users.shards {
-            shard.get_mut().unwrap().offset = table.entries.len() / SHARDS;
+            shard.get_mut().unwrap().offset = 1;
         }
-        let canonical = users.intern("canonical");
+        let canonical = 0;
         let key = packed_name(b"ualias").unwrap();
-        let hash = users.hash.hash_one(key) as usize;
-        let index = table.slot_for_link(key, hash) as usize;
-        table.entries[index]
-            .parent
-            .store(canonical, Ordering::Relaxed);
+        assert!(table.directory.fill(mixed_word(key).unwrap(), canonical));
         let table = Arc::new(table);
         users.packed = Some(Arc::clone(&table));
         let aliases = Aliases {
@@ -970,7 +1250,7 @@ mod person_tests {
         let keys: Vec<_> = (0..n)
             .map(|i| packed_name(format!("u{i:04}").as_bytes()).unwrap())
             .collect();
-        let mut table = NameTable::new(n, Vec::new());
+        let table = LinkGraph::new(n, Vec::new());
         (1..n).into_par_iter().for_each(|i| {
             for (left, right) in [(i, i - 1), (n - 1 - i, n - i)] {
                 let a = table.slot_for_link(keys[left], hash.hash_one(keys[left]) as usize);
@@ -978,22 +1258,37 @@ mod person_tests {
                 table.join(a, b);
             }
         });
-        table.finish(&hash);
-        let first = table.slot_for_link(keys[0], hash.hash_one(keys[0]) as usize);
+        let table = table.finish(&mut [], &hash);
+        let users = Names::default();
+        assert_eq!(table.canonical, [keys[0]]);
         for key in keys {
-            let slot = table.slot_for_link(key, hash.hash_one(key) as usize) as usize;
-            assert_eq!(table.entries[slot].parent.load(Ordering::Relaxed), first);
+            let mixed = mixed_word(key).unwrap();
+            assert_eq!(
+                table
+                    .directory
+                    .lookup(mixed, key, b"", &table.overflow, &users),
+                0
+            );
         }
     }
 
     #[test]
     fn concurrent_colliding_unlinked_names_keep_distinct_stable_ids() {
-        let table = NameTable::new(1, Vec::new());
+        let table = NameTable {
+            directory: Directory::new(1024),
+            canonical: Vec::new(),
+            external_names: Vec::new(),
+            overflow: AHashMap::default(),
+        };
         let mut users = Names::default();
-        for shard in &mut users.shards {
-            shard.get_mut().unwrap().offset = table.entries.len() / SHARDS;
-        }
-        let names: Vec<_> = (0..48).map(|i| format!("u{i:02}")).collect();
+        let names: Vec<_> = (0..)
+            .map(|i| format!("u{i:06}"))
+            .filter(|s| {
+                let mixed = mixed_word(packed_name(s.as_bytes()).unwrap()).unwrap();
+                table.directory.home(mixed) == 0
+            })
+            .take(48)
+            .collect();
         let results = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8)
                 .map(|offset| {
@@ -1003,7 +1298,12 @@ mod person_tests {
                         for j in 0..names.len() {
                             let i = (j + offset) % names.len();
                             let bytes = names[i].as_bytes();
-                            ids[i] = table.resolve(packed_name(bytes).unwrap(), 0, bytes, users);
+                            let key = packed_name(bytes).unwrap();
+                            let mixed = mixed_word(key).unwrap();
+                            ids[i] =
+                                table
+                                    .directory
+                                    .lookup(mixed, key, bytes, &table.overflow, users);
                         }
                         ids
                     })
@@ -1058,5 +1358,126 @@ mod calendar_tests {
         {
             assert_eq!(calendar.ingest(sample), ingest_timestamp(sample));
         }
+    }
+}
+
+#[cfg(test)]
+mod large_identity_regression {
+    use super::*;
+    use std::fmt::Write as _;
+
+    #[test]
+    fn linked_and_new_people_round_trip_after_concurrent_lookups() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("shopping-linked-{}-{nonce}", std::process::id()));
+        let links = dir.join("links");
+        std::fs::create_dir_all(&links)?;
+        let mut csv = String::from("user_id_a,user_id_b\n");
+        for i in 0..9000 {
+            writeln!(csv, "u{i:06},u{:06}", i + 1)?;
+        }
+        csv.push_str("u004500,u中\nu中,00外\nuAA,Urr\n");
+        let part = links.join("part.csv");
+        std::fs::write(&part, csv)?;
+        let mut users = Names::default();
+        let aliases = read_aliases(&dir, &mut users)?;
+        std::fs::remove_file(part)?;
+        std::fs::remove_dir(links)?;
+        std::fs::remove_dir(dir)?;
+        let cases = [
+            "u000000", "u009000", "u中", "00外", "uAA", "Urr", "u0", "u00", "u0\0", "uÚ", "uXX",
+            "uXX ", "", " U",
+        ];
+        let expected = [
+            "00外", "00外", "00外", "00外", "Urr", "Urr", "u0", "u00", "u0\0", "uÚ", "uXX", "uXX ",
+            "", " U",
+        ];
+        // The event reader rejects blank user IDs before resolution.
+        let ids = std::thread::scope(|scope| {
+            let jobs = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut cache = PersonCache::default();
+                        let mut ids = Vec::new();
+                        for _ in 0..8 {
+                            let round = cases
+                                .iter()
+                                .filter(|s| !s.is_empty())
+                                .map(|s| cache.resolve(&users, &aliases, s.as_bytes()))
+                                .collect::<Vec<_>>();
+                            if ids.is_empty() {
+                                ids = round;
+                            } else {
+                                assert_eq!(ids, round);
+                            }
+                        }
+                        ids
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+        drop(aliases);
+        let names = users.into_people();
+        for (id, expected) in ids[0].iter().zip(expected.iter().filter(|s| !s.is_empty())) {
+            assert_eq!(names.get(*id, &mut [0; 9]), *expected);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dimension_key_regression {
+    use super::*;
+    #[test]
+    fn lookup_preserves_noncanonical_and_utf8_keys() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("shopping-dim-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let products = dir.join("products.csv");
+        let campaigns = dir.join("campaigns.csv");
+        std::fs::write(
+            &products,
+            "p,category\np1,a\np01,b\nP1,c\np10000000,d\n瓷,e\np0,f\n",
+        )?;
+        std::fs::write(
+            &campaigns,
+            "c,channel\nc_1,a\nc_01,b\nc_10000000,c\n活動,d\n",
+        )?;
+        let dims = Dimensions::read(&dir)?;
+        std::fs::remove_file(products)?;
+        std::fs::remove_file(campaigns)?;
+        std::fs::remove_dir(dir)?;
+        for (key, value) in [
+            ("p1", "a"),
+            ("p01", "b"),
+            ("P1", "c"),
+            ("p10000000", "d"),
+            ("瓷", "e"),
+            ("p0", "f"),
+        ] {
+            let id = dims.products.lookup(key.as_bytes()).unwrap();
+            assert_eq!(dims.categories[id as usize], value);
+        }
+        for (key, value) in [
+            ("c_1", "a"),
+            ("c_01", "b"),
+            ("c_10000000", "c"),
+            ("活動", "d"),
+        ] {
+            let id = dims.campaign_ids.lookup(key.as_bytes()).unwrap();
+            assert_eq!(dims.campaigns[id as usize].1, value);
+        }
+        assert!(dims.products.lookup(b"p2").is_none());
+        assert!(dims.campaign_ids.lookup(b"c_0").is_none());
+        Ok(())
     }
 }

@@ -181,6 +181,10 @@ thread_local! {
 }
 
 impl Chunk {
+    pub fn byte_len(&self) -> usize {
+        (self.end - self.start).min(CHUNK_BYTES) as usize
+    }
+
     pub fn scan(&self, mut row: impl FnMut(&[u8])) -> Result<()> {
         let mut file = File::open(&self.path)?;
         let mut offset = self.start.saturating_sub(1);
@@ -294,6 +298,41 @@ pub fn chunks(directory: &Path) -> Result<Vec<Chunk>> {
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn long_rows_are_owned_by_the_chunk_containing_their_first_byte() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shopping-slab-long-row-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory)?;
+        let part = directory.join("part.csv");
+        fs::write(&part, b"")?;
+        assert!(chunks(&directory)?.is_empty());
+        let block = CHUNK_BYTES as usize;
+        let mut data = b"header\n".to_vec();
+        data.resize(block - 1, b'a');
+        data.push(b'\n');
+        data.resize(3 * block + 17, b'b');
+        data.extend_from_slice(b"\nz");
+        fs::write(&part, data)?;
+        let mut actual = Vec::new();
+        for chunk in chunks(&directory)? {
+            let mut lengths = Vec::new();
+            chunk.scan(|line| lengths.push(line.len()))?;
+            actual.push(lengths);
+        }
+        fs::remove_file(part)?;
+        fs::remove_dir(directory)?;
+        assert_eq!(
+            actual,
+            vec![vec![block - 8], vec![2 * block + 17], vec![], vec![1]]
+        );
+        Ok(())
+    }
 
     #[test]
     fn chunks_preserve_lines_across_read_buffers_and_job_boundaries() -> Result<()> {

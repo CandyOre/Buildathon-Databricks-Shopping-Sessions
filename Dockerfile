@@ -5,10 +5,15 @@ COPY rust/src/ ./src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo clean --release -p shopping-sessions && \
-    cargo build --locked --release && cp target/release/shopping-sessions /shopping-sessions
+    cargo build --locked --release && cp target/release/shopping-sessions /portable && \
+    if [ "$(uname -m)" = "x86_64" ]; then RUSTFLAGS="-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+aes" cargo build --locked --release && cp target/release/shopping-sessions /optimized; else cp /portable /optimized; fi
+COPY rust/dispatch.rs /tmp/dispatch.rs
+RUN rustc --edition=2024 -O /tmp/dispatch.rs -o /shopping-sessions
 
 FROM debian:bookworm-slim
 COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
+COPY --from=build /optimized /usr/local/bin/optimized
+COPY --from=build /portable /usr/local/bin/portable
 ENV MIMALLOC_PURGE_DELAY=10000
 USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]
