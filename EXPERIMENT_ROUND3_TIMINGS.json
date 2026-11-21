@@ -1,0 +1,1095 @@
+{
+  "starting_commit": "d4d375a26d97f167c26ce4e2870904c919069b6b",
+  "finalist": "v4slabnum",
+  "metric": "Docker State.FinishedAt minus State.StartedAt, seconds",
+  "cpu_set": "0,2,4,6,8,10,12,14",
+  "cpus": 8,
+  "memory_gib": 24,
+  "swap_gib": 0,
+  "storage": "same Linux named volume, warm resident input pages checked",
+  "batches": {
+    "baseline": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:20:50.655279821Z",
+          0.682603
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:20:51.951155528Z",
+          0.600708
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:20:53.156395186Z",
+          0.687597
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "third": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r3:quotient": "sha256:a68660947bcab3f254263e277e123a32d817bb22f557691ffff8ad833eab11ad",
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b"
+      },
+      "runs": [
+        [
+          "sessions-r3:quotient",
+          "2026-11-21T16:27:35.741576095Z",
+          0.623304
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:27:37.003317345Z",
+          0.648749
+        ],
+        [
+          "sessions-r3:quotient",
+          "2026-11-21T16:27:40.928378091Z",
+          0.615269
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:27:47.412167807Z",
+          0.721067
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:27:48.8220347Z",
+          0.597503
+        ],
+        [
+          "sessions-r3:quotient",
+          "2026-11-21T16:27:50.088067835Z",
+          0.719062
+        ],
+        [
+          "sessions-r3:quotient",
+          "2026-11-21T16:28:04.345178713Z",
+          0.603272
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:28:05.558086118Z",
+          0.703219
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "tenth": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:clickranges": "sha256:c0a2e5b3b56363528471a67addf7ad8354a67ffc16a9404af5741ec65d303ecd"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:48:59.416260425Z",
+          0.664259
+        ],
+        [
+          "sessions-r3:clickranges",
+          "2026-11-21T16:49:05.865909667Z",
+          0.712637
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:49:11.191133964Z",
+          0.691193
+        ],
+        [
+          "sessions-r3:clickranges",
+          "2026-11-21T16:49:16.660345246Z",
+          0.799298
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T16:49:27.576922083Z",
+          0.612347
+        ],
+        [
+          "sessions-r3:clickranges",
+          "2026-11-21T16:49:30.293087464Z",
+          0.840765
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "fifteenth": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:v4fast": "sha256:77c6e5162d63022b419834fded299aa86ec4c84c079ce2dd79813b17e6860e1c",
+        "sessions-r3:v4slab": "sha256:93566d19c900e8ed6e9cd93fc5109cf488c0ac2bfee646293ce76476ea9cfd4d",
+        "sessions-r3:v4fastnum": "sha256:309aabc68cc28fdc0f60ed104daa7692987d269622d724686599bbce200cdb0b",
+        "sessions-r3:numslab": "sha256:183ed9040b0d77d601106b46fe40ec34c3ed1d024ba7da830c2f7c311bbc6838",
+        "sessions-r3:v4pages": "sha256:faba9307f1bccfca944287d1298c7cd51f75232036c184c268992174d1348bbe",
+        "sessions-r3:v4slabnum": "sha256:a7b6da98bcda25ac57a71346cd5b6e1a70583aaf1748b9ca8b5d692d38970d61",
+        "sessions-r3:slab": "sha256:db734aabdb1a330ec162bb4a02176c87f8dedd586ad0099d935b833318da33ca"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:04:13.780848404Z",
+          0.683362
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:04:15.144639982Z",
+          0.602617
+        ],
+        [
+          "sessions-r3:v4slab",
+          "2026-11-21T17:04:16.391061041Z",
+          0.595566
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:04:17.653308839Z",
+          0.686922
+        ],
+        [
+          "sessions-r3:numslab",
+          "2026-11-21T17:04:19.108248716Z",
+          0.673762
+        ],
+        [
+          "sessions-r3:v4pages",
+          "2026-11-21T17:04:20.474640713Z",
+          0.591528
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:04:21.707854605Z",
+          0.536158
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:04:22.889146052Z",
+          0.562983
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:04:24.106944493Z",
+          0.616932
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:04:25.470066286Z",
+          0.685297
+        ],
+        [
+          "sessions-r3:numslab",
+          "2026-11-21T17:04:26.823915283Z",
+          0.575116
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:04:28.045978765Z",
+          0.563672
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:04:29.267159766Z",
+          0.682616
+        ],
+        [
+          "sessions-r3:v4pages",
+          "2026-11-21T17:04:30.665548261Z",
+          0.620788
+        ],
+        [
+          "sessions-r3:v4slab",
+          "2026-11-21T17:04:31.985451158Z",
+          0.575542
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:04:33.237411194Z",
+          0.662943
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:04:34.568751039Z",
+          0.646651
+        ],
+        [
+          "sessions-r3:v4slab",
+          "2026-11-21T17:04:35.884078111Z",
+          0.563799
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:04:37.121939434Z",
+          0.537657
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:04:38.308234358Z",
+          0.586205
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:04:39.557802921Z",
+          0.732023
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:04:40.971784247Z",
+          0.622881
+        ],
+        [
+          "sessions-r3:numslab",
+          "2026-11-21T17:04:42.289653084Z",
+          0.571277
+        ],
+        [
+          "sessions-r3:v4pages",
+          "2026-11-21T17:04:43.562112356Z",
+          0.621105
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:04:44.855741609Z",
+          0.608125
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:04:46.177064994Z",
+          0.650182
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:04:47.557065501Z",
+          0.999019
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:04:49.225085309Z",
+          0.541241
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:04:50.448854673Z",
+          0.640524
+        ],
+        [
+          "sessions-r3:numslab",
+          "2026-11-21T17:04:51.740795597Z",
+          0.596416
+        ],
+        [
+          "sessions-r3:v4slab",
+          "2026-11-21T17:04:53.007279605Z",
+          0.583363
+        ],
+        [
+          "sessions-r3:v4pages",
+          "2026-11-21T17:04:54.244956684Z",
+          0.674191
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "playoff": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r3:v4fat": "sha256:edd8a5f9a4a212a0b70e6a53669bc9994b384f5d53e1b1285594de270eee9fff",
+        "sessions-r3:slab": "sha256:db734aabdb1a330ec162bb4a02176c87f8dedd586ad0099d935b833318da33ca",
+        "sessions-r3:qnumber": "sha256:cec2b534283569cb93bf5f6819be10986e331881b2ca50c5fd685b9ece663419",
+        "sessions-r3:wordslab": "sha256:7aa19ef4e5dc3517af4c99319f9cc0b3e824f5c026d1b9d1200279d0793a841b",
+        "sessions-r3:v4qnum": "sha256:416d699c50a9d2582c8c292ea7ea2f2a5ae0f3834e6be834e440d863a3ea230f",
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:v4slabnum": "sha256:a7b6da98bcda25ac57a71346cd5b6e1a70583aaf1748b9ca8b5d692d38970d61",
+        "sessions-r3:v4wordslab": "sha256:9afbf2e439d444d774d6f0c9ab72533f09831cecb8ef048ea09b5d08507aeaee",
+        "sessions-r3:v4fast": "sha256:77c6e5162d63022b419834fded299aa86ec4c84c079ce2dd79813b17e6860e1c"
+      },
+      "runs": [
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:07:35.391144894Z",
+          0.886532
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:07:37.024818338Z",
+          0.723193
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:07:38.385736329Z",
+          0.582819
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:07:39.602699454Z",
+          0.577668
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:07:40.829257114Z",
+          0.617442
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:07:42.097854847Z",
+          0.60914
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:07:43.379920948Z",
+          0.562426
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:07:44.59204839Z",
+          0.546029
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:07:45.809666153Z",
+          0.614588
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:07:47.087734726Z",
+          0.59454
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:07:48.348450755Z",
+          0.56867
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:07:49.603909055Z",
+          0.601899
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:07:50.850376503Z",
+          0.595206
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:07:52.113744846Z",
+          0.608763
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:07:53.376544734Z",
+          0.568064
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:07:54.622560754Z",
+          0.586638
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:07:55.896555718Z",
+          0.686154
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:07:57.261096846Z",
+          0.563785
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:07:58.504797321Z",
+          0.55511
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:07:59.720413608Z",
+          0.678149
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:08:01.090529873Z",
+          0.550741
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:08:02.338039837Z",
+          0.668915
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:08:03.691345021Z",
+          0.593491
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:08:04.960777279Z",
+          0.587174
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:08:06.252955234Z",
+          0.726583
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:08:07.68205528Z",
+          0.647232
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:08:08.991694512Z",
+          0.561955
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:08:10.214135997Z",
+          0.580137
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:08:11.476895037Z",
+          0.566815
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:08:12.690906374Z",
+          0.530166
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:08:13.90578728Z",
+          0.565169
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:08:15.157635379Z",
+          0.606622
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:08:16.412671816Z",
+          0.579704
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:08:17.674937553Z",
+          0.603615
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:08:18.993394779Z",
+          0.736891
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:08:20.417427042Z",
+          0.632409
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:08:21.69055154Z",
+          0.593929
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:08:22.914815297Z",
+          0.606795
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:08:24.200158452Z",
+          0.592935
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:08:25.463355821Z",
+          0.572163
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:08:26.734700167Z",
+          0.586986
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:08:27.997078836Z",
+          0.643917
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:08:29.291655848Z",
+          0.573812
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:08:30.548375681Z",
+          0.573298
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:08:31.784442254Z",
+          0.535834
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:08:33.021229846Z",
+          0.68567
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:08:34.363077187Z",
+          0.582978
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:08:35.583553837Z",
+          0.563117
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:08:36.851560865Z",
+          0.695627
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:08:38.213015844Z",
+          0.561274
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:08:39.442283543Z",
+          0.611052
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:08:40.726541898Z",
+          0.617643
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:08:42.01448757Z",
+          0.632416
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:08:43.324609632Z",
+          0.574199
+        ],
+        [
+          "sessions-r3:qnumber",
+          "2026-11-21T17:08:44.552323852Z",
+          0.671321
+        ],
+        [
+          "sessions-r3:v4fast",
+          "2026-11-21T17:08:45.913985575Z",
+          0.807181
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:08:47.385925529Z",
+          0.60874
+        ],
+        [
+          "sessions-r3:v4wordslab",
+          "2026-11-21T17:08:48.637486666Z",
+          0.590876
+        ],
+        [
+          "sessions-r3:v4slabnum",
+          "2026-11-21T17:08:49.851041427Z",
+          0.542082
+        ],
+        [
+          "sessions-r3:wordslab",
+          "2026-11-21T17:08:51.063164924Z",
+          0.57712
+        ],
+        [
+          "sessions-r3:v4fat",
+          "2026-11-21T17:08:52.311685185Z",
+          0.629112
+        ],
+        [
+          "sessions-r3:v4qnum",
+          "2026-11-21T17:08:53.597672329Z",
+          0.568303
+        ],
+        [
+          "sessions-r3:slab",
+          "2026-11-21T17:08:54.836081664Z",
+          0.596016
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "control": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r3:v4fastnum": "sha256:309aabc68cc28fdc0f60ed104daa7692987d269622d724686599bbce200cdb0b",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "runs": [
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:30.631367801Z",
+          0.770803
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:32.084032687Z",
+          0.582978
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:33.321155583Z",
+          0.577677
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:34.582596369Z",
+          0.640289
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:35.917171961Z",
+          0.67903
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:37.273972766Z",
+          0.563626
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:38.556429452Z",
+          0.608557
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:39.826461031Z",
+          0.662637
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:41.150463819Z",
+          0.596179
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:42.409645773Z",
+          0.640871
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:43.743517338Z",
+          0.563582
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:44.982500983Z",
+          0.692615
+        ],
+        [
+          "sessions-r3:v4fastnum",
+          "2026-11-21T17:12:46.321104792Z",
+          0.610069
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:47.57866265Z",
+          0.574621
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "gate-verified-37": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:39.356756145Z",
+          0.696468
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:40.763621802Z",
+          0.59966
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:42.023081152Z",
+          0.54938
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:43.263132509Z",
+          0.673879
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:44.599475374Z",
+          0.821734
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:46.14637816Z",
+          0.621852
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:47.466732021Z",
+          0.574739
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:48.700118693Z",
+          0.675123
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:50.055022211Z",
+          0.613445
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:51.34009775Z",
+          0.548864
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:52.545602177Z",
+          0.560409
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:53.776397708Z",
+          0.647401
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:09:55.091547477Z",
+          0.694309
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:09:56.467502608Z",
+          0.567148
+        ]
+      ],
+      "resident_input_bytes": 1915314176
+    },
+    "gate-verified-83": {
+      "dataset": "seed83-20m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:10:00.746650873Z",
+          0.843972
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:10:02.321665542Z",
+          0.579822
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:10:03.576762826Z",
+          0.53591
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:10:04.804896811Z",
+          0.662389
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:10:06.134326829Z",
+          0.656386
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:10:07.490140844Z",
+          0.541901
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:10:08.698372504Z",
+          0.579861
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:10:09.966293379Z",
+          0.73577
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:10:11.388298206Z",
+          0.595197
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:10:12.67179853Z",
+          0.560118
+        ]
+      ],
+      "resident_input_bytes": 1869631488
+    },
+    "gate-verified-60": {
+      "dataset": "seed83-60m",
+      "images": {
+        "sessions-r2:shipped": "sha256:2eefddf58661182ae26daa17558ebd8b83611b053a7ea944675392b1bae85d3b",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "runs": [
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:11:49.829166672Z",
+          2.252345
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:11:52.859560309Z",
+          1.853279
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:11:55.448496159Z",
+          1.743825
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:11:57.980979163Z",
+          2.101777
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:12:00.811203421Z",
+          1.951735
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:03.490721477Z",
+          1.658351
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:05.882837728Z",
+          1.707936
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:12:08.353629321Z",
+          2.25142
+        ],
+        [
+          "sessions-r2:shipped",
+          "2026-11-21T17:12:11.33938263Z",
+          1.947582
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:13.99477258Z",
+          1.658866
+        ]
+      ],
+      "resident_input_bytes": 5602676736
+    },
+    "gate-verified-dev": {
+      "dataset": "dev-official",
+      "images": {
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "runs": [
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:12:19.725742374Z",
+          0.175938
+        ]
+      ],
+      "resident_input_bytes": 96399360
+    },
+    "alignment_check": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r3:colored": "sha256:bb2559cbef807f67f7e2a6f1aa91e1ae171cd269b590319e1c472f48fdb7403c",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "resident_input_bytes": 1915314176,
+      "runs": [
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:28.585826384Z",
+          0.607517
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:29.871616006Z",
+          0.587674
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:31.141552905Z",
+          0.572419
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:32.384123528Z",
+          0.590681
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:33.641797422Z",
+          0.561966
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:34.86279432Z",
+          0.543523
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:36.03481863Z",
+          0.560243
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:37.271178563Z",
+          0.559726
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:38.50920464Z",
+          0.56597
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:39.739678619Z",
+          0.577473
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:40.983171507Z",
+          0.550199
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:42.189560607Z",
+          0.609278
+        ],
+        [
+          "sessions-r3:colored",
+          "2026-11-21T17:13:43.453092722Z",
+          0.538551
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:13:44.689312192Z",
+          0.57181
+        ]
+      ]
+    }
+  },
+  "profile_60m": [
+    {
+      "elapsed_s": 0.116540911,
+      "end_rss_kib": 419760,
+      "peak_rss_kib": 419760,
+      "stage": "load_dimensions_and_links",
+      "start_rss_kib": 7140
+    },
+    {
+      "elapsed_s": 0.921096666,
+      "end_rss_kib": 2193496,
+      "peak_rss_kib": 2193496,
+      "stage": "parse_events",
+      "start_rss_kib": 419760
+    },
+    {
+      "elapsed_s": 0.287330432,
+      "end_rss_kib": 2488520,
+      "peak_rss_kib": 2488520,
+      "stage": "dedup_and_sessionize",
+      "start_rss_kib": 2193496
+    },
+    {
+      "elapsed_s": 0.237543775,
+      "end_rss_kib": 2533576,
+      "peak_rss_kib": 2533576,
+      "stage": "parse_and_sort_clicks",
+      "start_rss_kib": 2488520
+    },
+    {
+      "elapsed_s": 0.107105009,
+      "end_rss_kib": 2533576,
+      "peak_rss_kib": 2533576,
+      "stage": "attribution_and_assists",
+      "start_rss_kib": 2533576
+    },
+    {
+      "elapsed_s": 0.096158676,
+      "end_rss_kib": 2536728,
+      "peak_rss_kib": 2536728,
+      "stage": "write_parquet",
+      "start_rss_kib": 2533576
+    },
+    {
+      "container_peak_bytes": 2651619328,
+      "elapsed_s": 1.765921495,
+      "peak_rss_kib": 2536728,
+      "stage": "total"
+    }
+  ],
+  "code_commit": "4831f54c62c62d25d0e7267ad9d21af59f11723d",
+  "official_generator_zip_sha256": "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e",
+  "committed_binary_sha256": {
+    "/usr/local/bin/shopping-sessions": "140b36b3ad76819a701cc4594eeb1bf31990c87edcc73223e9cfc056ac962672",
+    "/usr/local/bin/portable": "51610600a9551213d95511ae150fcdccaefe919f56fec15bb9c55e755ac28c54",
+    "/usr/local/bin/optimized": "982783a28aea71d8b078e44d5afb72c6af2ddb3e6206cd7e6247620d4fd48e0a"
+  },
+  "checks": {
+    "rust_unit_tests": 21,
+    "official_fixtures_optimized": 36,
+    "official_fixtures_portable": 36,
+    "additional_cases": 6,
+    "different_columns": 0,
+    "duplicate_keys": 0,
+    "row_counts": {
+      "dev": [
+        117038,
+        27400
+      ],
+      "seed37-20m": [
+        2248281,
+        28014
+      ],
+      "seed83-20m": [
+        2240547,
+        28014
+      ],
+      "seed83-60m": [
+        6642360,
+        28014
+      ]
+    },
+    "row_count_order": [
+      "user_daily",
+      "campaign_daily"
+    ]
+  }
+}
