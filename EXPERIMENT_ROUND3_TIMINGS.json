@@ -1003,6 +1003,66 @@
           0.57181
         ]
       ]
+    },
+    "previous_chunk_capacity": {
+      "dataset": "seed37-20m",
+      "images": {
+        "sessions-r3:capacitytrial": "sha256:5c68a97b7d861a6281d4b539e0b8efc97778c86e6899d3cae89e74d6e3f7cc51",
+        "sessions-r3:verified": "sha256:9baccbefdd0bec21301c6ef23f0f47fae97c35285c2e03e67aea68a042eda3fa"
+      },
+      "resident_input_bytes": 1915314176,
+      "runs": [
+        [
+          "sessions-r3:capacitytrial",
+          "2026-11-21T17:20:01.72041515Z",
+          0.598883
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:20:02.978658906Z",
+          0.53973
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:20:04.172588679Z",
+          0.566394
+        ],
+        [
+          "sessions-r3:capacitytrial",
+          "2026-11-21T17:20:05.423286371Z",
+          0.598991
+        ],
+        [
+          "sessions-r3:capacitytrial",
+          "2026-11-21T17:20:06.67651137Z",
+          0.548538
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:20:07.881896175Z",
+          0.545371
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:20:09.078034608Z",
+          0.529661
+        ],
+        [
+          "sessions-r3:capacitytrial",
+          "2026-11-21T17:20:10.260378439Z",
+          0.582934
+        ],
+        [
+          "sessions-r3:capacitytrial",
+          "2026-11-21T17:20:11.515338761Z",
+          0.547887
+        ],
+        [
+          "sessions-r3:verified",
+          "2026-11-21T17:20:12.713328102Z",
+          0.578253
+        ]
+      ]
     }
   },
   "profile_60m": [
