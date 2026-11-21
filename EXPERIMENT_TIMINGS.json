@@ -1,0 +1,346 @@
+{
+  "start_commit": "bfc2c1c0c56676c3fbf7985e34a0d78dd04b2a03",
+  "release_code_commit": "e715b507346dfbe1a9f9265b4901f09f8b7de438",
+  "binary_sha256": {
+    "baseline": "db7643337dee3406bed425149c84e5c501ef8911593358294ce0dd0397a01e81",
+    "selected_training_candidate": "46976cd3e2df0ca223fe4e1367e889d8ba2639b9dd9b4a9ecd73b87cffa52a3d",
+    "release": "ef7032fef30b7f2a616b9c772012bb29e0e7809b1c5e3c0ce56d293ad7da4aea"
+  },
+  "conditions": {
+    "cpu": "AMD Ryzen 7 9800X3D",
+    "cpuset": "0,2,4,6,8,10,12,14",
+    "cpu_max": "800000 100000",
+    "memory_max_bytes": 25769803776,
+    "memory_swap_max_bytes": 0,
+    "virtual_machine_MemTotal_KiB": 24172180,
+    "volume": "sessions-independent-1121",
+    "storage": "same Docker Linux ext4 volume",
+    "cache": "warm input",
+    "duration": "Docker FinishedAt minus StartedAt, in seconds"
+  },
+  "samples": {
+    "initial runs": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:base",
+        "image_id": "sha256:e3c3020eaae774121c462989e224b7f910cd54a7f14e99db9a88d46506c25a55",
+        "started": "2026-11-21T08:45:42.752782889Z",
+        "finished": "2026-11-21T08:45:47.460786412Z",
+        "seconds": 4.708004,
+        "cli_seconds": 5.016124000001582
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:base",
+        "image_id": "sha256:e3c3020eaae774121c462989e224b7f910cd54a7f14e99db9a88d46506c25a55",
+        "started": "2026-11-21T08:45:47.917810948Z",
+        "finished": "2026-11-21T08:45:52.091848114Z",
+        "seconds": 4.174038,
+        "cli_seconds": 4.3817320999987714
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:base",
+        "image_id": "sha256:e3c3020eaae774121c462989e224b7f910cd54a7f14e99db9a88d46506c25a55",
+        "started": "2026-11-21T08:45:52.410694897Z",
+        "finished": "2026-11-21T08:45:56.333416928Z",
+        "seconds": 3.922722,
+        "cli_seconds": 4.109913000000233
+      }
+    ],
+    "baseline comparison": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:cleanbase",
+        "image_id": "sha256:19d6109dd9a0634562eef5763a3d906e6654e14608761ba349bb20a4a88c774a",
+        "started": "2026-11-21T09:25:37.84165697Z",
+        "finished": "2026-11-21T09:25:41.574437907Z",
+        "seconds": 3.732781,
+        "cli_seconds": 3.9176154999986466
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:cleanbase",
+        "image_id": "sha256:19d6109dd9a0634562eef5763a3d906e6654e14608761ba349bb20a4a88c774a",
+        "started": "2026-11-21T09:25:41.913555604Z",
+        "finished": "2026-11-21T09:25:45.973614626Z",
+        "seconds": 4.060059,
+        "cli_seconds": 4.255266800000754
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:cleanbase",
+        "image_id": "sha256:19d6109dd9a0634562eef5763a3d906e6654e14608761ba349bb20a4a88c774a",
+        "started": "2026-11-21T09:26:22.957740397Z",
+        "finished": "2026-11-21T09:26:26.40418934Z",
+        "seconds": 3.446449,
+        "cli_seconds": 3.6630829999994603
+      }
+    ],
+    "selected training candidate": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:xtime",
+        "image_id": "sha256:69c78350d6a0aa9d48723356d2cabd301c438a4996c658bcc25d8540d379d0fa",
+        "started": "2026-11-21T09:30:42.087686123Z",
+        "finished": "2026-11-21T09:30:42.917613609Z",
+        "seconds": 0.829927,
+        "cli_seconds": 1.0289714999998978
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:xtime",
+        "image_id": "sha256:69c78350d6a0aa9d48723356d2cabd301c438a4996c658bcc25d8540d379d0fa",
+        "started": "2026-11-21T09:31:05.903742418Z",
+        "finished": "2026-11-21T09:31:06.734621695Z",
+        "seconds": 0.830879,
+        "cli_seconds": 1.0276589000004606
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:xtime",
+        "image_id": "sha256:69c78350d6a0aa9d48723356d2cabd301c438a4996c658bcc25d8540d379d0fa",
+        "started": "2026-11-21T09:31:32.036082459Z",
+        "finished": "2026-11-21T09:31:32.904664435Z",
+        "seconds": 0.868582,
+        "cli_seconds": 1.0660786000007647
+      }
+    ],
+    "baseline holdouts": [
+      {
+        "dataset": "seed83-20m",
+        "image": "sessions-independent:cleanbase",
+        "image_id": "sha256:19d6109dd9a0634562eef5763a3d906e6654e14608761ba349bb20a4a88c774a",
+        "started": "2026-11-21T08:54:51.961188753Z",
+        "finished": "2026-11-21T08:54:55.309038996Z",
+        "seconds": 3.34785,
+        "cli_seconds": 3.5231781999991654
+      },
+      {
+        "dataset": "seed83-60m",
+        "image": "sessions-independent:cleanbase",
+        "image_id": "sha256:19d6109dd9a0634562eef5763a3d906e6654e14608761ba349bb20a4a88c774a",
+        "started": "2026-11-21T08:55:01.187146577Z",
+        "finished": "2026-11-21T08:55:12.564350515Z",
+        "seconds": 11.377204,
+        "cli_seconds": 11.569874900000286
+      }
+    ],
+    "release acceptance": [
+      {
+        "dataset": "seed83-20m",
+        "image": "sessions-independent:release",
+        "image_id": "sha256:29ad767bde3f056b8970fbea0e52951696c6e74e9b86c62f50101994905a96a2",
+        "started": "2026-11-21T09:34:37.648976295Z",
+        "finished": "2026-11-21T09:34:38.866303475Z",
+        "seconds": 1.217327,
+        "cli_seconds": 1.4313235999998142,
+        "resident_input_bytes": 1869631488,
+        "input_page_bytes": 1869631488
+      },
+      {
+        "dataset": "seed83-60m",
+        "image": "sessions-independent:release",
+        "image_id": "sha256:29ad767bde3f056b8970fbea0e52951696c6e74e9b86c62f50101994905a96a2",
+        "started": "2026-11-21T09:35:11.408336718Z",
+        "finished": "2026-11-21T09:35:15.456111037Z",
+        "seconds": 4.047775,
+        "cli_seconds": 4.2567492999987735,
+        "resident_input_bytes": 5602676736,
+        "input_page_bytes": 5602676736
+      },
+      {
+        "dataset": "dev-official",
+        "image": "sessions-independent:release",
+        "image_id": "sha256:29ad767bde3f056b8970fbea0e52951696c6e74e9b86c62f50101994905a96a2",
+        "started": "2026-11-21T09:35:20.572384186Z",
+        "finished": "2026-11-21T09:35:20.744277306Z",
+        "seconds": 0.171893,
+        "cli_seconds": 0.3490984000000026,
+        "resident_input_bytes": 96399360,
+        "input_page_bytes": 96399360
+      }
+    ],
+    "integrated control": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:top1",
+        "image_id": "sha256:8e3d7ecbe25b46adb9a34d70a55170d19f0d6666dfc3656c8a1f299ca46f060d",
+        "started": "2026-11-21T09:25:16.923722465Z",
+        "finished": "2026-11-21T09:25:17.904404595Z",
+        "seconds": 0.980682,
+        "cli_seconds": 1.185649299999568
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:top1",
+        "image_id": "sha256:8e3d7ecbe25b46adb9a34d70a55170d19f0d6666dfc3656c8a1f299ca46f060d",
+        "started": "2026-11-21T09:26:07.575797102Z",
+        "finished": "2026-11-21T09:26:08.479069919Z",
+        "seconds": 0.903272,
+        "cli_seconds": 1.0856645000003482
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:top1",
+        "image_id": "sha256:8e3d7ecbe25b46adb9a34d70a55170d19f0d6666dfc3656c8a1f299ca46f060d",
+        "started": "2026-11-21T09:26:26.787468976Z",
+        "finished": "2026-11-21T09:26:27.730725948Z",
+        "seconds": 0.943257,
+        "cli_seconds": 1.1294047000010323
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:top1",
+        "image_id": "sha256:8e3d7ecbe25b46adb9a34d70a55170d19f0d6666dfc3656c8a1f299ca46f060d",
+        "started": "2026-11-21T09:26:44.67880636Z",
+        "finished": "2026-11-21T09:26:45.60913425Z",
+        "seconds": 0.930328,
+        "cli_seconds": 1.1252156999998988
+      }
+    ],
+    "original identity resolver": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:nopeople",
+        "image_id": "sha256:89e886f7cc52bcb5b8a2d89b7a4ff218eb4c443c1c80cd13b2b9ea6a23f03f1e",
+        "started": "2026-11-21T09:25:18.30638439Z",
+        "finished": "2026-11-21T09:25:20.354008931Z",
+        "seconds": 2.047624,
+        "cli_seconds": 2.282122900000104
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:nopeople",
+        "image_id": "sha256:89e886f7cc52bcb5b8a2d89b7a4ff218eb4c443c1c80cd13b2b9ea6a23f03f1e",
+        "started": "2026-11-21T09:26:05.084873433Z",
+        "finished": "2026-11-21T09:26:07.239586Z",
+        "seconds": 2.154713,
+        "cli_seconds": 2.3366618000000017
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:nopeople",
+        "image_id": "sha256:89e886f7cc52bcb5b8a2d89b7a4ff218eb4c443c1c80cd13b2b9ea6a23f03f1e",
+        "started": "2026-11-21T09:26:28.085559653Z",
+        "finished": "2026-11-21T09:26:29.996338109Z",
+        "seconds": 1.910779,
+        "cli_seconds": 2.1090736000005563
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:nopeople",
+        "image_id": "sha256:89e886f7cc52bcb5b8a2d89b7a4ff218eb4c443c1c80cd13b2b9ea6a23f03f1e",
+        "started": "2026-11-21T09:26:42.445177484Z",
+        "finished": "2026-11-21T09:26:44.326045922Z",
+        "seconds": 1.880868,
+        "cli_seconds": 2.0878690000008646
+      }
+    ],
+    "original event layout": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:noevent",
+        "image_id": "sha256:13b92d465c810301109511c9eae09d3596035d5c1fc09ba1242ea7996b6c7a0c",
+        "started": "2026-11-21T09:25:20.753008266Z",
+        "finished": "2026-11-21T09:25:22.391449513Z",
+        "seconds": 1.638441,
+        "cli_seconds": 1.8722249000002193
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:noevent",
+        "image_id": "sha256:13b92d465c810301109511c9eae09d3596035d5c1fc09ba1242ea7996b6c7a0c",
+        "started": "2026-11-21T09:26:03.232645329Z",
+        "finished": "2026-11-21T09:26:04.727861467Z",
+        "seconds": 1.495216,
+        "cli_seconds": 1.6883115000000544
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:noevent",
+        "image_id": "sha256:13b92d465c810301109511c9eae09d3596035d5c1fc09ba1242ea7996b6c7a0c",
+        "started": "2026-11-21T09:26:30.31799319Z",
+        "finished": "2026-11-21T09:26:31.726741128Z",
+        "seconds": 1.408748,
+        "cli_seconds": 1.6016455000008136
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:noevent",
+        "image_id": "sha256:13b92d465c810301109511c9eae09d3596035d5c1fc09ba1242ea7996b6c7a0c",
+        "started": "2026-11-21T09:26:40.696923588Z",
+        "finished": "2026-11-21T09:26:42.114539116Z",
+        "seconds": 1.417616,
+        "cli_seconds": 1.598434300000008
+      }
+    ],
+    "row-wise CSV control": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:fcmove",
+        "image_id": "sha256:a92fd187e55d930a0a6e7a45d4c1040bfbc3cac132b3c59cf6eed0ce8856d060",
+        "started": "2026-11-21T09:25:28.640089342Z",
+        "finished": "2026-11-21T09:25:29.873151235Z",
+        "seconds": 1.233062,
+        "cli_seconds": 1.5068178000001353
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:fcmove",
+        "image_id": "sha256:a92fd187e55d930a0a6e7a45d4c1040bfbc3cac132b3c59cf6eed0ce8856d060",
+        "started": "2026-11-21T09:25:54.729548016Z",
+        "finished": "2026-11-21T09:25:55.976072099Z",
+        "seconds": 1.246524,
+        "cli_seconds": 1.5056549000000814
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:fcmove",
+        "image_id": "sha256:a92fd187e55d930a0a6e7a45d4c1040bfbc3cac132b3c59cf6eed0ce8856d060",
+        "started": "2026-11-21T09:26:13.423471131Z",
+        "finished": "2026-11-21T09:26:14.577481939Z",
+        "seconds": 1.15401,
+        "cli_seconds": 1.35008949999974
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:fcmove",
+        "image_id": "sha256:a92fd187e55d930a0a6e7a45d4c1040bfbc3cac132b3c59cf6eed0ce8856d060",
+        "started": "2026-11-21T09:26:33.346084891Z",
+        "finished": "2026-11-21T09:26:34.646691083Z",
+        "seconds": 1.300607,
+        "cli_seconds": 1.5262861000010162
+      }
+    ],
+    "block SIMD experiment": [
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:mb",
+        "image_id": "sha256:eebf6d78e27e2439e717d60d7ae1b5ff67e0ac284b4d8fe7dc343c03c8f7c011",
+        "started": "2026-11-21T09:25:30.238603978Z",
+        "finished": "2026-11-21T09:25:31.661627145Z",
+        "seconds": 1.423024,
+        "cli_seconds": 1.6290253999995912
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:mb",
+        "image_id": "sha256:eebf6d78e27e2439e717d60d7ae1b5ff67e0ac284b4d8fe7dc343c03c8f7c011",
+        "started": "2026-11-21T09:25:52.69503213Z",
+        "finished": "2026-11-21T09:25:54.291100324Z",
+        "seconds": 1.596068,
+        "cli_seconds": 1.7824254000006476
+      },
+      {
+        "dataset": "seed37-20m",
+        "image": "sessions-independent:mb",
+        "image_id": "sha256:eebf6d78e27e2439e717d60d7ae1b5ff67e0ac284b4d8fe7dc343c03c8f7c011",
+        "started": "2026-11-21T09:26:14.954042322Z",
+        "finished": "2026-11-21T09:26:16.440739506Z",
+        "seconds": 1.486697,
+        "cli_seconds": 1.6950935999993817
+      }
+    ]
+  }
+}
