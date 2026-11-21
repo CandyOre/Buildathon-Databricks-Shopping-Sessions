@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     let user_names = users.into_people();
     profile.stage("parse_and_sort_clicks");
 
-    let campaign_daily = aggregate::campaign_daily(&mut session_batches, clicks, click_ids);
+    let campaign_daily = aggregate::campaign_daily(&mut session_batches, clicks, click_ids, dimensions.campaigns.len(), window);
     profile.stage("attribution_and_assists");
     output::write(
         &out,

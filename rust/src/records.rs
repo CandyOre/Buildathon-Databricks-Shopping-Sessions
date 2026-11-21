@@ -360,6 +360,13 @@ pub struct Click {
     pub campaign: u32,
 }
 
+fn order_clicks(pieces: Vec<Vec<Click>>) -> Vec<Click> {
+    let mut clicks = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
+    for piece in pieces { clicks.extend(piece); }
+    clicks.par_sort_unstable_by_key(|click| (click.person, click.time));
+    clicks
+}
+
 pub fn read_clicks(
     data: &Path,
     window: Window,
@@ -368,11 +375,10 @@ pub fn read_clicks(
     aliases: &Aliases,
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
-    let shared = shards::<Mutex<Vec<Click>>>();
-    let worker_state = || (PersonCache::default(), shards::<Vec<Click>>());
-    chunks(&data.join("clicks"))?
+    let pieces = chunks(&data.join("clicks"))?
         .into_par_iter()
-        .try_for_each_init(worker_state, |(people, local), chunk| {
+        .map_init(PersonCache::default, |people, chunk| {
+            let mut local = shards::<Vec<Click>>();
             chunk.scan(|line| {
                 let Some([id, user, campaign, ts]) = fields(line) else {
                     return;
@@ -398,24 +404,14 @@ pub fn read_clicks(
                     campaign,
                 });
             })?;
-            for (destination, batch) in shared.iter().zip(local) {
-                if !batch.is_empty() {
-                    append(&mut destination.lock().unwrap(), batch);
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    let clicks = shared
-        .into_par_iter()
-        .map(|shard| {
-            let mut clicks = shard.into_inner().unwrap();
-            clicks.par_sort_unstable_by_key(|click| {
-                (click.person, click.time, click.campaign, click.id)
-            });
-            // Copies of a click have identical values, including validity.
-            clicks.dedup();
-            clicks
-        })
-        .collect();
+            Ok::<_, anyhow::Error>(local)
+        }).collect::<Result<Vec<_>>>()?;
+    let mut partitions = shards::<Vec<Vec<Click>>>();
+    for chunk in pieces {
+        for (partition, rows) in partitions.iter_mut().zip(chunk) {
+            if !rows.is_empty() { partition.push(rows); }
+        }
+    }
+    let clicks = partitions.into_par_iter().map(order_clicks).collect();
     Ok((clicks, ClickIds(ids.into_names())))
 }

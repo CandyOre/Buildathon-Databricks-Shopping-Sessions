@@ -9,6 +9,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 COPY --from=build /shopping-sessions /usr/local/bin/shopping-sessions
-ENV MIMALLOC_PURGE_DELAY=0
+ENV MIMALLOC_PURGE_DELAY=10000
 USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]

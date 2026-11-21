@@ -9,11 +9,13 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 
 use crate::aggregate::{CampaignDays, SessionBatch};
 use crate::input::{Dimensions, PersonNames};
 
 const BATCH_SIZE: usize = 65_536;
+const USER_PARTS: usize = 8;
 
 pub fn write(
     output: &Path,
@@ -23,7 +25,13 @@ pub fn write(
     dimensions: &Dimensions,
 ) -> Result<()> {
     let (user_result, campaign_result) = rayon::join(
-        || write_users(output, users, names, dimensions),
+        || {
+            (0..USER_PARTS).into_par_iter().try_for_each(|part| {
+                let batches =
+                    &users[part * users.len() / USER_PARTS..(part + 1) * users.len() / USER_PARTS];
+                write_users(output, part, batches, names, dimensions)
+            })
+        },
         || write_campaigns(output, campaigns, dimensions),
     );
     user_result?;
@@ -33,6 +41,7 @@ pub fn write(
 fn open(
     output: &Path,
     table: &str,
+    part: usize,
     columns: &[(&str, DataType, bool)],
 ) -> Result<(SchemaRef, ArrowWriter<File>)> {
     let directory = output.join(table);
@@ -48,7 +57,7 @@ fn open(
         .set_max_row_group_size(BATCH_SIZE)
         .build();
     let writer = ArrowWriter::try_new(
-        File::create(directory.join("part-0.parquet"))?,
+        File::create(directory.join(format!("part-{part}.parquet")))?,
         schema.clone(),
         Some(properties),
     )?;
@@ -57,13 +66,15 @@ fn open(
 
 fn write_users(
     output: &Path,
-    users: Vec<SessionBatch>,
+    part: usize,
+    users: &[SessionBatch],
     names: &PersonNames,
     dimensions: &Dimensions,
 ) -> Result<()> {
     let (schema, mut writer) = open(
         output,
         "user_daily",
+        part,
         &[
             ("user_id", DataType::Utf8, false),
             ("day", DataType::Date32, false),
@@ -112,6 +123,7 @@ fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensio
     let (schema, mut writer) = open(
         output,
         "campaign_daily",
+        0,
         &[
             ("campaign_id", DataType::Utf8, false),
             ("channel", DataType::Utf8, false),

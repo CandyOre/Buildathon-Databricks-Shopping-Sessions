@@ -89,7 +89,7 @@ fn finish_day(mut row: UserDay, categories: &mut AHashMap<u32, i64>, daily: &mut
     daily.push(row);
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct CampaignDay {
     pub sessions: i64,
     pub purchasing_sessions: i64,
@@ -99,36 +99,77 @@ pub struct CampaignDay {
 
 pub type CampaignDays = AHashMap<(u32, i32), CampaignDay>;
 
+// Allocate dense counters only when the manifest and dimension table imply a
+// modest working set. The sparse representation handles longer windows.
+enum Counters {
+    Dense { first_day: i32, days: usize, rows: Vec<CampaignDay> },
+    Sparse(CampaignDays),
+}
+
+impl Counters {
+    fn new(campaigns: usize, window: crate::input::Window) -> Self {
+        let first_day = day(window.start);
+        let days = (i64::from(day(window.end.saturating_sub(1))) - i64::from(first_day) + 1).max(0) as usize;
+        if let Some(size) = campaigns.checked_mul(days).filter(|&n| n > 0 && n <= 131_072) {
+            Self::Dense { first_day, days, rows: vec![CampaignDay::default(); size] }
+        } else {
+            Self::Sparse(CampaignDays::default())
+        }
+    }
+
+    fn row(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
+        match self {
+            Self::Dense { first_day, days, rows } => {
+                &mut rows[campaign as usize * *days + (day - *first_day) as usize]
+            }
+            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
+        }
+    }
+
+    fn into_rows(self) -> CampaignDays {
+        match self {
+            Self::Sparse(rows) => rows,
+            Self::Dense { first_day, days, rows } => rows.into_iter().enumerate()
+                .filter(|(_, row)| row.sessions != 0 || row.assisted_sessions != 0)
+                .map(|(index, row)| (((index / days) as u32, first_day + (index % days) as i32), row))
+                .collect(),
+        }
+    }
+}
+
 pub fn campaign_daily(
     batches: &mut [SessionBatch],
     clicks: Vec<Vec<Click>>,
     ids: ClickIds,
+    campaigns: usize,
+    window: crate::input::Window,
 ) -> CampaignDays {
-    batches
-        .par_iter_mut()
-        .zip(clicks)
-        .map(|(batch, clicks)| {
-            summarize_campaigns(std::mem::take(&mut batch.sessions), &clicks, &ids)
-        })
-        .reduce(CampaignDays::default, |mut left, right| {
-            for (key, value) in right {
-                let target = left.entry(key).or_default();
-                target.sessions += value.sessions;
-                target.purchasing_sessions += value.purchasing_sessions;
-                target.revenue += value.revenue;
-                target.assisted_sessions += value.assisted_sessions;
-            }
-            left
-        })
+    let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
+    batches.par_iter_mut().zip(clicks).with_min_len(min_len).fold(
+        || (Counters::new(campaigns, window), AHashMap::default()),
+        |(mut totals, mut intervals), (batch, clicks)| {
+            summarize_campaigns(std::mem::take(&mut batch.sessions), &clicks, &ids, &mut totals, &mut intervals);
+            (totals, intervals)
+        },
+    ).map(|(totals, _)| totals.into_rows()).reduce(CampaignDays::default, |mut left, right| {
+        for (key, value) in right {
+            let target = left.entry(key).or_default();
+            target.sessions += value.sessions;
+            target.purchasing_sessions += value.purchasing_sessions;
+            target.revenue += value.revenue;
+            target.assisted_sessions += value.assisted_sessions;
+        }
+        left
+    })
 }
 
 fn summarize_campaigns(
     sessions: Vec<Session>,
     mut clicks: &[Click],
     ids: &ClickIds,
-) -> CampaignDays {
-    let mut totals = CampaignDays::default();
-    let mut intervals = AHashMap::<u32, (i64, i64)>::new();
+    totals: &mut Counters,
+    intervals: &mut AHashMap<u32, (i64, i64)>,
+) {
     for sessions in sessions.chunk_by(|a, b| a.person == b.person) {
         let person = sessions[0].person;
         while clicks.first().is_some_and(|click| click.person < person) {
@@ -147,25 +188,24 @@ fn summarize_campaigns(
         let end = person_clicks.partition_point(|click| click.time <= end_time);
         let person_clicks = &person_clicks[start..end];
 
-        credit(sessions, person_clicks, ids, &mut totals);
+        credit(sessions, person_clicks, ids, totals);
         for click in person_clicks {
             let interval = intervals
                 .entry(click.campaign)
                 .or_insert((click.time, click.time + LOOKBACK));
             if click.time > interval.1 {
-                assist(sessions, click.campaign, *interval, &mut totals);
+                assist(sessions, click.campaign, *interval, totals);
                 interval.0 = click.time;
             }
             interval.1 = click.time + LOOKBACK;
         }
         for (campaign, interval) in intervals.drain() {
-            assist(sessions, campaign, interval, &mut totals);
+            assist(sessions, campaign, interval, totals);
         }
     }
-    totals
 }
 
-fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut CampaignDays) {
+fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut Counters) {
     let mut clicks = clicks.iter().peekable();
     let mut latest: Option<&Click> = None;
     for session in sessions {
@@ -183,7 +223,7 @@ fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut C
         let campaign = latest
             .filter(|click| click.time >= session.time - LOOKBACK)
             .map_or(0, |click| click.campaign);
-        let row = totals.entry((campaign, day(session.time))).or_default();
+        let row = totals.row(campaign, day(session.time));
         row.sessions += 1;
         row.purchasing_sessions += i64::from(session.revenue > 0);
         row.revenue += session.revenue;
@@ -194,7 +234,7 @@ fn assist(
     sessions: &[Session],
     campaign: u32,
     (first, last): (i64, i64),
-    totals: &mut CampaignDays,
+    totals: &mut Counters,
 ) {
     let start = sessions.partition_point(|session| session.time < first);
     let end = sessions.partition_point(|session| session.time <= last);
@@ -204,9 +244,7 @@ fn assist(
         let current_day = day(session.time);
         let next_day = (i64::from(current_day) + 1) * DAY;
         let count = covered.partition_point(|session| session.time < next_day);
-        totals
-            .entry((campaign, current_day))
-            .or_default()
+        totals.row(campaign, current_day)
             .assisted_sessions += count as i64;
         covered = &covered[count..];
     }
