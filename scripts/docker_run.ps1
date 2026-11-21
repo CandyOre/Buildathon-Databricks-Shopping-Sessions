@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $OutputDir,
     [ValidateRange(1, 4096)] [int] $Cpus = 4,
     [ValidateRange(1, 1024)] [int] $MemoryGb = 8,
-    [string] $Image = 'shopping-sessions:latest'
+    [string] $Image = 'shopping-sessions:rust'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +21,7 @@ $dockerArgs = @(
     '--mount', "type=bind,source=$data,target=/data,readonly",
     '--mount', "type=bind,source=$output,target=/output",
     '--mount', "type=bind,source=$scratch,target=/scratch",
-    '--env', "NCPU=$Cpus", '--env', "MEM_GB=$MemoryGb",
+    '--env', "NCPU=$Cpus", '--env', "MEM_GB=$MemoryGb", '--env', 'PROFILE',
     $Image
 )
 & docker @dockerArgs

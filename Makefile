@@ -1,4 +1,4 @@
-IMAGE ?= shopping-sessions:latest
+IMAGE ?= shopping-sessions:rust
 CPUS  ?= 8
 MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.

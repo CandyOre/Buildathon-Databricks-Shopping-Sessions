@@ -4,3 +4,4 @@ __pycache__/
 dev/
 dev-answer/
 out/
+rust/target/
