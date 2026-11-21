@@ -11,8 +11,12 @@ use crate::input::{
     unsigned,
 };
 
+#[path = "polars_dedup.rs"]
+mod polars_dedup;
+pub use polars_dedup::{dedup_polars_events, prepare_polars_events, read_polars_events};
+
 const EXTERNAL_ID: u64 = 1 << 63;
-const MAX_INLINE_ID: usize = 12;
+pub(crate) const MAX_INLINE_ID: usize = 12;
 const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const INVALID_PERSON: u32 = u32::MAX;
 
@@ -45,7 +49,7 @@ impl ClickIds {
             .cmp(self.bytes(right, &mut right_buffer))
     }
 
-    fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; MAX_INLINE_ID]) -> &'a [u8] {
+    pub(crate) fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; MAX_INLINE_ID]) -> &'a [u8] {
         if id >= EXTERNAL_ID {
             return input::name_for(&self.0, id as u32).as_bytes();
         }
@@ -132,6 +136,49 @@ fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
 }
 
+trait CandidateStore: Default + Send {
+    fn push_candidate(
+        &mut self,
+        id: u64,
+        ingested: i64,
+        time: i64,
+        person: u32,
+        purchase: Option<Purchase>,
+    );
+    fn flush_into(&mut self, destination: &Mutex<Self>);
+}
+
+impl CandidateStore for Batch<Candidate> {
+    fn push_candidate(
+        &mut self,
+        id: u64,
+        ingested: i64,
+        time: i64,
+        person: u32,
+        purchase: Option<Purchase>,
+    ) {
+        let purchase = self.add_purchase(purchase);
+        self.rows.push(Candidate {
+            id,
+            ingested,
+            event: Event {
+                time,
+                person,
+                purchase,
+            },
+        });
+    }
+
+    fn flush_into(&mut self, destination: &Mutex<Self>) {
+        if !self.rows.is_empty() {
+            destination
+                .lock()
+                .unwrap()
+                .append(self, |row| &mut row.event.purchase);
+        }
+    }
+}
+
 pub fn read_events(
     data: &Path,
     window: Window,
@@ -139,9 +186,19 @@ pub fn read_events(
     users: &Names,
     aliases: &Aliases,
 ) -> Result<Vec<Batch<Candidate>>> {
+    read_candidates(data, window, dimensions, users, aliases)
+}
+
+fn read_candidates<T: CandidateStore>(
+    data: &Path,
+    window: Window,
+    dimensions: &Dimensions,
+    users: &Names,
+    aliases: &Aliases,
+) -> Result<Vec<T>> {
     let ids = Names::default();
-    let shared = shards::<Mutex<Batch<Candidate>>>();
-    let worker_state = || (PersonCache::default(), shards::<Batch<Candidate>>());
+    let shared = shards::<Mutex<T>>();
+    let worker_state = || (PersonCache::default(), shards::<T>());
     chunks(&data.join("events"))?
         .into_par_iter()
         .try_for_each_init(worker_state, |(people, local), chunk| {
@@ -188,24 +245,10 @@ pub fn read_events(
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
                 let (time, person, purchase) = valid().unwrap_or((0, INVALID_PERSON, None));
-                let purchase = batch.add_purchase(purchase);
-                batch.rows.push(Candidate {
-                    id,
-                    ingested,
-                    event: Event {
-                        time,
-                        person,
-                        purchase,
-                    },
-                });
+                batch.push_candidate(id, ingested, time, person, purchase);
             })?;
             for (destination, batch) in shared.iter().zip(local) {
-                if !batch.rows.is_empty() {
-                    destination
-                        .lock()
-                        .unwrap()
-                        .append(batch, |row| &mut row.event.purchase);
-                }
+                batch.flush_into(destination);
             }
             Ok::<_, anyhow::Error>(())
         })?;

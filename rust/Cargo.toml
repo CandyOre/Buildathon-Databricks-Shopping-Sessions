@@ -17,6 +17,8 @@ parquet = { version = "54.3.1", default-features = false, features = ["arrow", "
 rayon = "1.10"
 serde_json = "1.0"
 
+polars = { version = "=0.46.0", default-features = false, features = ["lazy", "asof_join", "cum_agg", "range", "round_series"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

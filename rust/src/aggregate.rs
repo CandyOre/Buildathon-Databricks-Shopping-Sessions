@@ -18,15 +18,15 @@ pub struct UserDay {
     pub top_category: Option<u32>,
 }
 
-struct Session {
-    time: i64,
-    revenue: i64,
-    person: u32,
+pub(crate) struct Session {
+    pub(crate) time: i64,
+    pub(crate) revenue: i64,
+    pub(crate) person: u32,
 }
 
 pub struct SessionBatch {
     pub daily: Vec<UserDay>,
-    sessions: Vec<Session>,
+    pub(crate) sessions: Vec<Session>,
 }
 
 pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
