@@ -8,8 +8,7 @@ use rayon::prelude::*;
 
 use crate::csv::chunks;
 use crate::input::{
-    self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, timestamp,
-    unsigned,
+    self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, unsigned,
 };
 
 const EXTERNAL_ID: u64 = 1 << 63;
@@ -156,6 +155,7 @@ impl PersonRun {
 }
 
 pub struct Candidates {
+    compact_times: bool,
     by_id: Vec<Vec<IdRun>>,
     by_person: Vec<Vec<PersonRun>>,
     start: i64,
@@ -197,6 +197,7 @@ pub fn read_events(
     aliases: &Aliases,
 ) -> Result<Candidates> {
     let ids = Names::default();
+    let calendar = input::Calendar::new(window);
     let origin_seconds = window.start.div_euclid(1000) - 86_400;
     let parsed: Vec<_> = chunks(&data.join("events"))?
         .into_par_iter()
@@ -207,7 +208,8 @@ pub fn read_events(
                 if id.is_empty() {
                     return;
                 }
-                let ingested = input::ingest_timestamp(ingested);
+                let proposal = people.prepare(users, aliases, user);
+                let ingested = calendar.ingest(ingested);
                 let id = id_for(id, b'e', &ids);
                 // All three operations are bijective, including the multiplication
                 // by an odd number. Using the mixed value as the ID stays exact.
@@ -218,7 +220,7 @@ pub fn read_events(
                     if user.is_empty() || product.is_empty() {
                         return None;
                     }
-                    let time = timestamp(ts)?;
+                    let time = calendar.parse(ts)?;
                     if time < window.start || time >= window.end || time < ingested - DAY {
                         return None;
                     }
@@ -241,7 +243,11 @@ pub fn read_events(
                         }
                         _ => return None,
                     };
-                    Some((time, people.resolve(users, aliases, user), purchase))
+                    Some((
+                        time,
+                        people.prepared(proposal, users, aliases, user),
+                        purchase,
+                    ))
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
                 let position = valid().map_or(u32::MAX, |(time, person, purchase)| {
@@ -264,6 +270,11 @@ pub fn read_events(
         }
     }
     Ok(Candidates {
+        compact_times: window
+            .end
+            .checked_sub(window.start)
+            .and_then(|v| u32::try_from(v).ok())
+            .is_some(),
         by_id,
         by_person,
         start: window.start,
@@ -323,7 +334,10 @@ fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u
     losers
 }
 
-pub fn dedup_events(candidates: Candidates) -> (Vec<Batch<Event>>, usize) {
+pub fn dedup_and_sessionize(
+    candidates: Candidates,
+    width: usize,
+) -> (Vec<crate::aggregate::SessionBatch>, usize) {
     let losses: Vec<_> = candidates
         .by_id
         .into_par_iter()
@@ -339,37 +353,110 @@ pub fn dedup_events(candidates: Candidates) -> (Vec<Batch<Event>>, usize) {
         .by_person
         .into_par_iter()
         .zip(by_person)
-        .map(|(mut fragments, losers)| {
+        .enumerate()
+        .map(|(shard, (mut fragments, losers))| {
             let size: usize = fragments.iter().map(|run| run.rows.len()).sum();
-            let mut output = Batch {
-                rows: Vec::with_capacity(size - losers.len()),
-                purchases: Vec::new(),
-            };
+            let length = size - losers.len();
             for (chunk, position) in losers {
                 fragments[chunk].rows[position].person = INVALID_PERSON;
             }
+            if candidates.compact_times && use_counting_sort(length, width) {
+                // Count each user's offsets and purchases independently. Once converted to
+                // prefix sums, these counters also serve as the next free positions.
+                let mut ends = vec![(0u32, 0u32); width];
+                for run in &fragments {
+                    for row in &run.rows {
+                        let (person, purchase) = match row.person {
+                            INVALID_PERSON => continue,
+                            EXTENDED => {
+                                let (ev, p) = run.extra[row.time as usize];
+                                (ev.person, p.is_some())
+                            }
+                            person => (person, false),
+                        };
+                        let counts = &mut ends[person as usize / SHARDS];
+                        counts.0 += 1;
+                        counts.1 += u32::from(purchase);
+                    }
+                }
+                let mut totals = (0, 0);
+                for counts in &mut ends {
+                    let local = *counts;
+                    *counts = totals;
+                    totals.0 += local.0;
+                    totals.1 += local.1;
+                }
+                let mut times = Vec::<u32>::with_capacity(totals.0 as usize);
+                let mut sales = Vec::<(u32, Purchase)>::with_capacity(totals.1 as usize);
+                let ts_dst = times.spare_capacity_mut();
+                let sale_dst = sales.spare_capacity_mut();
+                for run in fragments {
+                    for row in run.rows {
+                        if row.person == INVALID_PERSON {
+                            continue;
+                        }
+                        let (person, time, p) = if row.person == EXTENDED {
+                            let (e, p) = run.extra[row.time as usize];
+                            (e.person, (e.time - candidates.start) as u32, p)
+                        } else {
+                            (row.person, row.time, None)
+                        };
+                        let heads = &mut ends[person as usize / SHARDS];
+                        ts_dst[heads.0 as usize].write(time);
+                        heads.0 += 1;
+                        if let Some(p) = p {
+                            sale_dst[heads.1 as usize].write((time, p));
+                            heads.1 += 1;
+                        }
+                    }
+                }
+                // Both ranges are based on the same surviving records we just scattered.
+                unsafe {
+                    times.set_len(totals.0 as usize);
+                    sales.set_len(totals.1 as usize);
+                }
+                return (
+                    crate::aggregate::compact_sessions(
+                        shard,
+                        candidates.start,
+                        &mut times,
+                        &mut sales,
+                        ends,
+                    ),
+                    length,
+                );
+            }
+            let mut output = Batch {
+                rows: Vec::with_capacity(length),
+                purchases: Vec::new(),
+            };
             for run in fragments {
                 for row in run.rows {
-                    match row.person {
+                    let event = match row.person {
                         INVALID_PERSON => continue,
                         EXTENDED => {
-                            let (mut event, purchase) = run.extra[row.time as usize];
-                            event.purchase = output.add_purchase(purchase);
-                            output.rows.push(event);
+                            let (mut e, purchase) = run.extra[row.time as usize];
+                            e.purchase = output.add_purchase(purchase);
+                            e
                         }
-                        person => output.rows.push(Event {
+                        person => Event {
                             time: candidates.start + i64::from(row.time),
                             person,
                             purchase: 0,
-                        }),
-                    }
+                        },
+                    };
+                    output.rows.push(event);
                 }
             }
-            output
+            output.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
+            (crate::aggregate::sessionize(output), length)
         })
         .collect();
-    let count = events.iter().map(|batch| batch.rows.len()).sum();
-    (events, count)
+    let event_count = events.iter().map(|(_, count)| *count).sum();
+    (
+        events.into_iter().map(|(batch, _)| batch).collect(),
+        event_count,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -380,14 +467,60 @@ pub struct Click {
     pub campaign: u32,
 }
 
-fn order_clicks(pieces: Vec<Vec<Click>>) -> Vec<Click> {
-    let mut clicks = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
-    for piece in pieces {
-        clicks.extend(piece);
+// Dense person IDs give a disjoint output range per person. For small or sparse
+// partitions, comparison sorting avoids initializing a larger offsets table.
+fn use_counting_sort(length: usize, width: usize) -> bool {
+    (4096..=u32::MAX as usize).contains(&length) && width <= length.saturating_mul(2)
+}
+
+fn prefixes(offsets: &mut [u32]) {
+    let mut total = 0;
+    for offset in offsets {
+        let size = *offset;
+        *offset = total;
+        total += size;
     }
-    // Equal-ID copies are identical. Repeating a click changes neither the
-    // winning click nor the union of assist intervals for its campaign.
-    clicks.par_sort_unstable_by_key(|click| (click.person, click.time));
+}
+
+fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, time: F) {
+    let mut start = 0;
+    for end in ends {
+        let end = end as usize;
+        if end - start > 32768 {
+            rows[start..end].par_sort_unstable_by_key(&time);
+        } else if end - start > 1 {
+            rows[start..end].sort_unstable_by_key(&time);
+        }
+        start = end;
+    }
+}
+
+fn order_clicks(pieces: Vec<Vec<Click>>, width: usize) -> Vec<Click> {
+    let length = pieces.iter().map(Vec::len).sum();
+    let mut clicks = Vec::with_capacity(length);
+    if !use_counting_sort(length, width) {
+        for piece in pieces {
+            clicks.extend(piece);
+        }
+        clicks.par_sort_unstable_by_key(|c| (c.person, c.time));
+        return clicks;
+    }
+    let mut ends = vec![0u32; width];
+    for c in pieces.iter().flatten() {
+        ends[c.person as usize / SHARDS] += 1;
+    }
+    prefixes(&mut ends);
+    let storage = clicks.spare_capacity_mut();
+    for c in pieces.into_iter().flatten() {
+        let head = &mut ends[c.person as usize / SHARDS];
+        storage[*head as usize].write(c);
+        *head += 1;
+    }
+    // Every click fills one distinct slot in its person's range.
+    unsafe {
+        clicks.set_len(length);
+    }
+    sort_times(&mut clicks, ends, |c| c.time);
     clicks
 }
 
@@ -399,6 +532,7 @@ pub fn read_clicks(
     aliases: &Aliases,
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
+    let calendar = input::Calendar::new(window);
     let pieces = chunks(&data.join("clicks"))?
         .into_par_iter()
         .map_init(PersonCache::default, |people, chunk| {
@@ -407,16 +541,17 @@ pub fn read_clicks(
                 if id.is_empty() || user.is_empty() {
                     return;
                 }
+                let proposal = people.prepare(users, aliases, user);
                 let Some(&campaign) = dimensions.campaign_ids.get(text(campaign)) else {
                     return;
                 };
-                let Some(time) = timestamp(ts) else {
+                let Some(time) = calendar.parse(ts) else {
                     return;
                 };
                 if time < window.start - LOOKBACK || time >= window.end {
                     return;
                 }
-                let person = people.resolve(users, aliases, user);
+                let person = people.prepared(proposal, users, aliases, user);
                 let id = id_for(id, b'k', &ids);
                 local[person as usize % SHARDS].push(Click {
                     time,
@@ -436,7 +571,11 @@ pub fn read_clicks(
             }
         }
     }
-    let clicks = partitions.into_par_iter().map(order_clicks).collect();
+    let width = users.person_slots_per_shard();
+    let clicks = partitions
+        .into_par_iter()
+        .map(|p| order_clicks(p, width))
+        .collect();
     Ok((clicks, ClickIds(ids.into_names())))
 }
 
@@ -470,6 +609,45 @@ mod id_tests {
                 assert_eq!(ids.compare(codes[i], codes[j]), a.cmp(b));
                 assert_eq!(codes[i] == codes[j], a == b);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::*;
+
+    #[test]
+    fn large_and_sparse_partitions_keep_all_clicks_in_time_order() {
+        for (count, width) in [(17, 29), (12000, 29), (12000, 40000)] {
+            let mut pieces = vec![Vec::new(); 7];
+            let mut expected = Vec::new();
+            for i in 0..count {
+                let person = ((i * 13 % 29) * SHARDS + 7) as u32;
+                let time = ((i * 23 % 41) as i64) - 23;
+                let id = i as u64;
+                let campaign = (i % 7) as u32;
+                pieces[i % 7].push(Click {
+                    person,
+                    time,
+                    id,
+                    campaign,
+                });
+                expected.push((person, time, id, campaign));
+            }
+            let sorted = order_clicks(pieces, width);
+            assert!(
+                sorted
+                    .windows(2)
+                    .all(|v| (v[0].person, v[0].time) <= (v[1].person, v[1].time))
+            );
+            let mut actual: Vec<_> = sorted
+                .iter()
+                .map(|c| (c.person, c.time, c.id, c.campaign))
+                .collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
         }
     }
 }

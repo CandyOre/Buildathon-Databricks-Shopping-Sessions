@@ -24,13 +24,34 @@ struct Session {
     person: u32,
 }
 
+#[derive(Default)]
+pub struct DailyColumns {
+    pub person: Vec<u32>,
+    pub day: Vec<i32>,
+    pub sessions: Vec<i64>,
+    pub events: Vec<i64>,
+    pub revenue: Vec<i64>,
+    pub category: Vec<Option<u32>>,
+}
+
+impl DailyColumns {
+    fn push(&mut self, row: UserDay) {
+        self.person.push(row.person);
+        self.day.push(row.day);
+        self.sessions.push(row.sessions);
+        self.events.push(row.events);
+        self.revenue.push(row.revenue);
+        self.category.push(row.top_category);
+    }
+}
+
 pub struct SessionBatch {
-    pub daily: Vec<UserDay>,
+    pub daily: DailyColumns,
     sessions: Vec<Session>,
 }
 
 pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
-    let mut daily = Vec::new();
+    let mut daily = DailyColumns::default();
     let mut sessions: Vec<Session> = Vec::new();
     let mut categories = AHashMap::<u32, i64>::new();
     for events in batch.rows.chunk_by(|a, b| a.person == b.person) {
@@ -80,7 +101,84 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
     SessionBatch { daily, sessions }
 }
 
-fn finish_day(mut row: UserDay, categories: &mut AHashMap<u32, i64>, daily: &mut Vec<UserDay>) {
+// Each range holds one person's millisecond offsets from the window start.
+// Sorting sparse purchases by the same clock places all sales at their session,
+// including sales sharing a timestamp with another event.
+pub fn compact_sessions(
+    shard: usize,
+    start: i64,
+    times: &mut [u32],
+    sales: &mut [(u32, crate::records::Purchase)],
+    ends: Vec<(u32, u32)>,
+) -> SessionBatch {
+    let mut daily = DailyColumns::default();
+    let mut sessions = Vec::new();
+    let mut categories = AHashMap::<u32, i64>::new();
+    let mut prev = (0, 0);
+    for (index, (last, sold)) in ends.into_iter().enumerate() {
+        let local = &mut times[prev.0 as usize..last as usize];
+        let purchases = &mut sales[prev.1 as usize..sold as usize];
+        prev = (last, sold);
+        if local.is_empty() {
+            continue;
+        }
+        if local.len() > 32768 {
+            local.par_sort_unstable();
+        } else {
+            local.sort_unstable();
+        }
+        purchases.sort_unstable_by_key(|p| p.0);
+        let person = (index * crate::input::SHARDS + shard) as u32;
+        let mut previous = local[0];
+        let first = start + i64::from(previous);
+        let mut row = UserDay {
+            person,
+            day: day(first),
+            sessions: 1,
+            ..UserDay::default()
+        };
+        sessions.push(Session {
+            person,
+            time: first,
+            revenue: 0,
+        });
+        let mut next = 0;
+        for &mut offset in local {
+            if offset - previous > 1_800_000 {
+                let time = start + i64::from(offset);
+                let next_day = day(time);
+                if next_day != row.day {
+                    finish_day(row, &mut categories, &mut daily);
+                    row = UserDay {
+                        person,
+                        day: next_day,
+                        ..UserDay::default()
+                    };
+                }
+                row.sessions += 1;
+                sessions.push(Session {
+                    person,
+                    time,
+                    revenue: 0,
+                });
+            }
+            previous = offset;
+            row.events += 1;
+            while next < purchases.len() && purchases[next].0 == offset {
+                let p = purchases[next].1;
+                let cents = i64::from(p.cents);
+                *categories.entry(p.category).or_default() += cents;
+                row.revenue += cents;
+                sessions.last_mut().unwrap().revenue += cents;
+                next += 1;
+            }
+        }
+        finish_day(row, &mut categories, &mut daily);
+    }
+    SessionBatch { daily, sessions }
+}
+
+fn finish_day(mut row: UserDay, categories: &mut AHashMap<u32, i64>, daily: &mut DailyColumns) {
     // Category IDs follow the byte-wise order of category names.
     row.top_category = categories
         .drain()
@@ -298,5 +396,76 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
         let count = covered.partition_point(|session| session.time < next_day);
         totals.row(campaign, current_day).assisted_sessions += count as i64;
         covered = &covered[count..];
+    }
+}
+
+#[cfg(test)]
+mod compact_session_tests {
+    use super::*;
+    use crate::records::Purchase;
+    fn daily(batch: &SessionBatch) -> Vec<(u32, i32, i64, i64, i64, Option<u32>)> {
+        (0..batch.daily.person.len())
+            .map(|i| {
+                (
+                    batch.daily.person[i],
+                    batch.daily.day[i],
+                    batch.daily.sessions[i],
+                    batch.daily.events[i],
+                    batch.daily.revenue[i],
+                    batch.daily.category[i],
+                )
+            })
+            .collect()
+    }
+    fn sessions(batch: &SessionBatch) -> Vec<(u32, i64, i64)> {
+        batch
+            .sessions
+            .iter()
+            .map(|s| (s.person, s.time, s.revenue))
+            .collect()
+    }
+    #[test]
+    fn compact_offsets_match_full_events_at_gaps_midnight_and_purchase_ties() {
+        let start = DAY - 500;
+        let shard = 7;
+        let mut times = Vec::new();
+        let mut sales = Vec::new();
+        let mut ends = Vec::new();
+        let mut expanded: Batch<Event> = Batch::default();
+        let data: &[&[(u32, Option<(u32, u32)>)]] = &[
+            &[
+                (1_800_501, Some((1, 50))),
+                (500, Some((2, 75))),
+                (0, None),
+                (500, Some((1, 25))),
+                (3_600_501, None),
+                (5_400_502, None),
+            ],
+            &[],
+            &[(11, Some((7, 10))), (11, Some((6, 10)))],
+        ];
+        for (group, events) in data.iter().enumerate() {
+            let person = (group * crate::input::SHARDS + shard) as u32;
+            for &(t, p) in *events {
+                times.push(t);
+                let purchase = p.map_or(0, |(category, cents)| {
+                    let p = Purchase { category, cents };
+                    sales.push((t, p));
+                    expanded.purchases.push(p);
+                    expanded.purchases.len() as u32
+                });
+                expanded.rows.push(Event {
+                    person,
+                    time: start + i64::from(t),
+                    purchase,
+                });
+            }
+            ends.push((times.len() as u32, sales.len() as u32));
+        }
+        expanded.rows.sort_unstable_by_key(|e| (e.person, e.time));
+        let expected = sessionize(expanded);
+        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends);
+        assert_eq!(daily(&actual), daily(&expected));
+        assert_eq!(sessions(&actual), sessions(&expected));
     }
 }

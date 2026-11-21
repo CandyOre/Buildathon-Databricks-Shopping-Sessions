@@ -144,6 +144,7 @@ fn clock_components(word: u64) -> (u32, u32, u32) {
     )
 }
 
+#[cfg(test)]
 pub fn ingest_timestamp(bytes: &[u8]) -> i64 {
     // The input contract guarantees F1 for ingest_ts.
     let bytes: &[u8; 20] = bytes.try_into().expect("ingest_ts is valid F1");
@@ -237,6 +238,115 @@ mod timestamp_tests {
         assert_eq!(unsigned(b"9223372036854775807"), Some(i64::MAX));
         assert_eq!(unsigned(b"9223372036854775808"), None);
         assert_eq!(unsigned(b"00000000000000:1"), None);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CachedDay {
+    month: u64,
+    day: u16,
+    midnight: i64,
+}
+
+// Cache dates around the manifest window and common decimal epoch prefixes.
+// Always compare the complete cached key before accepting a hit.
+pub struct Calendar {
+    days: [CachedDay; 64],
+    epochs: [(u32, i64); 16],
+}
+
+impl Calendar {
+    pub fn new(window: Window) -> Self {
+        let mut table = Self {
+            days: [CachedDay::default(); 64],
+            epochs: [(0, 0); 16],
+        };
+        let first = window.start.saturating_sub(LOOKBACK + DAY).div_euclid(DAY);
+        let last = window
+            .end
+            .saturating_add(DAY * 2)
+            .div_euclid(DAY)
+            .min(first.saturating_add(61));
+        for d in first..=last {
+            if let Some(date) = chrono::DateTime::from_timestamp(d * 86400, 0) {
+                let text = date.format("%Y-%m-%d").to_string();
+                let bytes = text.as_bytes();
+                if bytes.len() == 10 {
+                    table.days[Self::slot(bytes)] = CachedDay {
+                        month: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        day: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+                        midnight: d * DAY,
+                    };
+                }
+            }
+            let prefix = (d * DAY).div_euclid(1_000_000_000);
+            for n in [prefix, prefix + 1] {
+                if (1000..=9999).contains(&n) {
+                    let code = n.to_string();
+                    table.epochs[(code.as_bytes()[3] & 15) as usize] = (
+                        u32::from_le_bytes(code.as_bytes().try_into().unwrap()),
+                        n * 1_000_000_000,
+                    );
+                }
+            }
+        }
+        table
+    }
+
+    #[inline(always)]
+    fn slot(s: &[u8]) -> usize {
+        usize::from(s[6] & 1) * 32 + ((usize::from(s[8]) * 10 + usize::from(s[9])) & 31)
+    }
+
+    #[inline(always)]
+    fn date(&self, s: &[u8]) -> Option<i64> {
+        let entry = &self.days[Self::slot(s)];
+        let month = u64::from_le_bytes(s[..8].try_into().unwrap());
+        let day = u16::from_le_bytes(s[8..10].try_into().unwrap());
+        if month == entry.month && day == entry.day && month != 0 {
+            Some(entry.midnight)
+        } else {
+            midnight(s[..10].try_into().unwrap())
+        }
+    }
+
+    #[inline]
+    pub fn ingest(&self, s: &[u8]) -> i64 {
+        let s: &[u8; 20] = s.try_into().expect("ingest_ts is valid F1");
+        let word = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        let (h, m, sec) = clock_components(word);
+        self.date(s).expect("ingest_ts has a valid date")
+            + i64::from(h * 3600 + m * 60 + sec) * 1000
+    }
+
+    #[inline]
+    pub fn parse(&self, s: &[u8]) -> Option<i64> {
+        if s.len() == 13 {
+            let (key, base) = self.epochs[(s[3] & 15) as usize];
+            if key != 0 && key == u32::from_le_bytes(s[..4].try_into().unwrap()) {
+                let digit = s[4].wrapping_sub(b'0');
+                let tail = u64::from_le_bytes(s[5..].try_into().unwrap());
+                if digit > 9 || !all_digits(tail) {
+                    return None;
+                }
+                return Some(base + i64::from(digit) * 100_000_000 + i64::from(eight_digits(tail)));
+            }
+        }
+        if s.len() == 20 && s[19] == b'Z' {
+            let word = u64::from_le_bytes(s[11..19].try_into().unwrap());
+            if s[10] != b'T'
+                || word & CLOCK_COLONS != 0x0000_3a00_003a_0000
+                || !all_digits((word & !CLOCK_COLONS) | (0x3030_3030_3030_3030 & CLOCK_COLONS))
+            {
+                return None;
+            }
+            let (h, m, sec) = clock_components(word);
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            return Some(self.date(s)? + i64::from(h * 3600 + m * 60 + sec) * 1000);
+        }
+        timestamp(s)
     }
 }
 
@@ -347,6 +457,17 @@ impl Names {
             .into_iter()
             .map(|s| s.into_inner().unwrap().names)
             .collect()
+    }
+
+    pub fn person_slots_per_shard(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let state = shard.lock().unwrap();
+                state.offset + state.names.len()
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn into_people(mut self) -> PersonNames {
@@ -666,6 +787,57 @@ impl Default for PersonCache {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum Prepared {
+    Ready(u32),
+    Search(u64, usize),
+    External,
+}
+impl PersonCache {
+    #[inline]
+    pub fn prepare(&self, users: &Names, aliases: &Aliases, bytes: &[u8]) -> Prepared {
+        let Some(key) = packed_name(bytes) else {
+            return Prepared::External;
+        };
+        let hash = users.hash.hash_one(key) as usize;
+        let entry = &self.0[hash & (self.0.len() - 1)];
+        if entry.occupied && entry.key == key {
+            return Prepared::Ready(entry.person);
+        }
+        let index = hash & (aliases.table.entries.len() - 1);
+        let slot = &aliases.table.entries[index];
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                (slot as *const Entry).cast(),
+            );
+        }
+        Prepared::Search(key, hash)
+    }
+    #[inline]
+    pub fn prepared(
+        &mut self,
+        job: Prepared,
+        users: &Names,
+        aliases: &Aliases,
+        bytes: &[u8],
+    ) -> u32 {
+        match job {
+            Prepared::Ready(id) => id,
+            Prepared::External => self.resolve(users, aliases, bytes),
+            Prepared::Search(key, hash) => {
+                let person = aliases.table.resolve(key, hash, bytes, users);
+                let index = hash & (self.0.len() - 1);
+                self.0[index] = CachedPerson {
+                    key,
+                    person,
+                    occupied: true,
+                };
+                person
+            }
+        }
+    }
+}
 impl PersonCache {
     pub fn resolve(&mut self, users: &Names, aliases: &Aliases, bytes: &[u8]) -> u32 {
         debug_assert!(!bytes.is_empty());
@@ -849,6 +1021,42 @@ mod person_tests {
         let people = users.into_people();
         for (id, expected) in results[0].iter().zip(&names) {
             assert_eq!(people.get(*id, &mut [0; 9]), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+    #[test]
+    fn fast_dates_and_epochs_match_the_general_parser() {
+        let window = Window {
+            start: timestamp(b"2028-02-28T00:00:00Z").unwrap(),
+            end: timestamp(b"2028-03-05T00:00:00Z").unwrap(),
+        };
+        let calendar = Calendar::new(window);
+        let examples: &[&[u8]] = &[
+            b"2028-02-29T23:59:59Z",
+            b"2027-02-29T00:00:00Z",
+            b"2028-03-01T00:00:00+01:00",
+            b"2028-03-02T24:00:00Z",
+            b"2028-03-01T00:60:00Z",
+            b"1835481600000",
+            b"18350a1600000",
+            b"0000000000000",
+            b"00000000000000012",
+        ];
+        for &sample in examples {
+            assert_eq!(calendar.parse(sample), timestamp(sample));
+        }
+        for &sample in [
+            b"2028-02-29T23:59:59Z",
+            b"2028-03-01T00:00:00Z",
+            b"1984-01-01T02:03:04Z",
+        ]
+        .iter()
+        {
+            assert_eq!(calendar.ingest(sample), ingest_timestamp(sample));
         }
     }
 }

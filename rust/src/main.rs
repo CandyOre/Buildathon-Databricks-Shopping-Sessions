@@ -9,7 +9,6 @@ use std::env;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -35,18 +34,9 @@ fn main() -> Result<()> {
 
     let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
     profile.stage("parse_events");
-    let (mut events, event_count) = records::dedup_events(candidates);
-    profile.stage("dedup_events");
-    events.par_iter_mut().for_each(|batch| {
-        batch
-            .rows
-            .par_sort_unstable_by_key(|event| (event.person, event.time));
-    });
-    profile.stage("sort_events");
-
-    let mut session_batches: Vec<_> = events.into_par_iter().map(aggregate::sessionize).collect();
-    profile.stage("sessionize_and_user_daily");
-
+    let (mut session_batches, event_count) =
+        records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
+    profile.stage("dedup_and_sessionize");
     let (clicks, click_ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
     drop(aliases);
     let user_names = users.into_people();

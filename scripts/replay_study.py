@@ -32,6 +32,8 @@ def main():
     parser.add_argument("generator_zip", type=Path, help="official generator.zip")
     parser.add_argument("output", type=Path, help="a new folder for logs and Parquet outputs")
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
+    parser.add_argument("--baseline", default=BASE, help="local Git revision for the starting image")
+    parser.add_argument("--candidate", default="HEAD", help="local Git revision for the candidate image")
     parser.add_argument("--pairs", type=int, default=1)
     parser.add_argument("--cold-pairs", type=int, default=0)
     args = parser.parse_args()
@@ -47,8 +49,8 @@ def main():
     run("docker", "volume", "create", label)
     with tempfile.TemporaryDirectory() as temp:
         workspace = Path(temp)
-        build(BASE, baseline, workspace)
-        build("HEAD", candidate, workspace)
+        build(args.baseline, baseline, workspace)
+        build(args.candidate, candidate, workspace)
         with ZipFile(args.generator_zip) as files:
             files.extractall(workspace)
         generate = ["cargo build --release --locked --offline"]

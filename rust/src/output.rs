@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -26,11 +26,17 @@ pub fn write(
 ) -> Result<()> {
     let (user_result, campaign_result) = rayon::join(
         || {
-            (0..USER_PARTS).into_par_iter().try_for_each(|part| {
-                let batches =
-                    &users[part * users.len() / USER_PARTS..(part + 1) * users.len() / USER_PARTS];
-                write_users(output, part, batches, names, dimensions)
-            })
+            let shards = users.len();
+            let mut parts: [Vec<_>; USER_PARTS] = std::array::from_fn(|_| Vec::new());
+            for (i, shard) in users.into_iter().enumerate() {
+                parts[i * USER_PARTS / shards].push(shard);
+            }
+            parts
+                .into_par_iter()
+                .enumerate()
+                .try_for_each(|(part, batches)| {
+                    write_users(output, part, batches, names, dimensions)
+                })
         },
         || write_campaigns(output, campaigns, dimensions),
     );
@@ -67,7 +73,7 @@ fn open(
 fn write_users(
     output: &Path,
     part: usize,
-    users: &[SessionBatch],
+    users: Vec<SessionBatch>,
     names: &PersonNames,
     dimensions: &Dimensions,
 ) -> Result<()> {
@@ -84,34 +90,36 @@ fn write_users(
             ("top_category", DataType::Utf8, true),
         ],
     )?;
-    for batch in users {
-        for rows in batch.daily.chunks(BATCH_SIZE) {
-            let mut user_ids = StringBuilder::with_capacity(rows.len(), rows.len() * 9);
-            let mut name = [0; 9];
-            for row in rows {
-                user_ids.append_value(names.get(row.person, &mut name));
+    for shard in users {
+        let daily = shard.daily;
+        // Primitive Arrow arrays take ownership of these four contiguous
+        // buffers. Taking a row-group slice only adjusts offsets and lengths.
+        let primitives: [ArrayRef; 4] = [
+            Arc::new(Date32Array::from(daily.day)),
+            Arc::new(Int64Array::from(daily.sessions)),
+            Arc::new(Int64Array::from(daily.events)),
+            Arc::new(Int64Array::from(daily.revenue)),
+        ];
+        for (chunk, people) in daily.person.chunks(BATCH_SIZE).enumerate() {
+            let offset = chunk * BATCH_SIZE;
+            let len = people.len();
+            let mut user_ids = StringBuilder::with_capacity(len, len * 9);
+            let mut buffer = [0; 9];
+            for group in people.chunk_by(|a, b| a == b) {
+                let name = names.get(group[0], &mut buffer);
+                for _ in group {
+                    user_ids.append_value(name);
+                }
             }
-            let user_id = user_ids.finish();
-            let category = StringArray::from_iter(rows.iter().map(|row| {
-                row.top_category
-                    .map(|id| dimensions.categories[id as usize].as_str())
-            }));
-            let columns: Vec<ArrayRef> = vec![
-                Arc::new(user_id),
-                Arc::new(Date32Array::from_iter_values(
-                    rows.iter().map(|row| row.day),
-                )),
-                Arc::new(Int64Array::from_iter_values(
-                    rows.iter().map(|row| row.sessions),
-                )),
-                Arc::new(Int64Array::from_iter_values(
-                    rows.iter().map(|row| row.events),
-                )),
-                Arc::new(Int64Array::from_iter_values(
-                    rows.iter().map(|row| row.revenue),
-                )),
-                Arc::new(category),
-            ];
+            let categories = StringArray::from_iter(
+                daily.category[offset..offset + len]
+                    .iter()
+                    .map(|id| id.map(|id| dimensions.categories[id as usize].as_str())),
+            );
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(6);
+            columns.push(Arc::new(user_ids.finish()));
+            columns.extend(primitives.iter().map(|values| values.slice(offset, len)));
+            columns.push(Arc::new(categories));
             writer.write(&RecordBatch::try_new(schema.clone(), columns)?)?;
         }
     }

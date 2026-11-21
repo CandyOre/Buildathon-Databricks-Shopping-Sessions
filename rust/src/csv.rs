@@ -27,29 +27,45 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     use std::arch::x86_64::*;
 
-    let mut comma_masks = [0_u32; 4];
-    let mut quote_count = 0;
-    for (index, mask) in comma_masks
-        .iter_mut()
-        .take(line.len().div_ceil(32))
-        .enumerate()
-    {
-        let start = index * 32;
-        let load_at = start.min(line.len() - 32);
-        let skip = start - load_at;
-        // SAFETY: dispatch checked AVX2 and load_at + 32 <= line.len().
-        // The shift discards the bytes from an overlapping final load.
+    #[inline(always)]
+    unsafe fn masks(ptr: *const u8) -> (u64, u64) {
+        let b = unsafe { _mm256_loadu_si256(ptr.cast()) };
         unsafe {
-            let bytes = _mm256_loadu_si256(line.as_ptr().add(load_at).cast());
-            let commas = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8));
-            let quotes = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8));
-            *mask = (_mm256_movemask_epi8(commas) as u32) >> skip;
-            quote_count += ((_mm256_movemask_epi8(quotes) as u32) >> skip).count_ones();
+            (
+                (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, _mm256_set1_epi8(b',' as i8))) as u32)
+                    as u64,
+                (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, _mm256_set1_epi8(b'"' as i8))) as u32)
+                    as u64,
+            )
         }
     }
-
-    let mut low = u64::from(comma_masks[0]) | (u64::from(comma_masks[1]) << 32);
-    let mut high = u64::from(comma_masks[2]) | (u64::from(comma_masks[3]) << 32);
+    let len = line.len();
+    let (a, qa) = unsafe { masks(line.as_ptr()) };
+    let (b, qb) = if len > 32 && len <= 64 {
+        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+        (m >> (64 - len), q >> (64 - len))
+    } else if len > 64 {
+        unsafe { masks(line.as_ptr().add(32)) }
+    } else {
+        (0, 0)
+    };
+    let (c, qc) = if len > 64 && len <= 96 {
+        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+        (m >> (96 - len), q >> (96 - len))
+    } else if len > 96 {
+        unsafe { masks(line.as_ptr().add(64)) }
+    } else {
+        (0, 0)
+    };
+    let (d, qd) = if len > 96 {
+        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+        (m >> (128 - len), q >> (128 - len))
+    } else {
+        (0, 0)
+    };
+    let mut low = a | b << 32;
+    let mut high = c | d << 32;
+    let quote_count = (qa | qb << 32).count_ones() + (qc | qd << 32).count_ones();
     if (low.count_ones() + high.count_ones()) as usize + 1 != N {
         return None;
     }
