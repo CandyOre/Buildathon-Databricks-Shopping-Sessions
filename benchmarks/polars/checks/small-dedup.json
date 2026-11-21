@@ -1,0 +1,343 @@
+{
+  "variant": "dedup",
+  "image": "sha256:7b54f0d1fcec2e7f87cd5e4f1f449fbc211c076236ef68ff6bf6c06dbe135008",
+  "official_fixtures_passed": 36,
+  "fixtures": [
+    {
+      "case": "A1",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "A10",
+      "rows": {
+        "user_daily": 3,
+        "campaign_daily": 3
+      }
+    },
+    {
+      "case": "A11",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 3
+      }
+    },
+    {
+      "case": "A12",
+      "rows": {
+        "user_daily": 4,
+        "campaign_daily": 6
+      }
+    },
+    {
+      "case": "A2",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "A3",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "A4",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "A5",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "A6",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "A7",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "A8",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "A9",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "E1",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E10",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E11",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E12",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E13",
+      "rows": {
+        "user_daily": 0,
+        "campaign_daily": 0
+      }
+    },
+    {
+      "case": "E14",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "E15",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E16",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "E17",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E18",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E19",
+      "rows": {
+        "user_daily": 3,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "E2",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E20",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E3",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E4",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E5",
+      "rows": {
+        "user_daily": 0,
+        "campaign_daily": 0
+      }
+    },
+    {
+      "case": "E6",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E7",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E8",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "E9",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "L1",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "L2",
+      "rows": {
+        "user_daily": 2,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "L3",
+      "rows": {
+        "user_daily": 5,
+        "campaign_daily": 1
+      }
+    },
+    {
+      "case": "L4",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 2
+      }
+    },
+    {
+      "case": "copy_and_click_ties",
+      "rows": {
+        "user_daily": 1,
+        "campaign_daily": 2
+      }
+    }
+  ],
+  "public_1m_seed_1": {
+    "user_daily": {
+      "left": {
+        "rows": 117038,
+        "unique_keys": 117038,
+        "nulls": {
+          "user_id": 0,
+          "day": 0,
+          "sessions": 0,
+          "events": 0,
+          "revenue_cents": 0,
+          "top_category": 96338
+        }
+      },
+      "right": {
+        "rows": 117038,
+        "unique_keys": 117038,
+        "nulls": {
+          "user_id": 0,
+          "day": 0,
+          "sessions": 0,
+          "events": 0,
+          "revenue_cents": 0,
+          "top_category": 96338
+        }
+      },
+      "column_mismatches": {
+        "user_id": 0,
+        "day": 0,
+        "sessions": 0,
+        "events": 0,
+        "revenue_cents": 0,
+        "top_category": 0
+      },
+      "left_except_all_right": 0,
+      "right_except_all_left": 0
+    },
+    "campaign_daily": {
+      "left": {
+        "rows": 27400,
+        "unique_keys": 27400,
+        "nulls": {
+          "campaign_id": 0,
+          "channel": 0,
+          "day": 0,
+          "sessions": 0,
+          "purchasing_sessions": 0,
+          "revenue_cents": 0,
+          "assisted_sessions": 0
+        }
+      },
+      "right": {
+        "rows": 27400,
+        "unique_keys": 27400,
+        "nulls": {
+          "campaign_id": 0,
+          "channel": 0,
+          "day": 0,
+          "sessions": 0,
+          "purchasing_sessions": 0,
+          "revenue_cents": 0,
+          "assisted_sessions": 0
+        }
+      },
+      "column_mismatches": {
+        "campaign_id": 0,
+        "channel": 0,
+        "day": 0,
+        "sessions": 0,
+        "purchasing_sessions": 0,
+        "revenue_cents": 0,
+        "assisted_sessions": 0
+      },
+      "left_except_all_right": 0,
+      "right_except_all_left": 0
+    }
+  }
+}

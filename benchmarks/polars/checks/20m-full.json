@@ -1,0 +1,82 @@
+{
+  "size": "20m",
+  "baseline": "native",
+  "candidate": "full",
+  "tables": {
+    "user_daily": {
+      "left": {
+        "rows": 2230266,
+        "unique_keys": 2230266,
+        "nulls": {
+          "user_id": 0,
+          "day": 0,
+          "sessions": 0,
+          "events": 0,
+          "revenue_cents": 0,
+          "top_category": 1837562
+        }
+      },
+      "right": {
+        "rows": 2230266,
+        "unique_keys": 2230266,
+        "nulls": {
+          "user_id": 0,
+          "day": 0,
+          "sessions": 0,
+          "events": 0,
+          "revenue_cents": 0,
+          "top_category": 1837562
+        }
+      },
+      "column_mismatches": {
+        "user_id": 0,
+        "day": 0,
+        "sessions": 0,
+        "events": 0,
+        "revenue_cents": 0,
+        "top_category": 0
+      },
+      "left_except_all_right": 0,
+      "right_except_all_left": 0
+    },
+    "campaign_daily": {
+      "left": {
+        "rows": 28014,
+        "unique_keys": 28014,
+        "nulls": {
+          "campaign_id": 0,
+          "channel": 0,
+          "day": 0,
+          "sessions": 0,
+          "purchasing_sessions": 0,
+          "revenue_cents": 0,
+          "assisted_sessions": 0
+        }
+      },
+      "right": {
+        "rows": 28014,
+        "unique_keys": 28014,
+        "nulls": {
+          "campaign_id": 0,
+          "channel": 0,
+          "day": 0,
+          "sessions": 0,
+          "purchasing_sessions": 0,
+          "revenue_cents": 0,
+          "assisted_sessions": 0
+        }
+      },
+      "column_mismatches": {
+        "campaign_id": 0,
+        "channel": 0,
+        "day": 0,
+        "sessions": 0,
+        "purchasing_sessions": 0,
+        "revenue_cents": 0,
+        "assisted_sessions": 0
+      },
+      "left_except_all_right": 0,
+      "right_except_all_left": 0
+    }
+  }
+}

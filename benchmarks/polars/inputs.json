@@ -1,0 +1,32 @@
+{
+  "archives_sha256": {
+    "generator.zip": "13724cadbac5a99d847e27cea911cd2e338ff972b46c2039da87452011bb101e",
+    "dev-answer.zip": "7eb8e1f0b1f431d178d28ac9437ce85809c44eb6393fdd42fb59857f30834fa9"
+  },
+  "generator_image": "rust:1.85-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36",
+  "datasets": {
+    "events-1m": {
+      "seed": 1,
+      "events": 1000000,
+      "clicks": 250000,
+      "files": 87,
+      "manifest_sha256": "4ee627fa863d808517d8b840588921761a790e094dad404a46041cb8277e5554"
+    },
+    "events-20m": {
+      "seed": 53,
+      "events": 20000000,
+      "clicks": 5000000,
+      "files": 168,
+      "manifest_sha256": "2d4eadd2e46171d5c2c00e85d67c1827591689881fb12adef7b2bebc735e994c"
+    },
+    "events-60m": {
+      "seed": 37,
+      "events": 60000000,
+      "clicks": 15000000,
+      "files": 161,
+      "manifest_sha256": "a678db9e7c117a4a1875ed67dbbd52ecc9192f5b587bc563cfbd7f8279ef8903"
+    }
+  },
+  "manifest_format": "LC_ALL=C, sorted ./relative/path names, lowercase sha256, two spaces, path, LF",
+  "compared_volume": "shopping-sessions-bench"
+}

@@ -1,5 +1,7 @@
 # Shopping Sessions
 
+This branch benchmarks two Rust + Polars candidates against native commit `bfc2c1c`. The default Docker target runs the full Polars pipeline. Use the `dedup` target for Polars event deduplication with the native downstream stages. [Measured results and reproduction commands](POLARS_BENCHMARKS.md).
+
 The Rust pipeline cleans the Shopping Sessions CSVs, resolves linked user IDs, builds sessions, and computes campaign attribution and assists. It writes `user_daily/part-0.parquet` and `campaign_daily/part-0.parquet` to the output directory. See [the official rules](rules.md) for the input and output contracts.
 
 ## Windows quick start
@@ -7,10 +9,10 @@ The Rust pipeline cleans the Shopping Sessions CSVs, resolves linked user IDs, b
 With Docker Desktop running, build the scorer image and install the Python checker:
 
 ```powershell
-docker buildx build --platform linux/amd64 --load -t shopping-sessions:rust .
+docker buildx build --platform linux/amd64 --target full --load -t shopping-sessions:polars-full .
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install polars
-.\.venv\Scripts\python.exe scripts/run_fixtures.py fixtures -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/docker_run.ps1
+.\.venv\Scripts\python.exe scripts/run_fixtures.py fixtures -- powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/docker_run.ps1 -Image shopping-sessions:polars-full
 ```
 
 The fixture runner checks both Parquet tables against the expected CSVs for all 36 official cases. To generate the public development dataset and download its expected results, run the following with Docker Desktop running:
@@ -31,7 +33,7 @@ Run the development dataset and compare both tables:
 
 ```powershell
 $env:PROFILE = '1'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/docker_run.ps1 -DataDir .buildathon/dev -OutputDir out
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/docker_run.ps1 -Image shopping-sessions:polars-full -DataDir .buildathon/dev -OutputDir out
 .\.venv\Scripts\python.exe scripts/compare.py out .buildathon/dev-answer
 ```
 
@@ -60,7 +62,7 @@ On Apple silicon, use `PLATFORM=linux/arm64` for native local iteration and veri
 
 Set `PROFILE=1` to emit one JSON record per stage and a total record to stderr. On Linux, the stage records contain first, last, and peak process RSS sampled about every 5 ms. The total record reads the kernel's process high-water mark and cgroup peak, if available. The cgroup peak also includes charged file cache. A Docker memory cap constrains the container, including that cache.
 
-See [measured stage timings and memory peaks](BENCHMARKS.md) for the 1M, 10M and 60M runs.
+See [the Polars comparison](POLARS_BENCHMARKS.md) for the 20M and 60M experiments, and [the native pipeline history](BENCHMARKS.md) for earlier measurements.
 
 The DuckDB comparison implementation is still available in `pipeline/`. Build it with `docker build -f Dockerfile.duckdb -t shopping-sessions:duckdb .` and run the PowerShell wrapper with `-Image shopping-sessions:duckdb` and a separate output directory. Pass both output directories to `scripts/compare.py` for an exact comparison.
 

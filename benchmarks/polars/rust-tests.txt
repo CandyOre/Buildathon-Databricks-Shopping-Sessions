@@ -1,0 +1,10 @@
+running 7 tests
+test input::timestamp_tests::cached_midnights_distinguish_months_years_and_invalid_dates ... ok
+test input::timestamp_tests::epoch_numbers_support_padding_and_reject_overflow ... ok
+test input::person_tests::local_cache_keeps_linked_and_unlinked_ids_exact_on_collision ... ok
+test csv::field_tests::vector_boundaries_agree_with_portable_csv ... ok
+test csv::scan_tests::chunks_preserve_lines_across_read_buffers_and_job_boundaries ... ok
+test records::polars_dedup::tests::invalid_earliest_copy_discards_id_across_files ... ok
+test polars_campaign::tests::byte_ties_and_overlapping_assists_at_inclusive_boundaries ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

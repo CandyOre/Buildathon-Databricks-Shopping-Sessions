@@ -1,0 +1,33 @@
+{
+  "source_commit": "ecd7b8971c65390d649693a064bff054f727f9b6",
+  "wall_seconds": 268.5540198,
+  "full_image": "sha256:ac208dea8effdbd167ae6b230a36a15afce2d3ab09f7ff0d30867481b0ed30b2 156158461",
+  "buildkit": "v0.35.1",
+  "builder_setup_seconds": 2.9,
+  "cpu_set": "0-7",
+  "memory_bytes": 25769803776,
+  "memory_swap_bytes": 25769803776,
+  "cache": "new docker-container builder, --no-cache, no Cargo mounts",
+  "rustc": "1.85.1",
+  "polars": "0.46.0",
+  "dedup_image": "sha256:7b54f0d1fcec2e7f87cd5e4f1f449fbc211c076236ef68ff6bf6c06dbe135008 156158463",
+  "builder_run_step_seconds": 237.2,
+  "host": {
+    "processor": "AMD Ryzen 7 9800X3D",
+    "engine": "Docker Desktop 29.9.3",
+    "kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "logical_cpus": 16,
+    "vm_memory_bytes": 24752316416,
+    "benchmark_cpu_set": "0-7",
+    "benchmark_smt_siblings": [
+      "0-1",
+      "2-3",
+      "4-5",
+      "6-7"
+    ],
+    "cpu_max": "800000 100000",
+    "memory_max_bytes": 25769803776,
+    "swap_max_bytes": 0
+  },
+  "native_image": "sha256:8f0cd6cdf6519f2b850ded92aff6d2adb6fd4a2d702d3e8fec2f743d25591473 122147317"
+}
