@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
     let out = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
@@ -40,13 +43,14 @@ fn main() -> Result<()> {
     });
     profile.stage("sort_events");
 
+    let mut session_batches: Vec<_> = events.into_par_iter().map(aggregate::sessionize).collect();
+    profile.stage("sessionize_and_user_daily");
+
     let (clicks, click_ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
     drop(aliases);
     let user_names = users.into_names();
     profile.stage("parse_and_sort_clicks");
 
-    let mut session_batches: Vec<_> = events.into_par_iter().map(aggregate::sessionize).collect();
-    profile.stage("sessionize_and_user_daily");
     let campaign_daily = aggregate::campaign_daily(&mut session_batches, clicks, click_ids);
     profile.stage("attribution_and_assists");
     output::write(

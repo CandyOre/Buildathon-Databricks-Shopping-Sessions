@@ -60,4 +60,6 @@ On Apple silicon, use `PLATFORM=linux/arm64` for native local iteration and veri
 
 Set `PROFILE=1` to emit one JSON record per stage and a total record to stderr. On Linux, the stage records contain first, last, and peak process RSS sampled about every 5 ms. The total record reads the kernel's process high-water mark and cgroup peak, if available. The cgroup peak also includes charged file cache. A Docker memory cap constrains the container, including that cache.
 
+See [measured stage timings and memory peaks](BENCHMARKS.md) for the 1M, 10M and 60M runs.
+
 The DuckDB comparison implementation is still available in `pipeline/`. Build it with `docker build -f Dockerfile.duckdb -t shopping-sessions:duckdb .` and run the PowerShell wrapper with `-Image shopping-sessions:duckdb` and a separate output directory. Pass both output directories to `scripts/compare.py` for an exact comparison.
