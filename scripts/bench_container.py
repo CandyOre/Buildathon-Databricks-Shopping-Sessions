@@ -13,6 +13,18 @@ def docker(*args, capture=False):
     return result.stdout if capture else None
 
 
+def input_residency(data_mount):
+    check = (
+        'pagesize=$(getconf PAGESIZE); '
+        'find /data -type f -exec fincore -bn -o RES,SIZE {} + | '
+        """awk -v p="$pagesize" '{r+=$1; n+=int(($2+p-1)/p)*p} END{printf "%.0f %.0f", r,n}'"""
+    )
+    output = docker("run", "--rm", "--network", "none", "--mount", data_mount,
+                    "debian:bookworm-slim", "sh", "-ec", check, capture=True)
+    resident, total = output.split()
+    return int(resident), int(total)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("volume")
@@ -22,6 +34,8 @@ def main():
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--cache", choices=("warm", "evict"), default="warm")
+    parser.add_argument("--verify-cache", action="store_true",
+                        help="check resident input pages before each run and log the result")
     parser.add_argument("--export", type=Path, help="copy the last run's output to a new directory")
     args = parser.parse_args()
     if args.export and args.export.exists():
@@ -36,6 +50,7 @@ def main():
                "sh", "-ec", "find /data -type f -exec cat {} + >/dev/null")
     for i, image in enumerate(args.images):
         resident_bytes = None
+        input_page_bytes = None
         if args.cache == "evict":
             resident_bytes = int(docker(
                 "run", "--rm", "--network", "none", "--mount", data_mount, "debian:bookworm-slim",
@@ -43,6 +58,15 @@ def main():
                 """find /data -type f -exec dd 'if={}' iflag=nocache count=0 status=none \\;"""
                 """ && find /data -type f -exec fincore -bn -o RES {} + | awk '{n+=$1} END{printf "%.0f", n}'""",
                 capture=True).strip())
+        if args.verify_cache:
+            resident_bytes, input_page_bytes = input_residency(data_mount)
+            if args.cache == "warm" and resident_bytes != input_page_bytes:
+                docker("run", "--rm", "--network", "none", "--mount", data_mount,
+                       "debian:bookworm-slim", "sh", "-ec", "find /data -type f -exec cat {} + >/dev/null")
+                resident_bytes, input_page_bytes = input_residency(data_mount)
+            target = input_page_bytes if args.cache == "warm" else 0
+            if resident_bytes != target:
+                raise RuntimeError(f"input cache has {resident_bytes} resident bytes, expected {target}")
         run = "shopping-bench-" + uuid.uuid4().hex
         output = "/output/" + run
         command = ["run", "--name", run, "--platform", "linux/amd64", "--network", "none",
@@ -70,7 +94,8 @@ def main():
                        volume=args.volume, cpuset=args.cpuset, started=state["StartedAt"],
                        finished=state["FinishedAt"], seconds=duration, cli_seconds=host_wall,
                        profile=args.profile, output=output,
-                       cache=args.cache, resident_bytes_after_eviction=resident_bytes,
+                       cache=args.cache, resident_input_bytes=resident_bytes, input_page_bytes=input_page_bytes,
+                       resident_bytes_after_eviction=resident_bytes if args.cache == "evict" else None,
                        stages=[json.loads(line[8:]) for line in result.stderr.splitlines()
                                if line.startswith("profile ")])
             with args.log.open("a", encoding="utf-8") as file:
