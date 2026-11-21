@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use ahash::AHashMap;
 use anyhow::Result;
 use rayon::prelude::*;
 
@@ -12,23 +13,26 @@ use crate::input::{
 };
 
 const EXTERNAL_ID: u64 = 1 << 63;
-const MAX_INLINE_ID: usize = 12;
-const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const INVALID_PERSON: u32 = u32::MAX;
 
-fn id_for(id: &[u8], fallback: &Names) -> u64 {
-    if id.len() <= MAX_INLINE_ID {
-        let mut value = 0;
-        for &byte in id {
-            let digit = match byte {
-                b'0'..=b'9' => byte - b'0' + 1,
-                b'a'..=b'z' => byte - b'a' + 11,
-                _ => return EXTERNAL_ID | u64::from(fallback.intern(text(id))),
+// Encode the common prefix plus up to eight following bytes without hashing
+// or base conversion. The high bit is reserved for interned names. Right zero
+// padding preserves byte order; names ending in NUL use the exact fallback.
+fn id_for(id: &[u8], prefix: u8, fallback: &Names) -> u64 {
+    if let [first, tail @ ..] = id {
+        if *first == prefix && tail.len() <= 8 && tail.last() != Some(&0) {
+            let word = match tail {
+                full @ [_, _, _, _, _, _, _, _] => u64::from_be_bytes(full.try_into().unwrap()),
+                _ => {
+                    let mut bytes = [0; 8];
+                    bytes[..tail.len()].copy_from_slice(tail);
+                    u64::from_be_bytes(bytes)
+                }
             };
-            value = value * 37 + u64::from(digit);
+            if word < EXTERNAL_ID {
+                return word;
+            }
         }
-        // Zero is padding. Every byte in the alphabet maps to a nonzero digit.
-        return value * 37_u64.pow((MAX_INLINE_ID - id.len()) as u32);
     }
     EXTERNAL_ID | u64::from(fallback.intern(text(id)))
 }
@@ -40,27 +44,19 @@ impl ClickIds {
         if left < EXTERNAL_ID && right < EXTERNAL_ID {
             return left.cmp(&right);
         }
-        let (mut left_buffer, mut right_buffer) = ([0; MAX_INLINE_ID], [0; MAX_INLINE_ID]);
+        let (mut left_buffer, mut right_buffer) = ([0; 9], [0; 9]);
         self.bytes(left, &mut left_buffer)
             .cmp(self.bytes(right, &mut right_buffer))
     }
 
-    fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; MAX_INLINE_ID]) -> &'a [u8] {
+    fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; 9]) -> &'a [u8] {
         if id >= EXTERNAL_ID {
             return input::name_for(&self.0, id as u32).as_bytes();
         }
-        let mut code = id;
-        let mut length = MAX_INLINE_ID;
-        for (position, byte) in buffer.iter_mut().enumerate().rev() {
-            let digit = (code % 37) as usize;
-            code /= 37;
-            if digit == 0 {
-                length = position;
-            } else {
-                *byte = ALPHABET[digit - 1];
-            }
-        }
-        &buffer[..length]
+        buffer[0] = b'k';
+        buffer[1..].copy_from_slice(&id.to_be_bytes());
+        let end = 9 - (id.trailing_zeros() / 8) as usize;
+        &buffer[..end]
     }
 }
 
@@ -77,10 +73,76 @@ pub struct Event {
     pub purchase: u32,
 }
 
-pub struct Candidate {
+const EXTENDED: u32 = 1 << 31;
+
+struct EntryId {
     id: u64,
-    ingested: i64,
-    event: Event,
+    ingested: u32,
+    position: u32,
+}
+
+#[derive(Default)]
+struct IdRun {
+    rows: Vec<EntryId>,
+    far_ingests: Vec<i64>,
+}
+
+impl IdRun {
+    fn push(&mut self, id: u64, ingested: i64, position: u32, origin_seconds: i64) {
+        let offset = (ingested.div_euclid(1000) - origin_seconds) as u64;
+        let ingested = if offset < u64::from(EXTENDED) {
+            offset as u32
+        } else {
+            let index = self.far_ingests.len() as u32;
+            self.far_ingests.push(ingested);
+            EXTENDED | index
+        };
+        self.rows.push(EntryId { id, ingested, position });
+    }
+
+    fn ingest_time(&self, value: u32, origin_seconds: i64) -> i64 {
+        if value < EXTENDED {
+            (origin_seconds + i64::from(value)) * 1000
+        } else {
+            self.far_ingests[(value ^ EXTENDED) as usize]
+        }
+    }
+}
+
+struct PersonEvent {
+    person: u32,
+    time: u32,
+}
+
+#[derive(Default)]
+struct PersonRun {
+    rows: Vec<PersonEvent>,
+    extra: Vec<(Event, Option<Purchase>)>,
+}
+
+impl PersonRun {
+    fn push(&mut self, person: u32, time: i64, purchase: Option<Purchase>, start: i64) -> u32 {
+        // Each run belongs to one 4 MiB input chunk; a position plus a shard
+        // index fits in 32 bits even when every byte ends a row.
+        let at = self.rows.len() as u32;
+        let offset = time.wrapping_sub(start) as u64;
+        let row = if person < EXTENDED && offset <= u64::from(u32::MAX) && purchase.is_none() {
+            PersonEvent { person, time: offset as u32 }
+        } else {
+            let index = self.extra.len() as u32;
+            self.extra.push((Event { time, person, purchase: 0 }, purchase));
+            PersonEvent { person: EXTENDED, time: index }
+        };
+        self.rows.push(row);
+        at * SHARDS as u32 + person % SHARDS as u32
+    }
+}
+
+pub struct Candidates {
+    by_id: Vec<Vec<IdRun>>,
+    by_person: Vec<Vec<PersonRun>>,
+    start: i64,
+    origin_seconds: i64,
 }
 
 pub struct Batch<T> {
@@ -105,19 +167,7 @@ impl<T> Batch<T> {
         })
     }
 
-    fn append(&mut self, batch: &mut Self, index: impl Fn(&mut T) -> &mut u32) {
-        if !batch.purchases.is_empty() {
-            let offset = self.purchases.len() as u32;
-            for row in &mut batch.rows {
-                let purchase = index(row);
-                if *purchase != 0 {
-                    *purchase += offset;
-                }
-            }
-            append(&mut self.purchases, &mut batch.purchases);
-        }
-        append(&mut self.rows, &mut batch.rows);
-    }
+
 }
 
 fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
@@ -138,13 +188,14 @@ pub fn read_events(
     dimensions: &Dimensions,
     users: &Names,
     aliases: &Aliases,
-) -> Result<Vec<Batch<Candidate>>> {
+) -> Result<Candidates> {
     let ids = Names::default();
-    let shared = shards::<Mutex<Batch<Candidate>>>();
-    let worker_state = || (PersonCache::default(), shards::<Batch<Candidate>>());
-    chunks(&data.join("events"))?
+    let origin_seconds = window.start.div_euclid(1000) - 86_400;
+    let parsed: Vec<_> = chunks(&data.join("events"))?
         .into_par_iter()
-        .try_for_each_init(worker_state, |(people, local), chunk| {
+        .map_init(PersonCache::default, |people, chunk| {
+            let mut id_runs = shards::<IdRun>();
+            let mut person_runs = shards::<PersonRun>();
             chunk.scan(|line| {
                 let Some([id, user, ts, ingested, kind, product, price]) = fields(line) else {
                     return;
@@ -153,10 +204,12 @@ pub fn read_events(
                     return;
                 }
                 let ingested = timestamp(ingested).expect("ingest_ts is valid F1");
-                let id = id_for(id, &ids);
-                // Mix high and low bits because short IDs have trailing base-37 padding.
-                let shard = ((id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize;
-                let batch = &mut local[shard];
+                let id = id_for(id, b'e', &ids);
+                // All three operations are bijective, including the multiplication
+                // by an odd number. Using the mixed value as the ID stays exact.
+                let mixed = (id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let id = mixed ^ (mixed >> 31);
+                let shard = id as usize % SHARDS;
                 let mut valid = || {
                     if user.is_empty() || product.is_empty() {
                         return None;
@@ -187,80 +240,116 @@ pub fn read_events(
                     Some((time, people.resolve(users, aliases, user), purchase))
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
-                let (time, person, purchase) = valid().unwrap_or((0, INVALID_PERSON, None));
-                let purchase = batch.add_purchase(purchase);
-                batch.rows.push(Candidate {
-                    id,
-                    ingested,
-                    event: Event {
-                        time,
-                        person,
-                        purchase,
-                    },
+                let position = valid().map_or(u32::MAX, |(time, person, purchase)| {
+                    person_runs[person as usize % SHARDS].push(person, time, purchase, window.start)
                 });
+                id_runs[shard].push(id, ingested, position, origin_seconds);
             })?;
-            for (destination, batch) in shared.iter().zip(local) {
-                if !batch.rows.is_empty() {
-                    destination
-                        .lock()
-                        .unwrap()
-                        .append(batch, |row| &mut row.event.purchase);
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    Ok(shared
-        .into_iter()
-        .map(|batch| batch.into_inner().unwrap())
-        .collect())
+            Ok::<_, anyhow::Error>((id_runs, person_runs))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut by_id = shards::<Vec<IdRun>>();
+    let mut by_person = shards::<Vec<PersonRun>>();
+    for (ids, people) in parsed {
+        for (to, run) in by_id.iter_mut().zip(ids) {
+            to.push(run);
+        }
+        for (to, run) in by_person.iter_mut().zip(people) {
+            to.push(run);
+        }
+    }
+    Ok(Candidates { by_id, by_person, start: window.start, origin_seconds })
 }
 
-pub fn dedup_events(candidates: Vec<Batch<Candidate>>) -> (Vec<Batch<Event>>, usize) {
-    let shared = shards::<Mutex<Batch<Event>>>();
-    let count = candidates
-        .into_par_iter()
-        .map(|mut batch| {
-            batch
-                .rows
-                .par_sort_unstable_by_key(|row| (row.id, row.ingested));
-            batch.rows.dedup_by_key(|row| row.id);
-            let mut local = shards::<Batch<Event>>();
-            let mut count = 0;
-            // Flush in batches so concurrent workers limit rebucketing memory.
-            for chunk in batch.rows.chunks(100_000) {
-                for row in chunk {
-                    let mut event = row.event;
-                    if event.person == INVALID_PERSON {
+// A bucket hit proves an ID is unique if no other row hit that bucket. Only
+// repeated buckets need exact equality checks and earliest-ingest selection.
+fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u32)> {
+    let rows: usize = fragments.iter().map(|batch| batch.rows.len()).sum();
+    let buckets = (8 * rows).next_power_of_two().max(64);
+    let mut occupied = vec![0_u64; buckets / 64];
+    let mut repeated = vec![0_u64; buckets / 64];
+    let bucket = |id: u64| (id as usize / SHARDS) & (buckets - 1);
+    for batch in &fragments {
+        for row in &batch.rows {
+            let slot = bucket(row.id);
+            let bit = 1_u64 << (slot % 64);
+            let seen = &mut occupied[slot / 64];
+            repeated[slot / 64] |= *seen & bit;
+            *seen |= bit;
+        }
+    }
+    drop(occupied);
+
+    let mut losers = Vec::new();
+    let mut winners = AHashMap::<u64, (i64, usize, u32)>::new();
+    for (chunk, batch) in fragments.iter().enumerate() {
+        for row in &batch.rows {
+            let slot = bucket(row.id);
+            if repeated[slot / 64] & (1_u64 << (slot % 64)) != 0 {
+                let current = (batch.ingest_time(row.ingested, origin_seconds), chunk, row.position);
+                let (_, old_chunk, old_row) = match winners.entry(row.id) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(current);
                         continue;
                     }
-                    let destination = &mut local[event.person as usize % SHARDS];
-                    let purchase = event
-                        .purchase
-                        .checked_sub(1)
-                        .map(|at| batch.purchases[at as usize]);
-                    event.purchase = destination.add_purchase(purchase);
-                    destination.rows.push(event);
-                    count += 1;
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if current.0 < entry.get().0 {
+                            entry.insert(current)
+                        } else {
+                            current
+                        }
+                    }
+                };
+                if old_row != u32::MAX {
+                    losers.push((old_chunk, old_row));
                 }
-                for (destination, batch) in shared.iter().zip(&mut local) {
-                    if !batch.rows.is_empty() {
-                        destination
-                            .lock()
-                            .unwrap()
-                            .append(batch, |row| &mut row.purchase);
+            }
+        }
+    }
+    losers
+}
+
+pub fn dedup_events(candidates: Candidates) -> (Vec<Batch<Event>>, usize) {
+    let losses: Vec<_> = candidates.by_id.into_par_iter()
+        .map(|shard| losing_positions(shard, candidates.origin_seconds)).collect();
+    let mut by_person = shards::<Vec<(usize, usize)>>();
+    for loss in losses {
+        for (chunk, position) in loss {
+            by_person[position as usize % SHARDS].push((chunk, position as usize / SHARDS));
+        }
+    }
+    let events: Vec<_> = candidates.by_person.into_par_iter().zip(by_person)
+        .map(|(mut fragments, losers)| {
+            let size: usize = fragments.iter().map(|run| run.rows.len()).sum();
+            let mut output = Batch {
+                rows: Vec::with_capacity(size - losers.len()),
+                purchases: Vec::new(),
+            };
+            for (chunk, position) in losers {
+                fragments[chunk].rows[position].person = INVALID_PERSON;
+            }
+            for run in fragments {
+                for row in run.rows {
+                    match row.person {
+                        INVALID_PERSON => continue,
+                        EXTENDED => {
+                            let (mut event, purchase) = run.extra[row.time as usize];
+                            event.purchase = output.add_purchase(purchase);
+                            output.rows.push(event);
+                        }
+                        person => output.rows.push(Event {
+                            time: candidates.start + i64::from(row.time),
+                            person,
+                            purchase: 0,
+                        }),
                     }
                 }
             }
-            count
-        })
-        .sum();
-    (
-        shared
-            .into_iter()
-            .map(|batch| batch.into_inner().unwrap())
-            .collect(),
-        count,
-    )
+            output
+        }).collect();
+    let count = events.iter().map(|batch| batch.rows.len()).sum();
+    (events, count)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -301,7 +390,7 @@ pub fn read_clicks(
                     return;
                 }
                 let person = people.resolve(users, aliases, user);
-                let id = id_for(id, &ids);
+                let id = id_for(id, b'k', &ids);
                 local[person as usize % SHARDS].push(Click {
                     time,
                     id,
