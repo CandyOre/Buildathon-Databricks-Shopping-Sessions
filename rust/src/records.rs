@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::csv::{chunks, fields};
+use crate::csv::chunks;
 use crate::input::{
     self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, timestamp,
     unsigned,
@@ -97,7 +97,11 @@ impl IdRun {
             self.far_ingests.push(ingested);
             EXTENDED | index
         };
-        self.rows.push(EntryId { id, ingested, position });
+        self.rows.push(EntryId {
+            id,
+            ingested,
+            position,
+        });
     }
 
     fn ingest_time(&self, value: u32, origin_seconds: i64) -> i64 {
@@ -127,11 +131,24 @@ impl PersonRun {
         let at = self.rows.len() as u32;
         let offset = time.wrapping_sub(start) as u64;
         let row = if person < EXTENDED && offset <= u64::from(u32::MAX) && purchase.is_none() {
-            PersonEvent { person, time: offset as u32 }
+            PersonEvent {
+                person,
+                time: offset as u32,
+            }
         } else {
             let index = self.extra.len() as u32;
-            self.extra.push((Event { time, person, purchase: 0 }, purchase));
-            PersonEvent { person: EXTENDED, time: index }
+            self.extra.push((
+                Event {
+                    time,
+                    person,
+                    purchase: 0,
+                },
+                purchase,
+            ));
+            PersonEvent {
+                person: EXTENDED,
+                time: index,
+            }
         };
         self.rows.push(row);
         at * SHARDS as u32 + person % SHARDS as u32
@@ -166,16 +183,6 @@ impl<T> Batch<T> {
             u32::try_from(self.purchases.len()).expect("too many purchases in one shard")
         })
     }
-
-
-}
-
-fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
-    if destination.capacity() - destination.len() < source.len() {
-        // Keep headroom for the next chunk without doubling large vectors.
-        destination.reserve_exact(source.len().max(destination.len() / 8));
-    }
-    destination.append(source);
 }
 
 fn shards<T: Default>() -> Vec<T> {
@@ -196,14 +203,11 @@ pub fn read_events(
         .map_init(PersonCache::default, |people, chunk| {
             let mut id_runs = shards::<IdRun>();
             let mut person_runs = shards::<PersonRun>();
-            chunk.scan(|line| {
-                let Some([id, user, ts, ingested, kind, product, price]) = fields(line) else {
-                    return;
-                };
+            chunk.scan_parsed(|[id, user, ts, ingested, kind, product, price]| {
                 if id.is_empty() {
                     return;
                 }
-                let ingested = timestamp(ingested).expect("ingest_ts is valid F1");
+                let ingested = input::ingest_timestamp(ingested);
                 let id = id_for(id, b'e', &ids);
                 // All three operations are bijective, including the multiplication
                 // by an odd number. Using the mixed value as the ID stays exact.
@@ -259,7 +263,12 @@ pub fn read_events(
             to.push(run);
         }
     }
-    Ok(Candidates { by_id, by_person, start: window.start, origin_seconds })
+    Ok(Candidates {
+        by_id,
+        by_person,
+        start: window.start,
+        origin_seconds,
+    })
 }
 
 // A bucket hit proves an ID is unique if no other row hit that bucket. Only
@@ -287,7 +296,11 @@ fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u
         for row in &batch.rows {
             let slot = bucket(row.id);
             if repeated[slot / 64] & (1_u64 << (slot % 64)) != 0 {
-                let current = (batch.ingest_time(row.ingested, origin_seconds), chunk, row.position);
+                let current = (
+                    batch.ingest_time(row.ingested, origin_seconds),
+                    chunk,
+                    row.position,
+                );
                 let (_, old_chunk, old_row) = match winners.entry(row.id) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(current);
@@ -311,15 +324,21 @@ fn losing_positions(fragments: Vec<IdRun>, origin_seconds: i64) -> Vec<(usize, u
 }
 
 pub fn dedup_events(candidates: Candidates) -> (Vec<Batch<Event>>, usize) {
-    let losses: Vec<_> = candidates.by_id.into_par_iter()
-        .map(|shard| losing_positions(shard, candidates.origin_seconds)).collect();
+    let losses: Vec<_> = candidates
+        .by_id
+        .into_par_iter()
+        .map(|shard| losing_positions(shard, candidates.origin_seconds))
+        .collect();
     let mut by_person = shards::<Vec<(usize, usize)>>();
     for loss in losses {
         for (chunk, position) in loss {
             by_person[position as usize % SHARDS].push((chunk, position as usize / SHARDS));
         }
     }
-    let events: Vec<_> = candidates.by_person.into_par_iter().zip(by_person)
+    let events: Vec<_> = candidates
+        .by_person
+        .into_par_iter()
+        .zip(by_person)
         .map(|(mut fragments, losers)| {
             let size: usize = fragments.iter().map(|run| run.rows.len()).sum();
             let mut output = Batch {
@@ -347,7 +366,8 @@ pub fn dedup_events(candidates: Candidates) -> (Vec<Batch<Event>>, usize) {
                 }
             }
             output
-        }).collect();
+        })
+        .collect();
     let count = events.iter().map(|batch| batch.rows.len()).sum();
     (events, count)
 }
@@ -362,7 +382,11 @@ pub struct Click {
 
 fn order_clicks(pieces: Vec<Vec<Click>>) -> Vec<Click> {
     let mut clicks = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
-    for piece in pieces { clicks.extend(piece); }
+    for piece in pieces {
+        clicks.extend(piece);
+    }
+    // Equal-ID copies are identical. Repeating a click changes neither the
+    // winning click nor the union of assist intervals for its campaign.
     clicks.par_sort_unstable_by_key(|click| (click.person, click.time));
     clicks
 }
@@ -379,10 +403,7 @@ pub fn read_clicks(
         .into_par_iter()
         .map_init(PersonCache::default, |people, chunk| {
             let mut local = shards::<Vec<Click>>();
-            chunk.scan(|line| {
-                let Some([id, user, campaign, ts]) = fields(line) else {
-                    return;
-                };
+            chunk.scan_parsed(|[id, user, campaign, ts]| {
                 if id.is_empty() || user.is_empty() {
                     return;
                 }
@@ -405,13 +426,50 @@ pub fn read_clicks(
                 });
             })?;
             Ok::<_, anyhow::Error>(local)
-        }).collect::<Result<Vec<_>>>()?;
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut partitions = shards::<Vec<Vec<Click>>>();
     for chunk in pieces {
         for (partition, rows) in partitions.iter_mut().zip(chunk) {
-            if !rows.is_empty() { partition.push(rows); }
+            if !rows.is_empty() {
+                partition.push(rows);
+            }
         }
     }
     let clicks = partitions.into_par_iter().map(order_clicks).collect();
     Ok((clicks, ClickIds(ids.into_names())))
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn click_ids_distinguish_padding_and_preserve_mixed_byte_order() {
+        let cases: &[&[u8]] = &[
+            b"k",
+            b"k\0",
+            b"k\0a",
+            b"ka",
+            b"ka\0",
+            b"ka\0b",
+            b"k12345678",
+            b"k123456789",
+            b"K12",
+            b"kx\xc3\xa9",
+            "k用户".as_bytes(),
+        ];
+        let fallback = Names::default();
+        let codes: Vec<_> = cases
+            .iter()
+            .map(|value| id_for(value, b'k', &fallback))
+            .collect();
+        let ids = ClickIds(fallback.into_names());
+        for (i, a) in cases.iter().enumerate() {
+            for (j, b) in cases.iter().enumerate() {
+                assert_eq!(ids.compare(codes[i], codes[j]), a.cmp(b));
+                assert_eq!(codes[i] == codes[j], a == b);
+            }
+        }
+    }
 }

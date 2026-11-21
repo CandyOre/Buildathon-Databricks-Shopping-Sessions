@@ -11,7 +11,11 @@ const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "x86_64")]
-    if (32..=128).contains(&line.len()) && std::is_x86_feature_detected!("avx2") {
+    if (32..=128).contains(&line.len())
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("bmi1")
+        && std::is_x86_feature_detected!("popcnt")
+    {
         // SAFETY: the CPU supports AVX2 and each input contains 1 to 4 vectors.
         return unsafe { fields_avx2(line) };
     }
@@ -19,7 +23,7 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi1,popcnt")]
 unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     use std::arch::x86_64::*;
 
@@ -64,14 +68,11 @@ unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         } else {
             line.len()
         };
-        let raw = &line[start..end];
-        *field = match raw {
-            [b'"', inner @ .., b'"'] => {
-                matched_quotes += 2;
-                inner
-            }
-            _ => raw,
-        };
+        let left = line[start.min(line.len() - 1)];
+        let right = line[end.saturating_sub(1)];
+        let trim = usize::from((end - start >= 2) & (left == b'"') & (right == b'"'));
+        matched_quotes += 2 * trim as u32;
+        *field = &line[start + trim..end - trim];
         start = end + 1;
     }
     // Every quote must be one of the two outer bytes of its own field.
@@ -211,6 +212,43 @@ impl Chunk {
                 } else if offset >= self.end {
                     return Ok(());
                 }
+            }
+        })
+    }
+}
+
+impl Chunk {
+    pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("popcnt")
+        {
+            // SAFETY: CPU features are checked once for this entire chunk.
+            return unsafe { self.scan_parsed_avx2(row) };
+        }
+        self.scan(|line| {
+            if let Some(values) = fields_portable(line) {
+                row(values);
+            }
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,popcnt")]
+    unsafe fn scan_parsed_avx2<const N: usize>(
+        &self,
+        mut row: impl FnMut([&[u8]; N]),
+    ) -> Result<()> {
+        self.scan(|line| {
+            let values = if (32..=128).contains(&line.len()) {
+                // SAFETY: target features are active and the vector loads fit.
+                unsafe { fields_avx2(line) }
+            } else {
+                fields_portable(line)
+            };
+            if let Some(values) = values {
+                row(values);
             }
         })
     }

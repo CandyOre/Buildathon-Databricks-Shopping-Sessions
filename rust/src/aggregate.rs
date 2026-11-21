@@ -102,16 +102,28 @@ pub type CampaignDays = AHashMap<(u32, i32), CampaignDay>;
 // Allocate dense counters only when the manifest and dimension table imply a
 // modest working set. The sparse representation handles longer windows.
 enum Counters {
-    Dense { first_day: i32, days: usize, rows: Vec<CampaignDay> },
+    Dense {
+        first_day: i32,
+        days: usize,
+        rows: Vec<CampaignDay>,
+    },
     Sparse(CampaignDays),
 }
 
 impl Counters {
     fn new(campaigns: usize, window: crate::input::Window) -> Self {
         let first_day = day(window.start);
-        let days = (i64::from(day(window.end.saturating_sub(1))) - i64::from(first_day) + 1).max(0) as usize;
-        if let Some(size) = campaigns.checked_mul(days).filter(|&n| n > 0 && n <= 131_072) {
-            Self::Dense { first_day, days, rows: vec![CampaignDay::default(); size] }
+        let days = (i64::from(day(window.end.saturating_sub(1))) - i64::from(first_day) + 1).max(0)
+            as usize;
+        if let Some(size) = campaigns
+            .checked_mul(days)
+            .filter(|&n| n > 0 && n <= 131_072)
+        {
+            Self::Dense {
+                first_day,
+                days,
+                rows: vec![CampaignDay::default(); size],
+            }
         } else {
             Self::Sparse(CampaignDays::default())
         }
@@ -119,9 +131,11 @@ impl Counters {
 
     fn row(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
         match self {
-            Self::Dense { first_day, days, rows } => {
-                &mut rows[campaign as usize * *days + (day - *first_day) as usize]
-            }
+            Self::Dense {
+                first_day,
+                days,
+                rows,
+            } => &mut rows[campaign as usize * *days + (day - *first_day) as usize],
             Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
         }
     }
@@ -129,11 +143,50 @@ impl Counters {
     fn into_rows(self) -> CampaignDays {
         match self {
             Self::Sparse(rows) => rows,
-            Self::Dense { first_day, days, rows } => rows.into_iter().enumerate()
+            Self::Dense {
+                first_day,
+                days,
+                rows,
+            } => rows
+                .into_iter()
+                .enumerate()
                 .filter(|(_, row)| row.sessions != 0 || row.assisted_sessions != 0)
-                .map(|(index, row)| (((index / days) as u32, first_day + (index % days) as i32), row))
+                .map(|(index, row)| {
+                    (
+                        ((index / days) as u32, first_day + (index % days) as i32),
+                        row,
+                    )
+                })
                 .collect(),
         }
+    }
+}
+
+impl CampaignDay {
+    fn add(&mut self, other: Self) {
+        self.sessions += other.sessions;
+        self.purchasing_sessions += other.purchasing_sessions;
+        self.revenue += other.revenue;
+        self.assisted_sessions += other.assisted_sessions;
+    }
+}
+
+impl Counters {
+    fn merge(mut self, other: Self) -> Self {
+        match (&mut self, other) {
+            (Self::Dense { rows, .. }, Self::Dense { rows: right, .. }) => {
+                for (left, value) in rows.iter_mut().zip(right) {
+                    left.add(value);
+                }
+            }
+            (Self::Sparse(rows), Self::Sparse(right)) => {
+                for (key, value) in right {
+                    rows.entry(key).or_default().add(value);
+                }
+            }
+            _ => unreachable!("all workers use the same window and campaign dimension"),
+        }
+        self
     }
 }
 
@@ -145,22 +198,26 @@ pub fn campaign_daily(
     window: crate::input::Window,
 ) -> CampaignDays {
     let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
-    batches.par_iter_mut().zip(clicks).with_min_len(min_len).fold(
-        || (Counters::new(campaigns, window), AHashMap::default()),
-        |(mut totals, mut intervals), (batch, clicks)| {
-            summarize_campaigns(std::mem::take(&mut batch.sessions), &clicks, &ids, &mut totals, &mut intervals);
-            (totals, intervals)
-        },
-    ).map(|(totals, _)| totals.into_rows()).reduce(CampaignDays::default, |mut left, right| {
-        for (key, value) in right {
-            let target = left.entry(key).or_default();
-            target.sessions += value.sessions;
-            target.purchasing_sessions += value.purchasing_sessions;
-            target.revenue += value.revenue;
-            target.assisted_sessions += value.assisted_sessions;
-        }
-        left
-    })
+    batches
+        .par_iter_mut()
+        .zip(clicks)
+        .with_min_len(min_len)
+        .fold(
+            || (Counters::new(campaigns, window), AHashMap::default()),
+            |(mut totals, mut intervals), (batch, clicks)| {
+                summarize_campaigns(
+                    std::mem::take(&mut batch.sessions),
+                    &clicks,
+                    &ids,
+                    &mut totals,
+                    &mut intervals,
+                );
+                (totals, intervals)
+            },
+        )
+        .map(|(totals, _)| totals)
+        .reduce_with(Counters::merge)
+        .map_or_else(CampaignDays::default, Counters::into_rows)
 }
 
 fn summarize_campaigns(
@@ -230,12 +287,7 @@ fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut C
     }
 }
 
-fn assist(
-    sessions: &[Session],
-    campaign: u32,
-    (first, last): (i64, i64),
-    totals: &mut Counters,
-) {
+fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals: &mut Counters) {
     let start = sessions.partition_point(|session| session.time < first);
     let end = sessions.partition_point(|session| session.time <= last);
     let mut covered = &sessions[start..end];
@@ -244,8 +296,7 @@ fn assist(
         let current_day = day(session.time);
         let next_day = (i64::from(current_day) + 1) * DAY;
         let count = covered.partition_point(|session| session.time < next_day);
-        totals.row(campaign, current_day)
-            .assisted_sessions += count as i64;
+        totals.row(campaign, current_day).assisted_sessions += count as i64;
         covered = &covered[count..];
     }
 }

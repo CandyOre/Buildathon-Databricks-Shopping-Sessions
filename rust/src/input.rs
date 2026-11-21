@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ahash::{AHashMap, RandomState};
 use anyhow::{Context, Result};
@@ -80,9 +80,10 @@ fn midnight(date: &[u8; 10]) -> Option<i64> {
     thread_local! {
         static MIDNIGHTS: [Entry; 32] = const { [const { Entry::new(None) }; 32] };
     }
-    let day = two_digits(date[8], date[9])?;
     MIDNIGHTS.with(|cache| {
-        let slot = &cache[day as usize % cache.len()];
+        // Mix the raw day digits. Checking the full key makes a cache hit
+        // sufficient to validate even an untrusted date.
+        let slot = &cache[(usize::from(date[8]) * 10 + usize::from(date[9])) % cache.len()];
         if let Some((key, value)) = slot.get() {
             if key == *date {
                 return Some(value);
@@ -93,6 +94,7 @@ fn midnight(date: &[u8; 10]) -> Option<i64> {
         }
         let year = two_digits(date[0], date[1])? * 100 + two_digits(date[2], date[3])?;
         let month = two_digits(date[5], date[6])?;
+        let day = two_digits(date[8], date[9])?;
         let value = NaiveDate::from_ymd_opt(year as i32, month, day)?
             .and_hms_opt(0, 0, 0)?
             .and_utc()
@@ -102,7 +104,59 @@ fn midnight(date: &[u8; 10]) -> Option<i64> {
     })
 }
 
+fn all_digits(word: u64) -> bool {
+    // Check the high nibbles for ASCII '0' and the low nibbles for <= 9.
+    // No byte of low + 6 can carry into a neighbour.
+    let low = word & 0x0f0f_0f0f_0f0f_0f0f;
+    word & 0xf0f0_f0f0_f0f0_f0f0 == 0x3030_3030_3030_3030
+        && (low + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 == 0
+}
+
+fn eight_digits(word: u64) -> u32 {
+    // Combine pairs of decimal digits, then neighbouring pairs. Each mask
+    // leaves enough space for the next multiplication to stay within its lane.
+    let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
+    let pairs = (digits * 10 + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    (quads as u32) * 10_000 + (quads >> 32) as u32
+}
+
+fn epoch_13(bytes: &[u8]) -> Option<i64> {
+    let head = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+    let tail = u64::from_le_bytes(bytes[5..].try_into().ok()?);
+    if !all_digits(head) || !all_digits(tail) {
+        return None;
+    }
+    // The two loads overlap on three digits.
+    Some(i64::from(eight_digits(head) / 1_000) * 100_000_000 + i64::from(eight_digits(tail)))
+}
+
+// Positions in the little-endian bytes of HH:MM:SS.
+const CLOCK_COLONS: u64 = 0x0000_ff00_00ff_0000;
+
+fn clock_components(word: u64) -> (u32, u32, u32) {
+    let digits = word & 0x0f0f_000f_0f00_0f0f;
+    let pairs = digits * 10 + (digits >> 8);
+    (
+        (pairs & 255) as u32,
+        ((pairs >> 24) & 255) as u32,
+        ((pairs >> 48) & 255) as u32,
+    )
+}
+
+pub fn ingest_timestamp(bytes: &[u8]) -> i64 {
+    // The input contract guarantees F1 for ingest_ts.
+    let bytes: &[u8; 20] = bytes.try_into().expect("ingest_ts is valid F1");
+    let day = midnight(bytes[..10].try_into().unwrap()).expect("ingest_ts has a valid date");
+    let word = u64::from_le_bytes(bytes[11..19].try_into().unwrap());
+    let (hour, minute, second) = clock_components(word);
+    day + i64::from(hour * 3600 + minute * 60 + second) * 1000
+}
+
 pub fn timestamp(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() == 13 {
+        return epoch_13(bytes);
+    }
     let offset_minutes = match bytes {
         [.., b'Z'] if bytes.len() == 20 => 0,
         [
@@ -123,12 +177,14 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
         }
         _ => return unsigned(bytes),
     };
-    if bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+    let word = u64::from_le_bytes(bytes[11..19].try_into().ok()?);
+    if bytes[10] != b'T'
+        || word & CLOCK_COLONS != 0x0000_3a00_003a_0000
+        || !all_digits((word & !CLOCK_COLONS) | (0x3030_3030_3030_3030 & CLOCK_COLONS))
+    {
         return None;
     }
-    let hour = two_digits(bytes[11], bytes[12])?;
-    let minute = two_digits(bytes[14], bytes[15])?;
-    let second = two_digits(bytes[17], bytes[18])?;
+    let (hour, minute, second) = clock_components(word);
     if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
@@ -139,7 +195,28 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
 
 #[cfg(test)]
 mod timestamp_tests {
-    use super::{DAY, timestamp, unsigned};
+    use super::{DAY, ingest_timestamp, timestamp, unsigned};
+
+    #[test]
+    fn packed_clock_and_epoch_keep_the_digit_boundaries() {
+        let last = b"2028-02-29T23:59:59Z";
+        let base = timestamp(b"2028-02-29T00:00:00Z").unwrap();
+        assert_eq!(timestamp(last), Some(base + DAY - 1000));
+        assert_eq!(ingest_timestamp(last), base + DAY - 1000);
+        for byte in 0..=255u8 {
+            for index in 0..13 {
+                let mut epoch = *b"0123456789012";
+                epoch[index] = byte;
+                assert_eq!(timestamp(&epoch), unsigned(&epoch));
+            }
+            let mut clock = *last;
+            clock[13] = byte;
+            assert_eq!(
+                timestamp(&clock),
+                (byte == b':').then_some(base + DAY - 1000)
+            );
+        }
+    }
 
     #[test]
     fn cached_midnights_distinguish_months_years_and_invalid_dates() {
@@ -266,12 +343,18 @@ impl Names {
     }
 
     pub fn into_names(self) -> Vec<Vec<Arc<str>>> {
-        self.shards.into_iter().map(|s| s.into_inner().unwrap().names).collect()
+        self.shards
+            .into_iter()
+            .map(|s| s.into_inner().unwrap().names)
+            .collect()
     }
 
     pub fn into_people(mut self) -> PersonNames {
         let table = self.packed.take().expect("link graph must be initialized");
-        PersonNames { table, external: self.into_names() }
+        PersonNames {
+            table,
+            external: self.into_names(),
+        }
     }
 }
 
@@ -333,11 +416,18 @@ impl NameTable {
         // for the terminating search, even when every endpoint is distinct.
         let capacity = (2 * edges + 1).max(1024).next_power_of_two();
         assert!(capacity <= u32::MAX as usize, "too many linked names");
-        let entries = (0..capacity).into_par_iter().map(|index| Entry {
-            key: AtomicU64::new(EMPTY_KEY),
-            parent: AtomicU32::new(index as u32),
-        }).collect();
-        Self { entries, external_names, overflow: AHashMap::default() }
+        let entries = (0..capacity)
+            .into_par_iter()
+            .map(|index| Entry {
+                key: AtomicU64::new(EMPTY_KEY),
+                parent: AtomicU32::new(index as u32),
+            })
+            .collect();
+        Self {
+            entries,
+            external_names,
+            overflow: AHashMap::default(),
+        }
     }
 
     fn spelling<'a>(&'a self, key: u64, buffer: &'a mut [u8; 9]) -> &'a str {
@@ -358,7 +448,10 @@ impl NameTable {
                 return index as u32;
             }
             if stored == EMPTY_KEY {
-                match slot.key.compare_exchange(EMPTY_KEY, key, Ordering::AcqRel, Ordering::Acquire) {
+                match slot
+                    .key
+                    .compare_exchange(EMPTY_KEY, key, Ordering::AcqRel, Ordering::Acquire)
+                {
                     Ok(_) => return index as u32,
                     Err(raced) if raced == key => return index as u32,
                     Err(_) => {}
@@ -377,7 +470,12 @@ impl NameTable {
             }
             let grandparent = self.entries[parent as usize].parent.load(Ordering::Acquire);
             if grandparent != parent {
-                let _ = entry.parent.compare_exchange(parent, grandparent, Ordering::AcqRel, Ordering::Acquire);
+                let _ = entry.parent.compare_exchange(
+                    parent,
+                    grandparent,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
             id = parent;
         }
@@ -397,11 +495,18 @@ impl NameTable {
             } else {
                 self.spelling(a, &mut [0; 9]) < self.spelling(b, &mut [0; 9])
             };
-            let (lower, higher) = if left_first { (left, right) } else { (right, left) };
+            let (lower, higher) = if left_first {
+                (left, right)
+            } else {
+                (right, left)
+            };
             // Edges always point toward a smaller spelling. This prevents cycles
             // even when another worker concurrently changes the lower root.
-            if self.entries[higher as usize].parent.compare_exchange(
-                higher, lower, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if self.entries[higher as usize]
+                .parent
+                .compare_exchange(higher, lower, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 break;
             }
         }
@@ -409,16 +514,21 @@ impl NameTable {
 
     fn finish(&mut self, hash: &RandomState) {
         let mask = self.entries.len() - 1;
-        let beyond: Vec<_> = self.entries.par_iter().enumerate().filter_map(|(index, entry)| {
-            let key = entry.key.load(Ordering::Relaxed);
-            if key == EMPTY_KEY {
-                return None;
-            }
-            let root = self.root(index as u32);
-            entry.parent.store(root, Ordering::Relaxed);
-            let distance = index.wrapping_sub(hash.hash_one(key) as usize) & mask;
-            (distance >= MAX_PROBES).then_some((key, root))
-        }).collect();
+        let beyond: Vec<_> = self
+            .entries
+            .par_iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let key = entry.key.load(Ordering::Relaxed);
+                if key == EMPTY_KEY {
+                    return None;
+                }
+                let root = self.root(index as u32);
+                entry.parent.store(root, Ordering::Relaxed);
+                let distance = index.wrapping_sub(hash.hash_one(key) as usize) & mask;
+                (distance >= MAX_PROBES).then_some((key, root))
+            })
+            .collect();
         self.overflow = beyond.into_iter().collect();
     }
 
@@ -433,14 +543,22 @@ impl NameTable {
             if stored == EMPTY_KEY {
                 // Keys never move. Every link in overflow already had a full
                 // probe range at construction, so this spelling is unlinked.
-                match slot.key.compare_exchange(EMPTY_KEY, key, Ordering::Relaxed, Ordering::Relaxed) {
+                match slot.key.compare_exchange(
+                    EMPTY_KEY,
+                    key,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => return slot.parent.load(Ordering::Relaxed),
                     Err(raced) if raced == key => return slot.parent.load(Ordering::Relaxed),
                     Err(_) => {}
                 }
             }
         }
-        self.overflow.get(&key).copied().unwrap_or_else(|| users.intern(text(bytes)))
+        self.overflow
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| users.intern(text(bytes)))
     }
 }
 
@@ -475,9 +593,13 @@ fn unpack_name(key: u64, buffer: &mut [u8; 9]) -> &str {
 }
 
 pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
-    let external = Names { hash: users.hash.clone(), ..Names::default() };
+    let external = Names {
+        hash: users.hash.clone(),
+        ..Names::default()
+    };
     let key_for = |bytes: &[u8]| {
-        packed_name(bytes).unwrap_or_else(|| EXTERNAL_NAME | u64::from(external.intern(text(bytes))))
+        packed_name(bytes)
+            .unwrap_or_else(|| EXTERNAL_NAME | u64::from(external.intern(text(bytes))))
     };
     let batches = chunks(&data.join("links"))?
         .into_par_iter()
@@ -495,11 +617,14 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
         .collect::<Result<Vec<_>>>()?;
 
     let edge_count = batches.iter().map(Vec::len).sum::<usize>();
-    let (mut external, external_names): (Vec<_>, Vec<_>) =
-        external.shards.into_iter().map(|shard| {
+    let (mut external, external_names): (Vec<_>, Vec<_>) = external
+        .shards
+        .into_iter()
+        .map(|shard| {
             let state = shard.into_inner().unwrap();
             (state.ids, state.names)
-        }).unzip();
+        })
+        .unzip();
     let mut table = NameTable::new(edge_count, external_names);
     for shard in &mut users.shards {
         shard.get_mut().unwrap().offset = table.entries.len() / SHARDS;
@@ -537,7 +662,7 @@ pub struct PersonCache(Vec<CachedPerson>);
 
 impl Default for PersonCache {
     fn default() -> Self {
-        Self(vec![CachedPerson::default(); 16_384])
+        Self(vec![CachedPerson::default(); 4096])
     }
 }
 
@@ -547,7 +672,9 @@ impl PersonCache {
         let Some(key) = packed_name(bytes) else {
             let shard = users.hash.hash_one(bytes) as usize % SHARDS;
             let name = text(bytes);
-            return aliases.external[shard].get(name).copied()
+            return aliases.external[shard]
+                .get(name)
+                .copied()
                 .unwrap_or_else(|| users.intern_in(shard, name));
         };
         let hash = users.hash.hash_one(key) as usize;
@@ -557,7 +684,11 @@ impl PersonCache {
             return entry.person;
         }
         let person = aliases.table.resolve(key, hash, bytes, users);
-        *entry = CachedPerson { key, person, occupied: true };
+        *entry = CachedPerson {
+            key,
+            person,
+            occupied: true,
+        };
         person
     }
 }
@@ -577,10 +708,15 @@ mod person_tests {
         let key = packed_name(b"ualias").unwrap();
         let hash = users.hash.hash_one(key) as usize;
         let index = table.slot_for_link(key, hash) as usize;
-        table.entries[index].parent.store(canonical, Ordering::Relaxed);
+        table.entries[index]
+            .parent
+            .store(canonical, Ordering::Relaxed);
         let table = Arc::new(table);
         users.packed = Some(Arc::clone(&table));
-        let aliases = Aliases { table, external: (0..SHARDS).map(|_| AHashMap::default()).collect() };
+        let aliases = Aliases {
+            table,
+            external: (0..SHARDS).map(|_| AHashMap::default()).collect(),
+        };
         let mut cache = PersonCache(vec![CachedPerson::default(); 1]);
         let spellings = ["ux", "uy", "ux", "0123456789abcdefx", "0123456789abcdefy"];
         let ids = spellings.map(|name| {
@@ -596,7 +732,17 @@ mod person_tests {
 
     #[test]
     fn packed_spelling_preserves_bytes_and_lexicographic_order() {
-        let ordered = ["U", "U0", "Uabc", "u", "u\0x", "u1", "u1\0x", "u2", "uabcdefgh"];
+        let ordered = [
+            "U",
+            "U0",
+            "Uabc",
+            "u",
+            "u\0x",
+            "u1",
+            "u1\0x",
+            "u2",
+            "uabcdefgh",
+        ];
         let keys = ordered.map(|s| packed_name(s.as_bytes()).unwrap());
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
         for (name, key) in ordered.into_iter().zip(keys) {
@@ -609,9 +755,13 @@ mod person_tests {
 
     #[test]
     fn mixed_link_keys_choose_the_true_minimum_and_preserve_unlinked_names() -> Result<()> {
-        use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let directory = std::env::temp_dir().join(format!("shopping-names-{}-{nonce}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("shopping-names-{}-{nonce}", std::process::id()));
         let links = directory.join("links");
         fs::create_dir_all(&links)?;
         let part = links.join("part.csv");
@@ -619,9 +769,17 @@ mod person_tests {
         let mut users = Names::default();
         let aliases = read_aliases(&directory, &mut users)?;
         let mut cache = PersonCache::default();
-        let cases = [("u3", "U7"), ("ua", "U7"), ("long-name-at-least-ten", "U7"),
-            ("U7", "U7"), ("u9", " a"), ("u\0", " a"), ("u4", "u4"),
-            ("u12345678", "u12345678"), ("unlinked and long", "unlinked and long")];
+        let cases = [
+            ("u3", "U7"),
+            ("ua", "U7"),
+            ("long-name-at-least-ten", "U7"),
+            ("U7", "U7"),
+            ("u9", " a"),
+            ("u\0", " a"),
+            ("u4", "u4"),
+            ("u12345678", "u12345678"),
+            ("unlinked and long", "unlinked and long"),
+        ];
         let resolved = cases.map(|(key, _)| cache.resolve(&users, &aliases, key.as_bytes()));
         let names = users.into_people();
         for ((_, expected), id) in cases.into_iter().zip(resolved) {
@@ -637,7 +795,9 @@ mod person_tests {
     fn parallel_unions_choose_minimum_on_overlapping_chains() {
         let n = 4096;
         let hash = RandomState::new();
-        let keys: Vec<_> = (0..n).map(|i| packed_name(format!("u{i:04}").as_bytes()).unwrap()).collect();
+        let keys: Vec<_> = (0..n)
+            .map(|i| packed_name(format!("u{i:04}").as_bytes()).unwrap())
+            .collect();
         let mut table = NameTable::new(n, Vec::new());
         (1..n).into_par_iter().for_each(|i| {
             for (left, right) in [(i, i - 1), (n - 1 - i, n - i)] {
@@ -663,19 +823,24 @@ mod person_tests {
         }
         let names: Vec<_> = (0..48).map(|i| format!("u{i:02}")).collect();
         let results = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..8).map(|offset| {
-                let (table, users, names) = (&table, &users, &names);
-                scope.spawn(move || {
-                    let mut ids = vec![0; names.len()];
-                    for j in 0..names.len() {
-                        let i = (j + offset) % names.len();
-                        let bytes = names[i].as_bytes();
-                        ids[i] = table.resolve(packed_name(bytes).unwrap(), 0, bytes, users);
-                    }
-                    ids
+            let workers: Vec<_> = (0..8)
+                .map(|offset| {
+                    let (table, users, names) = (&table, &users, &names);
+                    scope.spawn(move || {
+                        let mut ids = vec![0; names.len()];
+                        for j in 0..names.len() {
+                            let i = (j + offset) % names.len();
+                            let bytes = names[i].as_bytes();
+                            ids[i] = table.resolve(packed_name(bytes).unwrap(), 0, bytes, users);
+                        }
+                        ids
+                    })
                 })
-            }).collect();
-            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
         });
         assert!(results.iter().all(|ids| *ids == results[0]));
         let distinct: std::collections::HashSet<_> = results[0].iter().collect();
