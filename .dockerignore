@@ -1,0 +1,9 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+.buildathon/
+.venv/
+dev-answer/
+**/__pycache__/
