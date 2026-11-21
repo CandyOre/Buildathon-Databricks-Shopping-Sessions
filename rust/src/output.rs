@@ -1,3 +1,4 @@
+use arrow_array::builder::StringBuilder;
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::aggregate::{CampaignDays, SessionBatch};
-use crate::input::{Dimensions, name_for};
+use crate::input::{Dimensions, PersonNames};
 
 const BATCH_SIZE: usize = 65_536;
 
@@ -18,7 +19,7 @@ pub fn write(
     output: &Path,
     users: Vec<SessionBatch>,
     campaigns: CampaignDays,
-    names: &[Vec<Arc<str>>],
+    names: &PersonNames,
     dimensions: &Dimensions,
 ) -> Result<()> {
     let (user_result, campaign_result) = rayon::join(
@@ -57,7 +58,7 @@ fn open(
 fn write_users(
     output: &Path,
     users: Vec<SessionBatch>,
-    names: &[Vec<Arc<str>>],
+    names: &PersonNames,
     dimensions: &Dimensions,
 ) -> Result<()> {
     let (schema, mut writer) = open(
@@ -74,8 +75,12 @@ fn write_users(
     )?;
     for batch in users {
         for rows in batch.daily.chunks(BATCH_SIZE) {
-            let user_id =
-                StringArray::from_iter_values(rows.iter().map(|row| name_for(names, row.person)));
+            let mut user_ids = StringBuilder::with_capacity(rows.len(), rows.len() * 9);
+            let mut name = [0; 9];
+            for row in rows {
+                user_ids.append_value(names.get(row.person, &mut name));
+            }
+            let user_id = user_ids.finish();
             let category = StringArray::from_iter(rows.iter().map(|row| {
                 row.top_category
                     .map(|id| dimensions.categories[id as usize].as_str())

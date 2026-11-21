@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     let (clicks, click_ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
     drop(aliases);
-    let user_names = users.into_names();
+    let user_names = users.into_people();
     profile.stage("parse_and_sort_clicks");
 
     let campaign_daily = aggregate::campaign_daily(&mut session_batches, clicks, click_ids);
