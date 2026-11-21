@@ -63,3 +63,9 @@ Set `PROFILE=1` to emit one JSON record per stage and a total record to stderr. 
 See [measured stage timings and memory peaks](BENCHMARKS.md) for the 1M, 10M and 60M runs.
 
 The DuckDB comparison implementation is still available in `pipeline/`. Build it with `docker build -f Dockerfile.duckdb -t shopping-sessions:duckdb .` and run the PowerShell wrapper with `-Image shopping-sessions:duckdb` and a separate output directory. Pass both output directories to `scripts/compare.py` for an exact comparison.
+
+## Credits and license
+
+The fixtures and test harness come from the [official Shopping Sessions starter](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). The Rust pipeline uses Rayon for parallel processing, memchr for CSV scanning, ahash for hashing, mimalloc for allocation, and the Apache Arrow Rust crates (`arrow-array`, `arrow-schema`, and `parquet`) for output. It also uses chrono, serde_json, and anyhow. The comparison pipeline uses DuckDB and PyArrow. The result checker uses Polars.
+
+Original contributions to this entry are released under the [MIT License](LICENSE).
