@@ -1,4 +1,5 @@
 mod aggregate;
+mod csv;
 mod input;
 mod output;
 mod profile;
@@ -28,8 +29,8 @@ fn main() -> Result<()> {
         .build_global()?;
     let window = input::Window::read(&data)?;
     let dimensions = input::Dimensions::read(&data)?;
-    let users = input::Names::default();
-    let aliases = input::read_aliases(&data, &users)?;
+    let mut users = input::Names::default();
+    let aliases = input::read_aliases(&data, &mut users)?;
     profile.stage("load_dimensions_and_links");
 
     let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;

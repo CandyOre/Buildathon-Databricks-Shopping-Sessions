@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use rayon::prelude::*;
 
+use crate::csv::{chunks, fields};
 use crate::input::{
-    self, DAY, Dimensions, LOOKBACK, Names, SHARDS, Window, fields, person, text, timestamp,
+    self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, timestamp,
     unsigned,
 };
 
@@ -104,7 +105,7 @@ impl<T> Batch<T> {
         })
     }
 
-    fn append(&mut self, mut batch: Self, index: impl Fn(&mut T) -> &mut u32) {
+    fn append(&mut self, batch: &mut Self, index: impl Fn(&mut T) -> &mut u32) {
         if !batch.purchases.is_empty() {
             let offset = self.purchases.len() as u32;
             for row in &mut batch.rows {
@@ -136,14 +137,14 @@ pub fn read_events(
     window: Window,
     dimensions: &Dimensions,
     users: &Names,
-    aliases: &[u32],
+    aliases: &Aliases,
 ) -> Result<Vec<Batch<Candidate>>> {
     let ids = Names::default();
     let shared = shards::<Mutex<Batch<Candidate>>>();
-    input::chunks(&data.join("events"))?
+    let worker_state = || (PersonCache::default(), shards::<Batch<Candidate>>());
+    chunks(&data.join("events"))?
         .into_par_iter()
-        .try_for_each(|chunk| {
-            let mut local = shards::<Batch<Candidate>>();
+        .try_for_each_init(worker_state, |(people, local), chunk| {
             chunk.scan(|line| {
                 let Some([id, user, ts, ingested, kind, product, price]) = fields(line) else {
                     return;
@@ -156,7 +157,7 @@ pub fn read_events(
                 // Mix high and low bits because short IDs have trailing base-37 padding.
                 let shard = ((id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize;
                 let batch = &mut local[shard];
-                let valid = || {
+                let mut valid = || {
                     if user.is_empty() || product.is_empty() {
                         return None;
                     }
@@ -183,7 +184,7 @@ pub fn read_events(
                         }
                         _ => return None,
                     };
-                    Some((time, person(users, aliases, user), purchase))
+                    Some((time, people.resolve(users, aliases, user), purchase))
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
                 let (time, person, purchase) = valid().unwrap_or((0, INVALID_PERSON, None));
@@ -246,7 +247,7 @@ pub fn dedup_events(candidates: Vec<Batch<Candidate>>) -> (Vec<Batch<Event>>, us
                         destination
                             .lock()
                             .unwrap()
-                            .append(std::mem::take(batch), |row| &mut row.purchase);
+                            .append(batch, |row| &mut row.purchase);
                     }
                 }
             }
@@ -275,14 +276,14 @@ pub fn read_clicks(
     window: Window,
     dimensions: &Dimensions,
     users: &Names,
-    aliases: &[u32],
+    aliases: &Aliases,
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
     let shared = shards::<Mutex<Vec<Click>>>();
-    input::chunks(&data.join("clicks"))?
+    let worker_state = || (PersonCache::default(), shards::<Vec<Click>>());
+    chunks(&data.join("clicks"))?
         .into_par_iter()
-        .try_for_each(|chunk| {
-            let mut local = shards::<Vec<Click>>();
+        .try_for_each_init(worker_state, |(people, local), chunk| {
             chunk.scan(|line| {
                 let Some([id, user, campaign, ts]) = fields(line) else {
                     return;
@@ -299,7 +300,7 @@ pub fn read_clicks(
                 if time < window.start - LOOKBACK || time >= window.end {
                     return;
                 }
-                let person = person(users, aliases, user);
+                let person = people.resolve(users, aliases, user);
                 let id = id_for(id, &ids);
                 local[person as usize % SHARDS].push(Click {
                     time,
@@ -308,9 +309,9 @@ pub fn read_clicks(
                     campaign,
                 });
             })?;
-            for (destination, mut batch) in shared.iter().zip(local) {
+            for (destination, batch) in shared.iter().zip(local) {
                 if !batch.is_empty() {
-                    append(&mut destination.lock().unwrap(), &mut batch);
+                    append(&mut destination.lock().unwrap(), batch);
                 }
             }
             Ok::<_, anyhow::Error>(())

@@ -1,5 +1,7 @@
 # Rust pipeline benchmark
 
+See the [24 GiB CSV parser comparison](#csv-parser-comparison-at-24-gib) for the optimized implementation. The 4 GiB measurements below describe the earlier pipeline at `cde707f`.
+
 Single profiled runs in Docker Desktop on an AMD Ryzen 7 9800X3D, using a `linux/amd64` release build, 8 vCPUs, a 4 GiB container limit, and no swap. The input and output were on Docker Linux volumes. The root filesystem and `/scratch` were read-only. The program read its input files in bounded chunks, kept intermediates in memory, and wrote the two Parquet outputs.
 
 | Dataset | Generator seed | Events | Clicks | Elapsed | Process peak | Container peak |
@@ -54,3 +56,28 @@ docker run --rm --platform linux/amd64 --network none --read-only `
     --mount type=volume,source=shopping-sessions-bench-out,target=/output,volume-subpath=rust-opt-60m `
     shopping-sessions:rust
 ```
+
+## CSV parser comparison at 24 GiB
+
+Baseline `cde707f` and the optimized build processed the same seed-37 input (60M events, 15M clicks). Both used 8 Rayon workers, the same logical CPUs 0-7 (four SMT sibling pairs on this machine), an 8-CPU quota, a 24 GiB Docker limit, and no swap. Docker Desktop reported 23.05 GiB of VM RAM. Input and output used the same Linux volumes with separate output directories. The six fresh containers ran serially in A/B, B/A, A/B order, with an already populated filesystem cache.
+
+| Stage | Baseline seconds | Optimized seconds | Baseline peak RSS, GiB | Optimized peak RSS, GiB |
+| --- | ---: | ---: | ---: | ---: |
+| Dimensions and linked IDs | 1.782 | 1.414 | 0.411 | 0.347 |
+| Parse events | 7.055 | 4.937 | 2.543 | 2.505 |
+| Deduplicate events | 1.450 | 1.278 | 2.741 | 2.639 |
+| Sort events | 0.215 | 0.203 | 1.520 | 1.512 |
+| Sessions and user totals | 0.125 | 0.109 | 1.570 | 1.563 |
+| Parse and sort clicks | 1.606 | 1.324 | 1.532 | 1.528 |
+| Attribution and assists | 0.193 | 0.197 | 1.310 | 1.388 |
+| Write Parquet | 1.009 | 1.011 | 0.616 | 0.667 |
+| Full pipeline | 13.886 | 10.519 | 2.744 | 2.654 |
+
+Times are per-stage medians of three runs per image. Memory columns use the highest of the three peaks. Stage peaks were sampled every 5 ms and whole-process peaks come from the kernel. Individual stage medians can sum to a different value than the median total.
+
+- Baseline program times were 13.125, 13.886, 14.985 s. Median Docker CLI wall time was 14.298 s. Container memory peaked at 2.937 GiB.
+- Optimized program times were 10.142, 10.519, 11.087 s. Median Docker CLI wall time was 10.944 s. Container memory peaked at 2.865 GiB.
+
+The optimized release passed all 36 official fixtures and the 1M-event public answer. For the full-scale outputs, both Parquet schemas matched. A bidirectional `EXCEPT ALL` on every column returned zero rows for both tables. All 6,662,636 user-day keys and 28,014 campaign-day keys were unique. Five Rust regression tests cover chunk boundaries, time parsing, cache collisions and vectorized CSV parsing.
+
+To repeat the comparison, use the full-scale Docker command above with `--cpuset-cpus 0-7 --cpus 8 --memory 24g --memory-swap 24g`. Use images `shopping-sessions:csv-baseline-cde707f` and `shopping-sessions:rust` and output subpaths `csv-before` and `csv-after` respectively.
