@@ -31,6 +31,7 @@ Event parsing used 50% of full-scale runtime. Memory peaked during deduplication
 
 - All 36 official fixtures passed in the release image.
 - Both tables matched the official public answer exactly, with 117,038 `user_daily` rows and 27,400 `campaign_daily` rows.
+- For the 10M event run, the independent DuckDB pipeline matched both Rust tables exactly, with 1,141,663 user rows and 28,014 campaign rows.
 - The full-scale output matched the first Rust build across all 6,662,636 user rows and 28,014 campaign rows. Both output tables had unique keys and agreed on the totals of 10,086,639 sessions and 19,293,637,426 cents. The campaign table also passed the official assist-count checks.
 
 ## Reproduce
