@@ -7,16 +7,14 @@ use rayon::prelude::*;
 
 use crate::csv::{chunks, fields};
 use crate::input::{
-    self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, timestamp,
-    unsigned,
+    self, Aliases, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, timestamp,
 };
 
 const EXTERNAL_ID: u64 = 1 << 63;
 const MAX_INLINE_ID: usize = 12;
 const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-const INVALID_PERSON: u32 = u32::MAX;
 
-fn id_for(id: &[u8], fallback: &Names) -> u64 {
+pub(crate) fn id_for(id: &[u8], fallback: &Names) -> u64 {
     if id.len() <= MAX_INLINE_ID {
         let mut value = 0;
         for &byte in id {
@@ -77,12 +75,6 @@ pub struct Event {
     pub purchase: u32,
 }
 
-pub struct Candidate {
-    id: u64,
-    ingested: i64,
-    event: Event,
-}
-
 pub struct Batch<T> {
     pub rows: Vec<T>,
     pub purchases: Vec<Purchase>,
@@ -98,29 +90,15 @@ impl<T> Default for Batch<T> {
 }
 
 impl<T> Batch<T> {
-    fn add_purchase(&mut self, purchase: Option<Purchase>) -> u32 {
+    pub(crate) fn add_purchase(&mut self, purchase: Option<Purchase>) -> u32 {
         purchase.map_or(0, |value| {
             self.purchases.push(value);
             u32::try_from(self.purchases.len()).expect("too many purchases in one shard")
         })
     }
-
-    fn append(&mut self, batch: &mut Self, index: impl Fn(&mut T) -> &mut u32) {
-        if !batch.purchases.is_empty() {
-            let offset = self.purchases.len() as u32;
-            for row in &mut batch.rows {
-                let purchase = index(row);
-                if *purchase != 0 {
-                    *purchase += offset;
-                }
-            }
-            append(&mut self.purchases, &mut batch.purchases);
-        }
-        append(&mut self.rows, &mut batch.rows);
-    }
 }
 
-fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
+pub(crate) fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
     if destination.capacity() - destination.len() < source.len() {
         // Keep headroom for the next chunk without doubling large vectors.
         destination.reserve_exact(source.len().max(destination.len() / 8));
@@ -128,139 +106,8 @@ fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) {
     destination.append(source);
 }
 
-fn shards<T: Default>() -> Vec<T> {
+pub(crate) fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
-}
-
-pub fn read_events(
-    data: &Path,
-    window: Window,
-    dimensions: &Dimensions,
-    users: &Names,
-    aliases: &Aliases,
-) -> Result<Vec<Batch<Candidate>>> {
-    let ids = Names::default();
-    let shared = shards::<Mutex<Batch<Candidate>>>();
-    let worker_state = || (PersonCache::default(), shards::<Batch<Candidate>>());
-    chunks(&data.join("events"))?
-        .into_par_iter()
-        .try_for_each_init(worker_state, |(people, local), chunk| {
-            chunk.scan(|line| {
-                let Some([id, user, ts, ingested, kind, product, price]) = fields(line) else {
-                    return;
-                };
-                if id.is_empty() {
-                    return;
-                }
-                let ingested = timestamp(ingested).expect("ingest_ts is valid F1");
-                let id = id_for(id, &ids);
-                // Mix high and low bits because short IDs have trailing base-37 padding.
-                let shard = ((id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize;
-                let batch = &mut local[shard];
-                let mut valid = || {
-                    if user.is_empty() || product.is_empty() {
-                        return None;
-                    }
-                    let time = timestamp(ts)?;
-                    if time < window.start || time >= window.end || time < ingested - DAY {
-                        return None;
-                    }
-                    let purchase = match kind {
-                        b"view" | b"cart" => None,
-                        b"purchase" => {
-                            let cents = unsigned(price)?;
-                            if !(1..=10_000_000).contains(&cents) {
-                                return None;
-                            }
-                            let category = dimensions
-                                .products
-                                .get(text(product))
-                                .copied()
-                                .unwrap_or(dimensions.unknown_category);
-                            Some(Purchase {
-                                category,
-                                cents: cents as u32,
-                            })
-                        }
-                        _ => return None,
-                    };
-                    Some((time, people.resolve(users, aliases, user), purchase))
-                };
-                // Invalid candidates still compete in deduplication. The earliest copy wins.
-                let (time, person, purchase) = valid().unwrap_or((0, INVALID_PERSON, None));
-                let purchase = batch.add_purchase(purchase);
-                batch.rows.push(Candidate {
-                    id,
-                    ingested,
-                    event: Event {
-                        time,
-                        person,
-                        purchase,
-                    },
-                });
-            })?;
-            for (destination, batch) in shared.iter().zip(local) {
-                if !batch.rows.is_empty() {
-                    destination
-                        .lock()
-                        .unwrap()
-                        .append(batch, |row| &mut row.event.purchase);
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    Ok(shared
-        .into_iter()
-        .map(|batch| batch.into_inner().unwrap())
-        .collect())
-}
-
-pub fn dedup_events(candidates: Vec<Batch<Candidate>>) -> (Vec<Batch<Event>>, usize) {
-    let shared = shards::<Mutex<Batch<Event>>>();
-    let count = candidates
-        .into_par_iter()
-        .map(|mut batch| {
-            batch
-                .rows
-                .par_sort_unstable_by_key(|row| (row.id, row.ingested));
-            batch.rows.dedup_by_key(|row| row.id);
-            let mut local = shards::<Batch<Event>>();
-            let mut count = 0;
-            // Flush in batches so concurrent workers limit rebucketing memory.
-            for chunk in batch.rows.chunks(100_000) {
-                for row in chunk {
-                    let mut event = row.event;
-                    if event.person == INVALID_PERSON {
-                        continue;
-                    }
-                    let destination = &mut local[event.person as usize % SHARDS];
-                    let purchase = event
-                        .purchase
-                        .checked_sub(1)
-                        .map(|at| batch.purchases[at as usize]);
-                    event.purchase = destination.add_purchase(purchase);
-                    destination.rows.push(event);
-                    count += 1;
-                }
-                for (destination, batch) in shared.iter().zip(&mut local) {
-                    if !batch.rows.is_empty() {
-                        destination
-                            .lock()
-                            .unwrap()
-                            .append(batch, |row| &mut row.purchase);
-                    }
-                }
-            }
-            count
-        })
-        .sum();
-    (
-        shared
-            .into_iter()
-            .map(|batch| batch.into_inner().unwrap())
-            .collect(),
-        count,
-    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

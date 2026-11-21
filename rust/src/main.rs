@@ -1,5 +1,6 @@
 mod aggregate;
 mod csv;
+mod events;
 mod input;
 mod output;
 mod profile;
@@ -33,10 +34,9 @@ fn main() -> Result<()> {
     let aliases = input::read_aliases(&data, &mut users)?;
     profile.stage("load_dimensions_and_links");
 
-    let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
+    let parsed = events::read(&data, window, &dimensions, &users, &aliases)?;
     profile.stage("parse_events");
-    let (mut events, event_count) = records::dedup_events(candidates);
-    profile.stage("dedup_events");
+    let (mut events, event_count) = events::deduplicate(parsed, &mut profile);
     events.par_iter_mut().for_each(|batch| {
         batch
             .rows
