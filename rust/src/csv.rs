@@ -13,6 +13,9 @@ const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 #[path = "structural.rs"]
 mod structural;
+#[cfg(target_arch = "x86_64")]
+#[path = "token_scan.rs"]
+mod token_scan;
 
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "x86_64")]
@@ -540,7 +543,10 @@ pub(crate) fn perf_on(name: &str) -> bool {
 }
 
 fn use_mmap() -> bool {
-    std::env::var_os("PERF_IO").is_some_and(|v| v == "mmap")
+    std::env::var_os("PERF_IO").map_or_else(
+        || matches!(std::env::var("PERF_ARCH").as_deref(), Ok("A" | "B")),
+        |v| v == "mmap",
+    )
 }
 
 fn each_line<'a>(bytes: &'a [u8], row: &mut impl FnMut(&'a [u8])) {
@@ -956,6 +962,11 @@ impl Chunk {
     }
 
     pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if token_scan::enabled::<N>() {
+            // enabled checks all ISA extensions used by the block classifier.
+            return self.spans(|span| unsafe { token_scan::scan::<N>(span, &mut row) });
+        }
         #[cfg(target_arch = "x86_64")]
         if structural::window_enabled::<N>() {
             return self.spans(|span| structural::window::<N>(span, &mut row));

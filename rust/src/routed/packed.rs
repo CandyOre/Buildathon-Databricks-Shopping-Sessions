@@ -58,19 +58,67 @@ fn eight_base36(word: u64) -> Option<u64> {
     Some(u64::from(quads as u32) * 36u64.pow(4) + (quads >> 32))
 }
 
-pub(super) fn write_number(mut n: u64, output: &mut [u8; 8]) -> usize {
-    let mut start = 8;
-    while n != 0 {
-        n -= 1;
-        start -= 1;
-        output[start] = DIGITS[(n % 36) as usize];
-        n /= 36;
+/// Load the two common v5 suffix widths without reading across a CSV field.
+/// A synthetic leading '0' contributes exactly 36^7 to the bijective rank.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn suffix_word(id: &[u8], prefix: u8) -> Option<(u64, u64)> {
+    if id.first() != Some(&prefix) {
+        return None;
     }
-    output.copy_within(start.., 0);
-    let length = 8 - start;
-    output[length..].fill(0);
-    length
+    match id.len() {
+        8 => {
+            let word = u64::from_le_bytes(id.try_into().unwrap());
+            Some(((word & !255) | u64::from(b'0'), 36u64.pow(7)))
+        }
+        9 => Some((u64::from_le_bytes(id[1..].try_into().unwrap()), 0)),
+        _ => None,
+    }
 }
+
+/// Validate and decode two short keys simultaneously on optimized binaries.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline]
+pub(super) fn event_and_user(event: &[u8], user: &[u8]) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let (event, pad_event) = suffix_word(event, b'e')?;
+    let (user, pad_user) = suffix_word(user, b'u')?;
+    unsafe {
+        let ascii = _mm_set_epi64x(user as i64, event as i64);
+        let in_range = |low: i8, high: i8| {
+            _mm_and_si128(
+                _mm_cmpgt_epi8(ascii, _mm_set1_epi8(low - 1)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(high + 1), ascii),
+            )
+        };
+        let numeric = in_range(b'0' as i8, b'9' as i8);
+        let alpha = in_range(b'a' as i8, b'z' as i8);
+        if _mm_movemask_epi8(_mm_or_si128(numeric, alpha)) != 65535 {
+            return None;
+        }
+        let digits = _mm_sub_epi8(
+            _mm_sub_epi8(ascii, _mm_set1_epi8(47)),
+            _mm_and_si128(alpha, _mm_set1_epi8(39)),
+        );
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x0124));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) | 36 * 36));
+        let ranks = _mm_add_epi64(
+            _mm_mul_epu32(quads, _mm_set1_epi32(36i32.pow(4))),
+            _mm_srli_epi64::<32>(quads),
+        );
+        let event = _mm_cvtsi128_si64(ranks) as u64 - pad_event;
+        let user = _mm_cvtsi128_si64(_mm_unpackhi_epi64(ranks, ranks)) as u64 - pad_user;
+        Some((event, user))
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[inline]
+pub(super) fn event_and_user(_event: &[u8], _user: &[u8]) -> Option<(u64, u64)> {
+    None
+}
+
+pub(super) use crate::input::write_base36 as write_number;
 
 fn code(handle: u64, width: u32) -> Option<u64> {
     let marker = 1u64 << (width - 1);
@@ -95,24 +143,88 @@ fn from_code(value: u64, width: u32, wide: &[[u64; 2]]) -> u64 {
 #[derive(Clone, Copy, Default)]
 pub(super) struct ShortEvent(u64, u64);
 
+const MARK: u64 = 1 << 41;
+
+/// Downstream aggregation never emits an event id. A permutation within the
+/// inline-key domain keeps its spelling identity exact and leaves a usable
+/// bucket fingerprint in the low bits for both passes over the records.
+#[inline]
+pub(super) fn distributed_key(id: u64) -> u64 {
+    if id >= MARK {
+        return id;
+    }
+    let v = (id ^ (id >> 21)).wrapping_mul(0x9e37_79b9_7f4a_7c15) & (MARK - 1);
+    v ^ (v >> 17)
+}
+
+#[inline]
+pub(super) fn fingerprint(id: u64) -> u32 {
+    if id < MARK {
+        (id & super::HASH_MASK) as u32
+    } else {
+        super::hash(id)
+    }
+}
+
 impl ShortEvent {
     #[inline]
     pub fn key(self, k: &EventKeys) -> u64 {
         from_code(self.0 & ((1 << 42) - 1), 42, &k.wide)
     }
     pub fn pack(e: EventRow) -> Option<Self> {
-        Self::encode::<false>(e)
+        Self::encode::<false>(e, code(e.id, 42)?)
     }
 
+    #[cfg(test)]
     pub fn pack_precise(e: EventRow) -> Option<Self> {
-        Self::encode::<true>(e)
+        Self::encode::<true>(e, code(e.id, 42)?)
+    }
+
+    /// Upper fingerprint bits are shared by neither the bucket nor the slot.
+    /// Short spelling ranks may use every bit below MARK; wide keys have an
+    /// explicit MARK tag and spill into the full row if their slot overflows.
+    #[inline]
+    pub fn pack_indexed(e: EventRow, hash: u32, bucket_bits: u32) -> Option<Self> {
+        let id = if e.id < MARK {
+            e.id
+        } else if (WIDE..OTHER).contains(&e.id) {
+            let slot = u64::from(e.id as u32);
+            if slot >= 1 << (11 + bucket_bits) {
+                return None;
+            }
+            MARK | (slot << (30 - bucket_bits)) | u64::from(hash >> bucket_bits)
+        } else {
+            return None;
+        };
+        Self::encode::<true>(e, id)
     }
 
     #[inline]
-    fn encode<const FRACTIONAL: bool>(e: EventRow) -> Option<Self> {
+    pub fn bitmap_fingerprint(self, bucket_bits: u32) -> usize {
+        let code = self.0 & (2 * MARK - 1);
+        // The caller masks to at most 30 - bucket_bits bits.
+        if code < MARK {
+            (code >> bucket_bits) as usize
+        } else {
+            code as usize
+        }
+    }
+
+    #[inline]
+    pub fn indexed_key(self, bucket_bits: u32, bucket: u16) -> u64 {
+        let code = self.0 & (2 * MARK - 1);
+        if code < MARK {
+            return code;
+        }
+        let fingerprint = ((code << bucket_bits) & super::HASH_MASK) | u64::from(bucket);
+        let slot = (code & (MARK - 1)) >> (30 - bucket_bits);
+        WIDE | (fingerprint << 32) | slot
+    }
+
+    #[inline]
+    fn encode<const FRACTIONAL: bool>(e: EventRow, id: u64) -> Option<Self> {
         const NO_TIME: u32 = (1 << 21) - 1;
         const PAYLOAD_REF: u32 = NO_TIME - 65535;
-        let id = code(e.id, 42)?;
         let user = code(e.user, 42)?;
         let stamp = if e.stamp == INVALID {
             NO_TIME
@@ -146,6 +258,11 @@ impl ShortEvent {
     }
 
     pub fn unpack(self, k: &EventKeys, p: &EventData) -> EventRow {
+        self.unpack_with_id(self.key(k), p)
+    }
+
+    #[inline]
+    pub fn unpack_with_id(self, id: u64, p: &EventData) -> EventRow {
         const NO_TIME: u32 = (1 << 21) - 1;
         const PAYLOAD_REF: u32 = NO_TIME - 65535;
         let (stamp, ingest) = if self.1 >> 63 != 0 {
@@ -164,7 +281,7 @@ impl ShortEvent {
             (stamp, (self.1 >> 41) as u32)
         };
         EventRow {
-            id: self.key(k),
+            id,
             user: from_code(
                 (self.0 >> 42) | ((self.1 & ((1 << 20) - 1)) << 22),
                 42,
@@ -202,9 +319,7 @@ impl ShortClick {
         let id = if click >= Self::WIDE_SLOT {
             crate::records::HEX_CLICK | (u64::from(chunk) << 32) | u64::from(click as u32)
         } else {
-            let mut tail = [0; 8];
-            write_number(click, &mut tail);
-            u64::from_be_bytes(tail)
+            crate::records::NUMERIC_CLICK | click
         };
         RawClick {
             user: owner,
@@ -223,6 +338,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn indexed_wide_keys_keep_the_hash_and_slot_without_loading_a_sidecar() {
+        for bits in 0..=13 {
+            let bucket_mask = (1u32 << bits) - 1;
+            let limit = 1u32 << (11 + bits);
+            for h in [0, 1, 0x1234_5678, super::super::HASH_MASK as u32] {
+                for slot in [0, limit - 1, limit] {
+                    let id = WIDE | (u64::from(h) << 32) | u64::from(slot);
+                    let e = EventRow {
+                        id,
+                        user: 19,
+                        stamp: 1001,
+                        ingest: 3,
+                    };
+                    let v = ShortEvent::pack_indexed(e, h, bits);
+                    if slot == limit {
+                        assert!(v.is_none());
+                        continue;
+                    }
+                    let v = v.unwrap();
+                    assert_eq!(v.indexed_key(bits, (h & bucket_mask) as u16), id);
+                    let usable = (1usize << (30 - bits)) - 1;
+                    assert_eq!(v.bitmap_fingerprint(bits) & usable, (h >> bits) as usize);
+                }
+            }
+            for rank in [0, 1, MARK - 2, MARK - 1, MARK, MARK + 1, OTHER] {
+                let id = distributed_key(rank);
+                let h = fingerprint(id);
+                let e = EventRow {
+                    id,
+                    user: 19,
+                    stamp: 1001,
+                    ingest: 3,
+                };
+                let v = ShortEvent::pack_indexed(e, h, bits);
+                if rank >= MARK {
+                    assert_eq!(id, rank);
+                    assert!(v.is_none());
+                } else {
+                    let v = v.unwrap();
+                    assert!(id < MARK);
+                    assert_eq!(v.indexed_key(bits, (h & bucket_mask) as u16), id);
+                    assert_eq!(v.bitmap_fingerprint(bits) & 63, (h >> bits) as usize & 63);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wide_base36_decoder_matches_every_byte_in_every_lane() {
         for sample in [b"0za3f90".as_slice(), b"z0ga107z", b"00000000", b"zzzzzzzz"] {
             let mut input = sample.to_vec();
@@ -230,12 +393,47 @@ mod tests {
                 for value in 0..=255 {
                     input[pos] = value;
                     let expected = input.iter().try_fold(0u64, |n, &b| {
-                        DIGITS.iter().position(|&symbol| symbol == b)
+                        DIGITS
+                            .iter()
+                            .position(|&symbol| symbol == b)
                             .map(|v| n * 36 + 1 + v as u64)
                     });
                     assert_eq!(number(&input), expected, "{input:?}");
                 }
                 input[pos] = sample[pos];
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[test]
+    fn paired_key_decoder_keeps_both_ranks_and_rejects_mixed_spelling() {
+        for mut event in [b"e01ad7z0".to_vec(), b"ez013ma01".to_vec()] {
+            for mut user in [b"u4190a0b".to_vec(), b"u003wp3ji".to_vec()] {
+                for field in 0..2 {
+                    let len = if field == 0 { event.len() } else { user.len() };
+                    for i in 0..len {
+                        let old = if field == 0 { event[i] } else { user[i] };
+                        for val in 0..=255 {
+                            if field == 0 {
+                                event[i] = val;
+                            } else {
+                                user[i] = val;
+                            }
+                            let expected = if event[0] == b'e' && user[0] == b'u' {
+                                number(&event[1..]).zip(number(&user[1..]))
+                            } else {
+                                None
+                            };
+                            assert_eq!(event_and_user(&event, &user), expected);
+                        }
+                        if field == 0 {
+                            event[i] = old;
+                        } else {
+                            user[i] = old;
+                        }
+                    }
+                }
             }
         }
     }
@@ -247,12 +445,22 @@ mod tests {
         for stamp in [1, 31_999, 32_001, 86_400_001, super::super::SIDE - 1] {
             let sec = stamp / 1000;
             for difference in [-33, -32, -1, 0, 1, 4063, 4064] {
-                let Ok(ingest) = u32::try_from(i64::from(sec) + difference) else { continue };
-                let row = EventRow { id: 10, user: 23, stamp, ingest };
+                let Ok(ingest) = u32::try_from(i64::from(sec) + difference) else {
+                    continue;
+                };
+                let row = EventRow {
+                    id: 10,
+                    user: 23,
+                    stamp,
+                    ingest,
+                };
                 let encoded = ShortEvent::pack_precise(row);
                 if (-32..=4063).contains(&difference) {
                     let decoded = encoded.unwrap().unpack(&keys, &data);
-                    assert_eq!((decoded.id,decoded.user,decoded.stamp,decoded.ingest), (10,23,stamp,ingest));
+                    assert_eq!(
+                        (decoded.id, decoded.user, decoded.stamp, decoded.ingest),
+                        (10, 23, stamp, ingest)
+                    );
                 } else {
                     assert!(encoded.is_none());
                 }
@@ -319,7 +527,10 @@ mod tests {
         .unwrap()
         .unpack(0, 0, &p.users);
         assert_eq!(t.user, user);
-        assert_eq!(t.id, u64::from_be_bytes(*b"00ab\0\0\0\0"));
+        assert_eq!(
+            t.id,
+            crate::records::NUMERIC_CLICK | number(b"00ab").unwrap()
+        );
         assert_eq!(t.campaign, (1 << 15) - 1);
         assert_eq!(t.time, (1 << 31) - 1);
         let wide = ShortClick::pack(user, ShortClick::WIDE_SLOT | 0x9876, 800, 0, 1)

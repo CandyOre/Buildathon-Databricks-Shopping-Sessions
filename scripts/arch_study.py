@@ -162,7 +162,8 @@ def main():
                 if opts.action=="race":
                     race(work,volume,name,digest,case)
                 else:
-                    call(work,volume,case,[name],{name:{"image":digest,"env":{}}},
+                    diagnostic = {"XL_TIMING":"1","V1ND_LOG":"1"} if digest == PEER else {}
+                    call(work,volume,case,[name],{name:{"image":digest,"env":diagnostic}},
                          "profile/"+name,profile=True,record_peers=True)
 
 

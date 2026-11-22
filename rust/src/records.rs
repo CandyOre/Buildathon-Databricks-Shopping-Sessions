@@ -68,6 +68,9 @@ fn mix_event_word(word: u64) -> u64 {
 }
 
 pub(crate) const HEX_CLICK: u64 = EXTERNAL_ID | (1 << 62);
+// Compact click packets retain their reversible suffix until a same-time
+// tie actually needs the byte ordering. External names use only 32 low bits.
+pub(crate) const NUMERIC_CLICK: u64 = EXTERNAL_ID | (1 << 61);
 
 pub(crate) struct ClickKeyChunk {
     index: usize,
@@ -147,6 +150,11 @@ impl ClickIds {
                 out[1] = alphabet[(byte & 15) as usize];
             }
             return buffer;
+        }
+        if id >= NUMERIC_CLICK {
+            let length =
+                input::write_base36(id ^ NUMERIC_CLICK, (&mut buffer[1..9]).try_into().unwrap());
+            return &buffer[..1 + length];
         }
         if id >= EXTERNAL_ID {
             return input::name_for(&self.external, id as u32).as_bytes();
@@ -1407,6 +1415,30 @@ mod id_tests {
         for (i, a) in cases.iter().enumerate() {
             for (j, b) in cases.iter().enumerate() {
                 assert_eq!(ids.compare(left[i], right[j]), a.cmp(b));
+            }
+        }
+        let packed = [
+            (0, &b"k"[..]),
+            (1, &b"k0"[..]),
+            (36, &b"kz"[..]),
+            (37, &b"k00"[..]),
+        ];
+        for (rank, spelling) in packed {
+            for (i, &other) in cases.iter().enumerate() {
+                assert_eq!(
+                    ids.compare(NUMERIC_CLICK | rank, right[i]),
+                    spelling.cmp(other)
+                );
+                assert_eq!(
+                    ids.compare(left[i], NUMERIC_CLICK | rank),
+                    other.cmp(spelling)
+                );
+            }
+            for (rank2, other) in packed {
+                assert_eq!(
+                    ids.compare(NUMERIC_CLICK | rank, NUMERIC_CLICK | rank2),
+                    spelling.cmp(other)
+                );
             }
         }
     }

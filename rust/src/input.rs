@@ -15,6 +15,23 @@ pub const DAY: i64 = 86_400_000;
 pub const LOOKBACK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
 
+/// Inverse of the bijective base-36 representation for a suffix of up to
+/// eight bytes. Zero is the empty suffix; leading '0' bytes are significant.
+pub(crate) fn write_base36(mut n: u64, output: &mut [u8; 8]) -> usize {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut start = 8;
+    while n != 0 {
+        n -= 1;
+        start -= 1;
+        output[start] = ALPHABET[(n % 36) as usize];
+        n /= 36;
+    }
+    output.copy_within(start.., 0);
+    let length = 8 - start;
+    output[length..].fill(0);
+    length
+}
+
 #[path = "fastdecode.rs"]
 mod fastdecode;
 
@@ -45,6 +62,20 @@ pub fn hex_id(bytes: &[u8], prefix: u8) -> Option<[u64; 2]> {
         }
     }
     hex_scalar(digits)
+}
+
+#[inline]
+pub(crate) fn routed_hex(bytes: &[u8], prefix: u8) -> Option<[u64; 2]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        if bytes.len() != 33 || bytes[0] != prefix {
+            return None;
+        }
+        // The dispatcher guarantees AVX2 for this binary.
+        unsafe { hex_avx2(bytes[1..].try_into().unwrap()) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    hex_id(bytes, prefix)
 }
 
 fn hex_scalar(digits: &[u8; 32]) -> Option<[u64; 2]> {
@@ -317,7 +348,10 @@ mod timestamp_tests {
     #[test]
     fn shared_event_ingest_hour_matches_the_complete_timestamp_parser() {
         let start = timestamp(b"2028-02-29T00:00:00Z").unwrap();
-        let cal = super::Calendar::new(super::Window { start, end: start + DAY });
+        let cal = super::Calendar::new(super::Window {
+            start,
+            end: start + DAY,
+        });
         for ingest in [b"2028-02-29T23:59:59Z", b"1968-02-29T07:09:13Z"] {
             let seconds = ingest_timestamp(ingest).div_euclid(1000);
             for event in [
@@ -461,16 +495,18 @@ impl Calendar {
         let ingest: &[u8; 20] = ingest.try_into().expect("ingest_ts is valid F1");
         let word = u64::from_le_bytes(ingest[11..19].try_into().unwrap());
         let (h, m, sec) = clock_components(word);
-        let hour_start = self.date_seconds(ingest).expect("ingest_ts has a valid date")
+        let hour_start = self
+            .date_seconds(ingest)
+            .expect("ingest_ts has a valid date")
             + i64::from(h) * 3600;
         let ingest_seconds = hour_start + i64::from(m * 60 + sec);
         let iso = event.len() == 20 && event[19] == b'Z'
             || event.len() == 25 && matches!(event[19], b'+' | b'-');
         let timestamp = if iso && event[..13] == ingest[..13] {
             let clock = u64::from_le_bytes(event[12..20].try_into().unwrap());
-            minute_seconds(clock).zip(zone_offset(event)).map(|(seconds, zone)| {
-                (hour_start + seconds) * 1000 - zone
-            })
+            minute_seconds(clock)
+                .zip(zone_offset(event))
+                .map(|(seconds, zone)| (hour_start + seconds) * 1000 - zone)
         } else {
             self.parse_reference(event)
         };
@@ -502,7 +538,9 @@ impl Calendar {
             if h > 23 || m > 59 || sec > 59 {
                 return None;
             }
-            return Some(self.date(s)? + i64::from(h * 3600 + m * 60 + sec) * 1000 - zone_offset(s)?);
+            return Some(
+                self.date(s)? + i64::from(h * 3600 + m * 60 + sec) * 1000 - zone_offset(s)?,
+            );
         }
         timestamp(s)
     }
@@ -988,31 +1026,51 @@ impl OutputSpellings {
         self.keys.push(key);
     }
 
-    pub(crate) fn len(&self) -> usize { self.keys.len() }
+    pub(crate) fn push_shared(&mut self, name: &Arc<str>) {
+        self.keys.push(EXTERNAL_NAME);
+        self.external.push(Arc::clone(name));
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 impl PersonNames {
     pub(crate) fn from_partitions(parts: Vec<OutputSpellings>) -> Self {
-        let total = parts.iter().map(OutputSpellings::len).sum();
-        let mut canonical = Vec::with_capacity(total);
-        let mut external_names: Vec<Vec<Arc<str>>> = (0..SHARDS).map(|_| Vec::new()).collect();
-        let mut external_id = 0usize;
+        let mut names = Self {
+            table: Arc::new(NameTable {
+                canonical: Vec::new(),
+                external_names: (0..SHARDS).map(|_| Vec::new()).collect(),
+                overflow: AHashMap::default(),
+                directory: Directory::new(8),
+            }),
+            dynamic: Vec::new(),
+        };
+        names.append_partitions(parts);
+        names
+    }
+
+    pub(crate) fn append_partitions(&mut self, parts: Vec<OutputSpellings>) {
+        // Both routes call this after the link directory is retired. Linked
+        // representatives keep their existing dense IDs and external slots.
+        let table = Arc::get_mut(&mut self.table).expect("output owns the frozen name table");
+        table
+            .canonical
+            .reserve(parts.iter().map(OutputSpellings::len).sum());
         for part in parts {
             let mut external = part.external.into_iter();
             for key in part.keys {
                 if key == EXTERNAL_NAME {
-                    external_names[external_id % SHARDS].push(external.next().unwrap());
-                    canonical.push(EXTERNAL_NAME | external_id as u64);
-                    external_id += 1;
+                    let shard = table.canonical.len() % SHARDS;
+                    let names = &mut table.external_names[shard];
+                    let id = id_for(shard, names.len());
+                    names.push(external.next().unwrap());
+                    table.canonical.push(EXTERNAL_NAME | u64::from(id));
                 } else {
-                    canonical.push(key);
+                    table.canonical.push(key);
                 }
             }
-        }
-        Self {
-            table: Arc::new(NameTable { canonical, external_names, overflow: AHashMap::default(),
-                                        directory: Directory::new(8) }),
-            dynamic: Vec::new(),
         }
     }
     pub fn get<'a>(&'a self, id: u32, buffer: &'a mut [u8; 9]) -> &'a str {
@@ -1038,6 +1096,10 @@ fn id_for(shard: usize, slot: usize) -> u32 {
 }
 
 pub fn name_for<T: AsRef<[Arc<str>]>>(names: &[T], id: u32) -> &str {
+    shared_name_for(names, id)
+}
+
+pub(crate) fn shared_name_for<T: AsRef<[Arc<str>]>>(names: &[T], id: u32) -> &Arc<str> {
     let id = id as usize;
     &names[id % SHARDS].as_ref()[id / SHARDS]
 }
@@ -1081,14 +1143,27 @@ fn linked_spelling<'a>(names: &'a [Vec<Arc<str>>], key: u64, buffer: &'a mut [u8
 /// link builder writes these slots, and it joins before routing starts.
 pub(crate) struct NumericLinks {
     keys: Vec<AtomicU64>,
-    people: Vec<AtomicU32>,
+    // Normal numeric user keys fit in 42 bits. The common graph therefore
+    // returns the representative from the same cache line as the full key.
+    large_people: Option<Vec<AtomicU32>>,
 }
 
 impl NumericLinks {
-    fn new(slots: usize) -> Self {
+    const KEY_BITS: u32 = 42;
+    const KEY_MASK: u64 = (1 << Self::KEY_BITS) - 1;
+
+    fn new(slots: usize, people: usize) -> Self {
         Self {
-            keys: (0..slots).into_par_iter().map(|_| AtomicU64::new(EMPTY_KEY)).collect(),
-            people: (0..slots).into_par_iter().map(|_| AtomicU32::new(0)).collect(),
+            keys: (0..slots)
+                .into_par_iter()
+                .map(|_| AtomicU64::new(EMPTY_KEY))
+                .collect(),
+            large_people: (people > (1 << (64 - Self::KEY_BITS))).then(|| {
+                (0..slots)
+                    .into_par_iter()
+                    .map(|_| AtomicU32::new(0))
+                    .collect()
+            }),
         }
     }
 
@@ -1099,26 +1174,55 @@ impl NumericLinks {
     }
 
     fn fill(&self, key: u64, person: u32) {
-        let mask = self.keys.len()-1;
+        debug_assert!(key < Self::KEY_MASK);
+        let word = if self.large_people.is_some() {
+            key
+        } else {
+            key | (u64::from(person) << Self::KEY_BITS)
+        };
+        let mask = self.keys.len() - 1;
         let mut pos = self.home(key);
         loop {
-            if self.keys[pos].compare_exchange(EMPTY_KEY,key,Ordering::Relaxed,Ordering::Relaxed).is_ok() {
-                self.people[pos].store(person,Ordering::Relaxed);
+            if self.keys[pos]
+                .compare_exchange(EMPTY_KEY, word, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                if let Some(ids) = &self.large_people {
+                    ids[pos].store(person, Ordering::Relaxed);
+                }
                 return;
             }
-            pos=(pos+1)&mask;
+            pos = (pos + 1) & mask;
         }
     }
 
     #[inline]
+    pub(crate) fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(self.keys.as_ptr().add(self.home(key)).cast());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
+    #[inline]
     pub(crate) fn person(&self, key: u64) -> Option<u32> {
-        let mask=self.keys.len()-1;
-        let mut pos=self.home(key);
+        let mask = self.keys.len() - 1;
+        let mut pos = self.home(key);
         loop {
-            let found=self.keys[pos].load(Ordering::Relaxed);
-            if found==EMPTY_KEY {return None;}
-            if found==key {return Some(self.people[pos].load(Ordering::Relaxed));}
-            pos=(pos+1)&mask;
+            let found = self.keys[pos].load(Ordering::Relaxed);
+            if found == EMPTY_KEY {
+                return None;
+            }
+            if found & Self::KEY_MASK == key {
+                return Some(self.large_people.as_ref().map_or_else(
+                    || (found >> Self::KEY_BITS) as u32,
+                    |ids| ids[pos].load(Ordering::Relaxed),
+                ));
+            }
+            pos = (pos + 1) & mask;
         }
     }
 }
@@ -1131,6 +1235,9 @@ pub struct Aliases {
 }
 
 impl Aliases {
+    pub(crate) fn linked_person_count(&self) -> usize {
+        self.table.canonical.len()
+    }
     #[inline]
     fn resolve_external(&self, users: &Names, bytes: &[u8]) -> u32 {
         if let Some(wide) = &self.wide {
@@ -1156,34 +1263,27 @@ impl Aliases {
             .unwrap_or_else(|| users.intern_in(shard, name))
     }
 
-    /// Probe only immutable linked endpoints. A miss must never insert a
-    /// dynamic ID when routing is keyed by the original unlinked spelling.
-    #[inline]
-    pub(crate) fn linked_only(&self, users: &Names, bytes: &[u8]) -> Option<u32> {
+    /// Resolve an unusual spelling by its complete packed key or original
+    /// bytes. Reversible numeric and canonical wide handles use their own
+    /// immutable indices before reaching this path.
+    pub(crate) fn linked_other(&self, users: &Names, bytes: &[u8]) -> Option<u32> {
         if let Some(key) = packed_name(bytes) {
-            let directory = &self.table.directory;
-            if let Some(mixed) = mixed_word(key) {
-                for (line, tag) in directory.locations(mixed) {
-                    let line = &directory.lines[line];
-                    if let Some(id) = line.cached(tag, directory.id_mask - 2, line.tags.load(Ordering::Relaxed)) {
-                        return Some(id);
-                    }
-                }
-            }
             return self.table.overflow.get(&key).copied();
         }
-        if let Some(wide) = &self.wide {
-            if let Some(key) = hex_id(bytes, b'u') {
-                return wide[users.hash.hash_one(key) as usize % SHARDS].get(&key).copied();
-            }
-        }
-        self.external[users.hash.hash_one(bytes) as usize % SHARDS].get(text(bytes)).copied()
+        self.external[users.hash.hash_one(bytes) as usize % SHARDS]
+            .get(text(bytes))
+            .copied()
     }
 
     #[inline]
-    pub(crate) fn linked_wide(&self, users: &Names, key: [u64;2]) -> Option<u32> {
-        let wide=self.wide.as_ref().expect("numeric link reader builds full-width endpoint index");
-        wide[users.hash.hash_one(key) as usize % SHARDS].get(&key).copied()
+    pub(crate) fn linked_wide(&self, users: &Names, key: [u64; 2]) -> Option<u32> {
+        let wide = self
+            .wide
+            .as_ref()
+            .expect("numeric link reader builds full-width endpoint index");
+        wide[users.hash.hash_one(key) as usize % SHARDS]
+            .get(&key)
+            .copied()
     }
 
     pub(crate) fn is_linked_person(&self, id: u32) -> bool {
@@ -1654,8 +1754,10 @@ impl LinkGraph {
     }
 
     fn finish(
-        self, external: &mut [AHashMap<Arc<str>, u32>], hash: &RandomState,
-        number: Option<fn(&[u8])->Option<u64>>,
+        self,
+        external: &mut [AHashMap<Arc<str>, u32>],
+        hash: &RandomState,
+        number: Option<fn(&[u8]) -> Option<u64>>,
     ) -> (NameTable, Option<NumericLinks>) {
         // Flatten all physical parents before reading any as final roots.
         let roots: Vec<_> = self
@@ -1684,9 +1786,27 @@ impl LinkGraph {
 
         // Each root owns at least one occupied slot. The directory reserves
         // more than eight IDs per graph slot, so all linked IDs fit.
-        let numeric = number.map(|_| NumericLinks::new(self.entries.len()));
-        let directory = Directory::new(if numeric.is_some(){8}else{self.entries.len()});
-        debug_assert!(numeric.is_some() || canonical.len() as u64 <= directory.id_mask - 2);
+        let numeric = number.map(|_| {
+            // Reserve an empty slot even when the compact link graph happened
+            // to fill exactly. This bounds unsuccessful probes on every input.
+            let short_count = self
+                .entries
+                .par_iter()
+                .filter(|entry| entry.key.load(Ordering::Relaxed) < EXTERNAL_NAME)
+                .count();
+            NumericLinks::new(
+                (short_count + short_count.div_ceil(2))
+                    .max(8)
+                    .next_power_of_two(),
+                canonical.len(),
+            )
+        });
+        let directory = Directory::new(if numeric.is_some() {
+            8
+        } else {
+            self.entries.len()
+        });
+        assert!(numeric.is_some() || canonical.len() as u64 <= directory.id_mask - 2);
         let spilled: Vec<_> = self
             .entries
             .par_iter()
@@ -1696,14 +1816,18 @@ impl LinkGraph {
                     return None;
                 }
                 let id = dense[entry.parent.load(Ordering::Relaxed) as usize];
-                if let (Some(index),Some(number))=(&numeric,number) {
+                if let (Some(index), Some(number)) = (&numeric, number) {
                     // Canonical numeric endpoints use the same code as the CSV
                     // front end. Other short spellings retain the exact packed key.
-                    if let Some(code)=unpack_name(key,&mut [0;9]).as_bytes().strip_prefix(b"u").and_then(number) {
-                        index.fill(code,id);
+                    if let Some(code) = unpack_name(key, &mut [0; 9])
+                        .as_bytes()
+                        .strip_prefix(b"u")
+                        .and_then(number)
+                    {
+                        index.fill(code, id);
                         return None;
                     }
-                    return Some((key,id));
+                    return Some((key, id));
                 }
                 if mixed_word(key).is_some_and(|mixed| directory.fill(mixed, id)) {
                     None
@@ -1720,12 +1844,15 @@ impl LinkGraph {
                 *id = dense[root as usize];
             }
         });
-(NameTable {
-            directory,
-            canonical,
-            external_names: self.external_names,
-            overflow: spilled.into_iter().collect(),
-        }, numeric)
+        (
+            NameTable {
+                directory,
+                canonical,
+                external_names: self.external_names,
+                overflow: spilled.into_iter().collect(),
+            },
+            numeric,
+        )
     }
 }
 
@@ -1764,17 +1891,23 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
 }
 
 fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> Result<Aliases> {
-    read_aliases_index(data, users, wide_users, None).map(|(aliases,_)| aliases)
+    read_aliases_index(data, users, wide_users, None).map(|(aliases, _)| aliases)
 }
 
 pub(crate) fn read_numeric_aliases(
-    data: &Path, users: &mut Names, number: fn(&[u8])->Option<u64>,
-) -> Result<(Aliases, Option<NumericLinks>)> {
+    data: &Path,
+    users: &mut Names,
+    number: fn(&[u8]) -> Option<u64>,
+) -> Result<(Aliases, NumericLinks)> {
     read_aliases_index(data, users, true, Some(number))
+        .map(|(aliases, index)| (aliases, index.expect("requested numeric link directory")))
 }
 
 fn read_aliases_index(
-    data: &Path, users: &mut Names, wide_users: bool, number: Option<fn(&[u8])->Option<u64>>,
+    data: &Path,
+    users: &mut Names,
+    wide_users: bool,
+    number: Option<fn(&[u8]) -> Option<u64>>,
 ) -> Result<(Aliases, Option<NumericLinks>)> {
     let external = Names {
         hash: users.hash.clone(),
@@ -1856,7 +1989,7 @@ fn read_aliases_index(
         );
     }
     drop(batches);
-    let (table,numeric) = graph.finish(&mut external, &users.hash,number);
+    let (table, numeric) = graph.finish(&mut external, &users.hash, number);
     let wide: Option<Vec<AHashMap<[u64; 2], u32>>> = wide_users.then(|| {
         external
             .par_iter_mut()
@@ -1885,7 +2018,15 @@ fn read_aliases_index(
         .as_ref()
         .filter(|_| perf_on("PERF_WIDE_CACHE"))
         .map(|maps| crate::wide_cache::WideCache::new(maps.iter().map(|m| m.len()).sum()));
-    Ok((Aliases {table,external,wide,wide_cache},numeric))
+    Ok((
+        Aliases {
+            table,
+            external,
+            wide,
+            wide_cache,
+        },
+        numeric,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -2073,6 +2214,21 @@ impl PersonCache {
 #[cfg(test)]
 mod person_tests {
     use super::*;
+
+    #[test]
+    fn frozen_numeric_slots_preserve_colliding_keys_and_large_representatives() {
+        for people in [1 << 22, (1 << 22) + 1] {
+            let index = NumericLinks::new(16, people);
+            let colliding: Vec<_> = (0..256).filter(|&id| index.home(id) == 0).take(3).collect();
+            for (i, &id) in colliding.iter().enumerate() {
+                index.fill(id, (people - 1 - i) as u32);
+            }
+            for (i, &id) in colliding.iter().enumerate() {
+                assert_eq!(index.person(id), Some((people - 1 - i) as u32));
+            }
+            assert_eq!(index.person((1 << 41) + 99), None);
+        }
+    }
 
     #[test]
     fn wide_people_preserve_linked_dynamic_and_unusual_spellings() -> Result<()> {
@@ -2327,7 +2483,7 @@ mod person_tests {
                 table.join(a, b);
             }
         });
-        let (table,_) = table.finish(&mut [], &hash,None);
+        let (table, _) = table.finish(&mut [], &hash, None);
         let users = Names::default();
         assert_eq!(table.canonical, [keys[0]]);
         for key in keys {

@@ -62,64 +62,61 @@ fn main() -> Result<()> {
         "default" => None,
         _ => anyhow::bail!("PERF_ARCH must be default, A, or B"),
     };
-    let (mut session_batches, campaigns, user_names, event_count) =
-        if let Some(direct) = direct {
-            eprintln!("architecture={requested}");
-            profile.stage("load_dimensions");
-            let rows = routed::run_arch(&data, window, &dimensions, direct)?;
-            profile.stage("route_and_sessionize");
-            rows
-        } else if probe::use_routing(&data, window)? {
-            profile.stage("load_dimensions");
-            let rows = routed::run(&data, window, &dimensions)?;
-            profile.stage("route_and_sessionize");
-            rows
+    let (mut session_batches, campaigns, user_names, event_count) = if let Some(direct) = direct {
+        eprintln!("architecture={requested}");
+        profile.stage("load_dimensions");
+        let rows = routed::run_arch(&data, window, &dimensions, direct)?;
+        profile.stage("route_and_sessionize");
+        rows
+    } else if probe::use_routing(&data, window)? {
+        profile.stage("load_dimensions");
+        let rows = routed::run(&data, window, &dimensions)?;
+        profile.stage("route_and_sessionize");
+        rows
+    } else {
+        let mut users = input::Names::default();
+        let aliases = input::read_aliases(&data, &mut users)?;
+        let aggregate_names = output::aggregate_names(&users);
+        profile.stage("load_dimensions_and_links");
+        let (sessions, count, clicks, ids) = if runtime::flag("PERF_OVERLAP_STREAMS") {
+            let (events, clicks) = rayon::join(
+                || -> Result<_> {
+                    let candidates =
+                        records::read_events(&data, window, &dimensions, &users, &aliases)?;
+                    Ok(records::dedup_and_sessionize(
+                        candidates,
+                        users.person_slots_per_shard(),
+                        aggregate_names,
+                    ))
+                },
+                || records::read_clicks(&data, window, &dimensions, &users, &aliases),
+            );
+            let (sessions, count) = events?;
+            let (clicks, ids) = clicks?;
+            profile.stage("overlap_events_and_clicks");
+            (sessions, count, clicks, ids)
         } else {
-            let mut users = input::Names::default();
-            let aliases = input::read_aliases(&data, &mut users)?;
-            let aggregate_names = output::aggregate_names(&users);
-            profile.stage("load_dimensions_and_links");
-            let (sessions, count, clicks, ids) = if runtime::flag("PERF_OVERLAP_STREAMS") {
-                let (events, clicks) = rayon::join(
-                    || -> Result<_> {
-                        let candidates =
-                            records::read_events(&data, window, &dimensions, &users, &aliases)?;
-                        Ok(records::dedup_and_sessionize(
-                            candidates,
-                            users.person_slots_per_shard(),
-                            aggregate_names,
-                        ))
-                    },
-                    || records::read_clicks(&data, window, &dimensions, &users, &aliases),
-                );
-                let (sessions, count) = events?;
-                let (clicks, ids) = clicks?;
-                profile.stage("overlap_events_and_clicks");
-                (sessions, count, clicks, ids)
-            } else {
-                let candidates =
-                    records::read_events(&data, window, &dimensions, &users, &aliases)?;
-                profile.stage("parse_events");
-                let (sessions, count) = records::dedup_and_sessionize(
-                    candidates,
-                    users.person_slots_per_shard(),
-                    aggregate_names,
-                );
-                profile.stage("dedup_and_sessionize");
-                let (clicks, ids) =
-                    records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
-                profile.stage("parse_and_sort_clicks");
-                (sessions, count, clicks, ids)
-            };
-            drop(aliases);
-            let names = users.into_people();
-            (
-                sessions,
-                routed::Campaigns::Pending(clicks, ids),
-                names,
-                count,
-            )
+            let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
+            profile.stage("parse_events");
+            let (sessions, count) = records::dedup_and_sessionize(
+                candidates,
+                users.person_slots_per_shard(),
+                aggregate_names,
+            );
+            profile.stage("dedup_and_sessionize");
+            let (clicks, ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
+            profile.stage("parse_and_sort_clicks");
+            (sessions, count, clicks, ids)
         };
+        drop(aliases);
+        let names = users.into_people();
+        (
+            sessions,
+            routed::Campaigns::Pending(clicks, ids),
+            names,
+            count,
+        )
+    };
 
     let dictionaries = output::prepare_names(&session_batches, &user_names)?;
     let campaign_daily = match campaigns {

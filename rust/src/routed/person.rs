@@ -33,17 +33,23 @@ pub(super) fn finish(
     assert!(rows.events.len() <= END as usize && rows.clicks.len() <= END as usize);
     fused.with_people(names, ids, |kernel| {
         for (person, heads) in rows.groups {
-            if heads.events == END as usize { continue; }
+            if heads.events == END as usize {
+                continue;
+            }
             let mut next = heads.events as u32;
             let events = std::iter::from_fn(|| {
-                if next == END { return None; }
+                if next == END {
+                    return None;
+                }
                 let e = &rows.events[next as usize];
                 next = e.person;
                 Some(data[e.chunk as usize].decode(window.start, e.stamp))
             });
             let mut next = heads.clicks as u32;
             let clicks = std::iter::from_fn(|| {
-                if next == END { return None; }
+                if next == END {
+                    return None;
+                }
                 let mut c = rows.clicks[next as usize];
                 next = c.person;
                 c.person = person;

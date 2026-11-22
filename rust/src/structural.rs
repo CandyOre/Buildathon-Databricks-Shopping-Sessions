@@ -21,13 +21,15 @@ pub(super) fn window_enabled<const N: usize>() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        (N == 4 || N == 7) && *ON.get_or_init(|| {
-            let arch = std::env::var("PERF_ARCH").unwrap_or_default();
-            let requested = std::env::var("PERF_SCANNER")
-                .map_or(matches!(arch.as_str(), "A" | "B"), |mode| mode == "window");
-            requested && std::is_x86_feature_detected!("avx512bw")
-                && std::is_x86_feature_detected!("avx512f")
-        })
+        (N == 4 || N == 7)
+            && *ON.get_or_init(|| {
+                let arch = std::env::var("PERF_ARCH").unwrap_or_default();
+                let requested = std::env::var("PERF_SCANNER")
+                    .map_or(matches!(arch.as_str(), "A" | "B"), |mode| mode == "window");
+                requested
+                    && std::is_x86_feature_detected!("avx512bw")
+                    && std::is_x86_feature_detected!("avx512f")
+            })
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
@@ -297,6 +299,16 @@ mod tests {
         scan::<N>(bytes, &mut |parts| actual.push(parts.map(<[u8]>::to_vec)));
         assert_eq!(actual, expected);
         #[cfg(target_arch = "x86_64")]
+        if super::super::token_scan::available() {
+            actual.clear();
+            unsafe {
+                super::super::token_scan::scan::<N>(bytes, &mut |parts| {
+                    actual.push(parts.map(<[u8]>::to_vec))
+                })
+            };
+            assert_eq!(actual, expected);
+        }
+        #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512f") {
             actual.clear();
             window::<N>(bytes, &mut |parts| actual.push(parts.map(<[u8]>::to_vec)));
@@ -337,6 +349,38 @@ mod tests {
         for shift in 0..64 {
             check::<4>(&data[shift..7919 + shift]);
             check::<7>(&data[shift..7919 + shift]);
+        }
+    }
+
+    #[test]
+    fn quoted_fields_and_wrapped_endpoints_cross_blocks_tiles_and_eof() {
+        let mut data = Vec::new();
+        for (i, width) in [
+            0, 1, 2, 61, 62, 63, 64, 65, 126, 127, 128, 129, 253, 254, 255, 256, 2046, 2047, 2048,
+            2049,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            data.extend_from_slice(b"abc,\"");
+            data.extend(std::iter::repeat_n(b'x', width));
+            data.extend_from_slice(b"\",\"\",,v,\"q\",\n");
+            data.extend_from_slice(b",,a,\"\",\"b\",,z\n");
+            for malformed in [b"\"".as_slice(), b"\"a", b"a\"", b"\"a\"b\"", b"\"\"\""] {
+                data.extend_from_slice(b"k,b,c,d,e,f,");
+                data.extend(std::iter::repeat_n(b'x', i * 5));
+                data.extend_from_slice(malformed);
+                data.extend_from_slice(b"\na,\"b\",c,d,e,f,g\n");
+            }
+            data.extend_from_slice(b",,\"\",\"c\"\n");
+        }
+        data.extend_from_slice(b"e,u,\"t\",i,v,p,\"\"");
+        for prefix in 0..128 {
+            let mut shifted = vec![b'q'; prefix];
+            shifted.push(b'\n');
+            shifted.extend_from_slice(&data);
+            check::<7>(&shifted);
+            check::<4>(&shifted);
         }
     }
 

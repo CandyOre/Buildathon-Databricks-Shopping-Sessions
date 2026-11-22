@@ -169,21 +169,7 @@ fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec
     if length > MAX_BINS {
         return false;
     }
-    bins.clear();
-    bins.resize(
-        length,
-        TimeBin {
-            first: u32::MAX,
-            last: 0,
-            count: 0,
-        },
-    );
-    for &time in times.iter() {
-        let bin = &mut bins[(time / SESSION_GAP) as usize];
-        bin.first = bin.first.min(time);
-        bin.last = bin.last.max(time);
-        bin.count += 1;
-    }
+    fill_time_bins(times.iter().copied(), length, bins);
     // A bin spans strictly less than one session gap. Its extrema suffice
     // to decide whether it joins the preceding nonempty bin.
     positions.clear();
@@ -202,6 +188,24 @@ fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec
     }
     positions.push(count);
     true
+}
+
+fn fill_time_bins(times: impl Iterator<Item = u32>, length: usize, bins: &mut Vec<TimeBin>) {
+    bins.clear();
+    bins.resize(
+        length,
+        TimeBin {
+            first: u32::MAX,
+            last: 0,
+            count: 0,
+        },
+    );
+    for time in times {
+        let bin = &mut bins[(time / SESSION_GAP) as usize];
+        bin.first = bin.first.min(time);
+        bin.last = bin.last.max(time);
+        bin.count += 1;
+    }
 }
 
 // Reuse bucket storage across people, initializing only occupied buckets.
@@ -1129,6 +1133,7 @@ struct FusedTiming {
     nanoseconds: std::sync::atomic::AtomicU64,
     people: std::sync::atomic::AtomicU64,
     events: std::sync::atomic::AtomicU64,
+    binned_events: std::sync::atomic::AtomicU64,
 }
 
 /// Scratch is owned by the worker processing a final person. Only the output
@@ -1140,12 +1145,123 @@ pub(crate) struct PersonKernel<'a> {
     assist: &'a mut AssistScratch,
     mode: AssistMode,
     daily: DailyColumns,
+    input: PersonRows,
+    bins: BinnedPerson,
+    use_bins: bool,
+    sessions: Vec<Session>,
+    category: DayPurchases,
+    work: Option<[u64; 5]>,
+}
+
+#[derive(Default)]
+struct BinnedPerson {
+    bins: Vec<TimeBin>,
+    // Each session's event count and head of its list of purchases.
+    groups: Vec<(u32, u32)>,
+    previous_purchase: Vec<u32>,
+}
+
+impl BinnedPerson {
+    fn write(
+        &mut self,
+        person: u32,
+        rows: &PersonRows,
+        sessions: &mut Vec<Session>,
+        category: &mut DayPurchases,
+        daily: &mut DailyColumns,
+    ) {
+        let offset = |time: i64| (time - rows.first) as u32;
+        let length = (offset(rows.last) / SESSION_GAP) as usize + 1;
+        fill_time_bins(
+            rows.times.iter().map(|&t| offset(t)),
+            length,
+            &mut self.bins,
+        );
+        self.groups.clear();
+        let mut previous = 0;
+        for bin in self.bins.iter_mut().filter(|b| b.count != 0) {
+            if sessions.is_empty() || bin.first - previous > SESSION_GAP {
+                sessions.push(Session {
+                    person,
+                    time: rows.first + i64::from(bin.first),
+                    revenue: 0,
+                });
+                self.groups.push((0, 0));
+            }
+            self.groups.last_mut().unwrap().0 += bin.count;
+            // All events in this half hour belong to the same session.
+            bin.count = (self.groups.len() - 1) as u32;
+            previous = bin.last;
+        }
+        self.previous_purchase.clear();
+        for &(time, _) in &rows.sales {
+            let session = self.bins[(offset(time) / SESSION_GAP) as usize].count as usize;
+            let head = &mut self.groups[session].1;
+            self.previous_purchase.push(*head);
+            *head = self.previous_purchase.len() as u32;
+        }
+        let mut row = UserDay {
+            person,
+            day: day(rows.first),
+            ..UserDay::default()
+        };
+        for (session, &(count, mut sale)) in sessions.iter_mut().zip(&self.groups) {
+            let date = day(session.time);
+            if date != row.day {
+                row.top_category = category.top();
+                daily.push(row);
+                row = UserDay {
+                    person,
+                    day: date,
+                    ..UserDay::default()
+                };
+            }
+            while sale != 0 {
+                let i = (sale - 1) as usize;
+                category.add(rows.sales[i].1, &mut session.revenue);
+                sale = self.previous_purchase[i];
+            }
+            row.events += i64::from(count);
+            row.sessions += 1;
+            row.revenue += session.revenue;
+        }
+        row.top_category = category.top();
+        daily.push(row);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PersonRows {
     times: Vec<i64>,
     sales: Vec<(i64, crate::records::Purchase)>,
     clicks: Vec<Click>,
-    sessions: Vec<Session>,
-    category: DayPurchases,
-    work: Option<[u64; 4]>,
+    first: i64,
+    last: i64,
+}
+
+impl PersonRows {
+    fn clear(&mut self) {
+        self.times.clear();
+        self.sales.clear();
+        self.clicks.clear();
+        self.first = i64::MAX;
+        self.last = i64::MIN;
+    }
+
+    #[inline]
+    pub fn event(&mut self, time: i64, purchase: Option<crate::records::Purchase>) {
+        self.times.push(time);
+        self.first = self.first.min(time);
+        self.last = self.last.max(time);
+        if let Some(p) = purchase {
+            self.sales.push((time, p));
+        }
+    }
+
+    #[inline]
+    pub fn click(&mut self, click: Click) {
+        self.clicks.push(click);
+    }
 }
 
 impl PersonKernel<'_> {
@@ -1155,72 +1271,128 @@ impl PersonKernel<'_> {
         events: impl Iterator<Item = (i64, Option<crate::records::Purchase>)>,
         clicks: impl Iterator<Item = Click>,
     ) {
-        self.times.clear();
-        self.sales.clear();
-        let mut first = i64::MAX;
-        let mut last = i64::MIN;
-        for (time, purchase) in events {
-            self.times.push(time);
-            first = first.min(time);
-            last = last.max(time);
-            if let Some(p) = purchase {
-                self.sales.push((time, p));
+        self.compute_fragments(person, |rows| {
+            for (time, purchase) in events {
+                rows.event(time, purchase);
             }
-        }
-        if self.times.is_empty() {
+            if !rows.times.is_empty() {
+                rows.clicks.extend(clicks);
+            }
+        });
+    }
+
+    pub fn compute_fragments(&mut self, person: u32, fill: impl FnOnce(&mut PersonRows)) {
+        let rows = &mut self.input;
+        rows.clear();
+        fill(rows);
+        if rows.times.is_empty() {
             return;
         }
+        let first = rows.first;
+        let span = rows.last.saturating_sub(first);
         self.sessions.clear();
-        if last.saturating_sub(first) <= i64::from(SESSION_GAP) {
+        if span <= i64::from(SESSION_GAP) {
             // Every timestamp is in a single session, independent of row order.
             let mut revenue = 0;
-            for &(_, sale) in &self.sales {
+            for &(_, sale) in &rows.sales {
                 self.category.add(sale, &mut revenue);
             }
             self.daily.push(UserDay {
-                person, day: day(first), sessions: 1, events: self.times.len() as i64,
-                revenue, top_category: self.category.top(),
+                person,
+                day: day(first),
+                sessions: 1,
+                events: rows.times.len() as i64,
+                revenue,
+                top_category: self.category.top(),
             });
-            self.sessions.push(Session { person, time: first, revenue });
+            self.sessions.push(Session {
+                person,
+                time: first,
+                revenue,
+            });
+        } else if self.use_bins
+            && (2048..=u32::MAX as usize).contains(&rows.times.len())
+            && span < 1024 * i64::from(SESSION_GAP)
+        {
+            self.bins.write(
+                person,
+                rows,
+                &mut self.sessions,
+                &mut self.category,
+                &mut self.daily,
+            );
+            if let Some(work) = &mut self.work {
+                work[4] += rows.times.len() as u64;
+            }
         } else {
-            self.times.sort_unstable();
-            self.sales.sort_unstable_by_key(|s| s.0);
-            let mut row = UserDay { person, day: day(first), ..UserDay::default() };
+            rows.times.sort_unstable();
+            rows.sales.sort_unstable_by_key(|s| s.0);
+            let mut row = UserDay {
+                person,
+                day: day(first),
+                ..UserDay::default()
+            };
             let mut sold = 0;
-            for group in self.times.chunk_by(|a, b| b.saturating_sub(*a) <= i64::from(SESSION_GAP)) {
+            for group in rows
+                .times
+                .chunk_by(|a, b| b.saturating_sub(*a) <= i64::from(SESSION_GAP))
+            {
                 let time = group[0];
                 let session_day = day(time);
                 if session_day != row.day {
                     row.top_category = self.category.top();
                     self.daily.push(row);
-                    row = UserDay { person, day: session_day, ..UserDay::default() };
+                    row = UserDay {
+                        person,
+                        day: session_day,
+                        ..UserDay::default()
+                    };
                 }
                 let end = group[group.len() - 1];
                 let mut revenue = 0;
-                while sold < self.sales.len() && self.sales[sold].0 <= end {
-                    self.category.add(self.sales[sold].1, &mut revenue);
+                while sold < rows.sales.len() && rows.sales[sold].0 <= end {
+                    self.category.add(rows.sales[sold].1, &mut revenue);
                     sold += 1;
                 }
                 row.sessions += 1;
                 row.events += group.len() as i64;
                 row.revenue += revenue;
-                self.sessions.push(Session { person, time, revenue });
+                self.sessions.push(Session {
+                    person,
+                    time,
+                    revenue,
+                });
             }
             row.top_category = self.category.top();
             self.daily.push(row);
         }
         self.daily.finish_person(person, self.names);
-        self.clicks.clear();
-        self.clicks.extend(clicks);
-        if self.clicks.len() > 1 && !skip_click_sort(self.clicks.len()) {
-            self.clicks.sort_unstable_by_key(|c| c.time);
+        if self.sessions.len() == 1 && rows.clicks.len() <= 16 {
+            single_session_clicks(
+                &self.sessions[0],
+                &rows.clicks,
+                self.ids,
+                self.totals,
+                self.assist,
+            );
+        } else {
+            if rows.clicks.len() > 1 && !skip_click_sort(rows.clicks.len()) {
+                rows.clicks.sort_unstable_by_key(|c| c.time);
+            }
+            attribute_person(
+                &self.sessions,
+                &mut rows.clicks,
+                self.ids,
+                self.totals,
+                self.assist,
+                self.mode,
+            );
         }
-        attribute_person(&self.sessions, &mut self.clicks, self.ids, self.totals, self.assist, self.mode);
         if let Some(work) = self.work.as_mut() {
             work[0] += 1;
-            work[1] += self.times.len() as u64;
+            work[1] += rows.times.len() as u64;
             work[2] += self.sessions.len() as u64;
-            work[3] += self.clicks.len() as u64;
+            work[3] += rows.clicks.len() as u64;
         }
     }
 }
@@ -1235,14 +1407,31 @@ impl FusedCampaigns {
         let start = self.timing.as_ref().map(|_| std::time::Instant::now());
         let index = crate::runtime::worker_slot().unwrap_or(0) % self.workers.len();
         let mut worker = self.workers[index].lock().unwrap();
-        let (totals, assist) = worker.get_or_insert_with(|| (
-            Counters::new(self.campaigns, self.window),
-            AssistScratch { work: self.work.then(AttributionWork::default), ..Default::default() },
-        ));
+        let (totals, assist) = worker.get_or_insert_with(|| {
+            (
+                Counters::new(self.campaigns, self.window),
+                AssistScratch {
+                    work: self.work.then(AttributionWork::default),
+                    ..Default::default()
+                },
+            )
+        });
+        static USE_BINS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_bins = *USE_BINS
+            .get_or_init(|| !matches!(std::env::var("PERF_ARCH_PERSON_BINS").as_deref(), Ok("0")));
         let mut k = PersonKernel {
-            names, ids, totals, assist, mode: assist_mode(), daily: DailyColumns::for_people(names),
-            times: Vec::new(), sales: Vec::new(), clicks: Vec::new(), sessions: Vec::new(),
-            category: DayPurchases::default(), work: start.map(|_| [0; 4]),
+            names,
+            ids,
+            totals,
+            assist,
+            mode: assist_mode(),
+            daily: DailyColumns::for_people(names),
+            input: PersonRows::default(),
+            bins: BinnedPerson::default(),
+            use_bins,
+            sessions: Vec::new(),
+            category: DayPurchases::default(),
+            work: start.map(|_| [0; 5]),
         };
         consume(&mut k);
         if let (Some(t), Some(start), Some(work)) = (&self.timing, start, k.work) {
@@ -1250,11 +1439,17 @@ impl FusedCampaigns {
             t.batches.fetch_add(1, Relaxed);
             t.people.fetch_add(work[0], Relaxed);
             t.events.fetch_add(work[1], Relaxed);
+            t.binned_events.fetch_add(work[4], Relaxed);
             t.sessions.fetch_add(work[2], Relaxed);
             t.clicks.fetch_add(work[3], Relaxed);
-            t.nanoseconds.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+            t.nanoseconds
+                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
         }
-        SessionBatch { daily: k.daily, sessions: Vec::new(), work: None }
+        SessionBatch {
+            daily: k.daily,
+            sessions: Vec::new(),
+            work: None,
+        }
     }
     pub fn new(campaigns: usize, window: crate::input::Window) -> Self {
         Self {
@@ -1309,6 +1504,7 @@ impl FusedCampaigns {
                 serde_json::json!({"stage":"fused_attribution","batches":t.batches.into_inner(),
                 "sessions_consumed":t.sessions.into_inner(),"clicks_consumed":t.clicks.into_inner(),
                 "complete_people_computed":t.people.into_inner(),"person_kernel_events":t.events.into_inner(),
+                "person_kernel_binned_events":t.binned_events.into_inner(),
                 "partition_task_sum_s":t.nanoseconds.into_inner() as f64*1e-9})
             );
         }
@@ -1395,33 +1591,92 @@ fn fused_campaigns_release_local_buffers_and_merge_both_passes() {
 #[test]
 fn person_kernel_matches_sorted_pipeline_on_boundaries_and_full_click_id_ties() {
     use crate::records::{ClickKeyChunk, Purchase};
-    let window = crate::input::Window { start: -DAY, end: 10 * DAY };
+    let window = crate::input::Window {
+        start: -DAY,
+        end: 10 * DAY,
+    };
     let registry = crate::input::Names::default();
     let mut keys = ClickKeyChunk::new(0);
     let short = keys.encode(b"k1", &registry);
     let wide = keys.encode(b"k00000000000000000000000000000001", &registry);
     let odd = keys.encode(b"key/mixed", &registry);
     let ids = ClickIds::new(registry, vec![keys]);
-    let p = |category| Some(Purchase { category, cents: 17 });
+    let p = |category| {
+        Some(Purchase {
+            category,
+            cents: 17,
+        })
+    };
     let events = [
-        vec![(DAY + 1, p(2)), (DAY - 1, p(1)), (DAY + 1_800_001, None),
-             (DAY * 2, p(1)), (DAY * 2, p(2)), (DAY * 2 + 1_800_001, None)],
+        vec![
+            (DAY + 1, p(2)),
+            (DAY - 1, p(1)),
+            (DAY + 1_800_001, None),
+            (DAY * 2, p(1)),
+            (DAY * 2, p(2)),
+            (DAY * 2 + 1_800_001, None),
+        ],
         vec![(-8, p(2)), (-9, p(1)), (-9, None)],
         Vec::new(),
         vec![(DAY * 8, None)],
+        vec![(0, p(1))],
+        // Populated bins touch at the exact half-hour cutoff or are one
+        // millisecond farther apart; some purchases cross midnight.
+        (0..3000)
+            .map(|i| {
+                let time = [
+                    DAY - 5,
+                    DAY + 1_799_995,
+                    DAY + 3_599_996,
+                    3 * DAY,
+                    3 * DAY + 150,
+                ][i % 5];
+                (
+                    time,
+                    (i % 31 == 0).then_some(Purchase {
+                        category: (i % 3) as u32,
+                        cents: 42,
+                    }),
+                )
+            })
+            .rev()
+            .collect(),
     ];
-    let click = |person, time, campaign, id| Click { person, time, campaign, id };
+    let click = |person, time, campaign, id| Click {
+        person,
+        time,
+        campaign,
+        id,
+    };
     let clicks = [
-        vec![click(0, DAY - 1, 2, short), click(0, DAY - 1 - LOOKBACK, 3, odd),
-             click(0, DAY - 1, 1, wide), click(0, DAY * 2, 2, odd)],
+        vec![
+            click(0, DAY - 1, 2, short),
+            click(0, DAY - 1 - LOOKBACK, 3, odd),
+            click(0, DAY - 1, 1, wide),
+            click(0, DAY * 2, 2, odd),
+        ],
         Vec::new(),
         vec![click(2, 0, 3, short)],
         vec![click(3, DAY - 1, 2, short), click(3, DAY, 3, wide)],
+        // The first campaign supplies both the largest and smallest ID at
+        // the winning time. A premature same-campaign shortcut loses credit.
+        vec![
+            click(4, 0, 1, odd),
+            click(4, 0, 1, wide),
+            click(4, 0, 2, short),
+            click(4, -LOOKBACK, 3, wide),
+            click(4, 1, 3, odd),
+        ],
+        vec![click(5, DAY - 5, 3, odd), click(5, 3 * DAY + 1, 2, wide)],
     ];
     let fused = FusedCampaigns::new(4, window);
     let actual = fused.with_people(None, &ids, |kernel| {
         for i in 0..events.len() {
-            kernel.compute(i as u32, events[i].iter().copied(), clicks[i].iter().copied());
+            kernel.compute(
+                i as u32,
+                events[i].iter().copied(),
+                clicks[i].iter().copied(),
+            );
         }
     });
     assert!(actual.sessions.is_empty());
@@ -1432,7 +1687,11 @@ fn person_kernel_matches_sorted_pipeline_on_boundaries_and_full_click_id_ties() 
                 rows.purchases.push(p);
                 rows.purchases.len() as u32
             });
-            rows.rows.push(Event { person: i as u32, time, purchase });
+            rows.rows.push(Event {
+                person: i as u32,
+                time,
+                purchase,
+            });
         }
     }
     rows.rows.sort_unstable_by_key(|e| (e.person, e.time));
@@ -1446,11 +1705,29 @@ fn person_kernel_matches_sorted_pipeline_on_boundaries_and_full_click_id_ties() 
     let mut ordered: Vec<_> = clicks.into_iter().flatten().collect();
     ordered.sort_unstable_by_key(|c| (c.person, c.time));
     fn days(c: CampaignDays) -> std::collections::BTreeMap<(u32, i32), [i64; 4]> {
-        c.into_iter().map(|(key, d)| (key, [d.sessions, d.purchasing_sessions, d.revenue, d.assisted_sessions])).collect()
+        c.into_iter()
+            .map(|(key, d)| {
+                (
+                    key,
+                    [
+                        d.sessions,
+                        d.purchasing_sessions,
+                        d.revenue,
+                        d.assisted_sessions,
+                    ],
+                )
+            })
+            .collect()
     }
     assert_eq!(
         days(fused.finish(&[actual])),
-        days(campaign_daily(std::slice::from_mut(&mut expected), vec![ordered], ids, 4, window))
+        days(campaign_daily(
+            std::slice::from_mut(&mut expected),
+            vec![ordered],
+            ids,
+            4,
+            window
+        ))
     );
 }
 
@@ -1472,7 +1749,75 @@ fn summarize_campaigns(
         while cursor < clicks.len() && clicks[cursor].person == person {
             cursor += 1;
         }
-        attribute_person(sessions, &mut clicks[first..cursor], ids, totals, scratch, mode);
+        attribute_person(
+            sessions,
+            &mut clicks[first..cursor],
+            ids,
+            totals,
+            scratch,
+            mode,
+        );
+    }
+}
+
+// A complete short click list fits on the stack. Full ID order matters only
+// when two different campaigns can win at the latest eligible millisecond.
+fn single_session_clicks(
+    session: &Session,
+    clicks: &[Click],
+    ids: &ClickIds,
+    totals: &mut Counters,
+    scratch: &mut AssistScratch,
+) {
+    debug_assert!(clicks.len() <= 16);
+    scratch.record(
+        usize::from(clicks.len() > 1),
+        std::slice::from_ref(session),
+        clicks,
+    );
+    let date = day(session.time);
+    let earliest = session.time.saturating_sub(LOOKBACK);
+    let mut latest: Option<&Click> = None;
+    let mut tied_campaigns = false;
+    let mut campaigns = [0u32; 16];
+    let mut used = 0;
+    for click in clicks {
+        if click.time < earliest || click.time > session.time {
+            continue;
+        }
+        if !campaigns[..used].contains(&click.campaign) {
+            campaigns[used] = click.campaign;
+            used += 1;
+        }
+        match latest {
+            Some(best) if click.time < best.time => {}
+            Some(best) if click.time == best.time => {
+                tied_campaigns |= best.campaign != click.campaign;
+            }
+            _ => {
+                latest = Some(click);
+                tied_campaigns = false;
+            }
+        }
+    }
+    let winner = latest.map_or(0, |mut best| {
+        if tied_campaigns {
+            for click in clicks {
+                if click.time == best.time
+                    && click.id != best.id
+                    && scratch.wins_tie(ids, click, best)
+                {
+                    best = click;
+                }
+            }
+        }
+        best.campaign
+    });
+    totals.add(winner, date, CampaignDay::credit(session, winner != 0));
+    for &campaign in &campaigns[..used] {
+        if campaign != winner {
+            totals.add(campaign, date, CampaignDay::assists(1));
+        }
     }
 }
 
