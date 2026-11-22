@@ -520,12 +520,15 @@ pub fn read_events(
     let work = work_enabled();
     let chunks = chunks(&data.join("events"))?;
     let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
-    let parsed: Vec<_> = chunks
+    let overhead = size_of::<(ChunkIds, ChunkPeople)>()
+        + 9 * SHARDS * (size_of::<EntryId>() + size_of::<PersonEvent>());
+    let parsed: Vec<_> = crate::csv::work_groups(&chunks, 1, overhead)
         .into_par_iter()
-        .map_init(PersonCache::default, |people, chunk| {
+        .map_init(PersonCache::default, |people, group| {
             // Approximate only the backing capacity. Arbitrary CSV lengths and
             // shard skew are handled by the exact per-shard continuation.
-            let stride = chunk.byte_len().div_ceil(70 * SHARDS) + 8;
+            let bytes = group.iter().map(|c| c.byte_len()).sum::<usize>();
+            let stride = bytes.div_ceil(70 * SHARDS) + 8;
             let mut id_rows = ChunkIds::new(stride);
             let mut people_rows = ChunkPeople {
                 rows: ShardSlab::new(stride),
@@ -574,11 +577,11 @@ pub fn read_events(
                 // Invalid candidates still compete for the earliest ingest.
                 id_rows.push_event(id, ingested, position, origin_seconds);
             };
-            if crate::csv::batch_size() != 0 {
+            group.iter().try_for_each(|chunk| if crate::csv::batch_size() != 0 {
                 chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, payload| {
                     let proposal = people.prepare(users, aliases, user);
                     store(people, proposal, EventId::parse(id, &ids), user, ingest, payload);
-                })?;
+                })
             } else {
                 chunk.scan_parsed(|f: [&[u8]; 7]| {
                     if f[0].is_empty() { return; }
@@ -587,8 +590,8 @@ pub fn read_events(
                     let id = EventId::parse(f[0], &ids);
                     let payload = crate::csv::event_payload(&f, time, ingest, window, dimensions);
                     store(people, proposal, id, f[1], ingest, payload);
-                })?;
-            }
+                })
+            })?;
             #[cfg(feature = "large-input")]
             for job in waiting {
                 commit(job, people, &mut people_rows, &mut id_rows)
@@ -596,6 +599,7 @@ pub fn read_events(
             Ok::<_, anyhow::Error>((id_rows, people_rows))
         })
         .collect::<Result<_>>()?;
+    drop(chunks);
 
     if work {
         let mut bins = [0usize; SHARDS];
@@ -1055,10 +1059,10 @@ fn read_click_records<P: ClickPiece>(
     let epoch = window.start.saturating_sub(LOOKBACK);
     let chunks = chunks(&data.join("clicks"))?;
     let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
-    let pieces = chunks
+    let pieces = crate::csv::work_groups(&chunks, 1, SHARDS * size_of::<P>())
         .into_par_iter()
         .enumerate()
-        .map_init(PersonCache::default, |people, (index, chunk)| {
+        .map_init(PersonCache::default, |people, (index, group)| {
             let mut local = shards::<P>();
             let mut keys = ClickKeyChunk::new(index);
             let mut counts = [0usize; 6];
@@ -1080,11 +1084,11 @@ fn read_click_records<P: ClickPiece>(
                     campaign,
                 }, proposal.work_class() < 2, epoch);
             };
-            if crate::csv::batch_size() != 0 {
+            group.iter().try_for_each(|chunk| if crate::csv::batch_size() != 0 {
                 chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
                     let proposal = people.prepare(users, aliases, user);
                     store(people, id, user, proposal, time, campaign);
-                })?;
+                })
             } else {
                 chunk.scan_parsed(|[id, user, campaign, ts]| {
                     if id.is_empty() || user.is_empty() {
@@ -1101,11 +1105,12 @@ fn read_click_records<P: ClickPiece>(
                         return;
                     }
                     store(people, id, user, proposal, time, campaign);
-                })?;
-            }
+                })
+            })?;
             Ok::<_, anyhow::Error>((local, keys, counts))
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(chunks);
     let mut partitions = shards::<Vec<P>>();
     let mut keys = Vec::with_capacity(pieces.len());
     let mut totals = [0usize;6];
