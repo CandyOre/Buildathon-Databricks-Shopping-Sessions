@@ -69,7 +69,7 @@ fn mix_event_word(word: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-const HEX_CLICK: u64 = EXTERNAL_ID | (1 << 62);
+pub(crate) const HEX_CLICK: u64 = EXTERNAL_ID | (1 << 62);
 
 pub(crate) struct ClickKeyChunk {
     index: usize,
@@ -620,11 +620,13 @@ pub fn read_events(
         }
         bins.sort_unstable();
         let n = bins.iter().sum::<usize>();
+        let (id_locks, id_wait_ns) = ids.lock_stats();
         eprintln!("profile {}", serde_json::json!({
             "stage":"event_work", "logical_input_bytes":input_bytes, "chunks":parsed.len(),
             "candidates":n, "valid_before_dedup":valid, "purchases_before_dedup":purchases,
             "candidate_bytes":n * size_of::<EntryId>(), "person_bytes":valid * size_of::<PersonEvent>(),
             "hex_keys":long, "hex_side_bytes":long * size_of::<HexEntry>(),
+            "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
             "exceptional_location_bytes":exceptional * size_of::<(i64,u32)>(),
             "person_side_bytes":extra * size_of::<(Event,Option<Purchase>)>(),
             "id_overflow_rows":id_overflow, "person_overflow_rows":person_overflow,
@@ -968,27 +970,50 @@ fn prefixes(offsets: &mut [u32]) {
     }
 }
 
-fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, time: F) {
+fn sort_click_keys<T: Send, K: Ord, F: Fn(&T) -> K + Sync>(
+    rows: &mut [T], key: F, parallel: bool, comparisons: Option<&std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if let Some(comparisons) = comparisons {
+        if parallel {
+            rows.par_sort_unstable_by(|a, b| {
+                comparisons.fetch_add(1, Relaxed);
+                key(a).cmp(&key(b))
+            });
+        } else {
+            let mut local = 0;
+            rows.sort_unstable_by(|a, b| {
+                local += 1;
+                key(a).cmp(&key(b))
+            });
+            comparisons.fetch_add(local, Relaxed);
+        }
+    } else if parallel {
+        rows.par_sort_unstable_by_key(key);
+    } else {
+        rows.sort_unstable_by_key(key);
+    }
+}
+
+fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, time: F, comparisons: Option<&std::sync::atomic::AtomicU64>) {
     let mut start = 0;
     for end in ends {
         let end = end as usize;
-        if end - start > 32768 {
-            rows[start..end].par_sort_unstable_by_key(&time);
-        } else if end - start > 1 && !crate::aggregate::skip_click_sort(end - start) {
-            rows[start..end].sort_unstable_by_key(&time);
+        if end - start > 1 && !crate::aggregate::skip_click_sort(end - start) {
+            sort_click_keys(&mut rows[start..end], &time, end-start>32768, comparisons);
         }
         start = end;
     }
 }
 
-fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch: i64) -> Vec<Click> {
+fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch: i64, comparisons: Option<&std::sync::atomic::AtomicU64>) -> Vec<Click> {
     let length = pieces.iter().map(ClickPiece::len).sum();
     let mut clicks = Vec::with_capacity(length);
     if !use_counting_sort(length, width) {
         for piece in pieces {
             clicks.extend(piece.rows(shard, epoch));
         }
-        clicks.par_sort_unstable_by_key(|c| (c.person, c.time));
+        sort_click_keys(&mut clicks, |c| (c.person, c.time), true, comparisons);
         return clicks;
     }
     let mut ends = vec![0u32; width];
@@ -1004,7 +1029,7 @@ fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch
     unsafe {
         clicks.set_len(length);
     }
-    sort_times(&mut clicks, ends, |c| c.time);
+    sort_times(&mut clicks, ends, |c| c.time, comparisons);
     clicks
 }
 
@@ -1100,6 +1125,7 @@ fn read_click_records<P: ClickPiece>(
     if work {
         let valid = totals[..4].iter().sum::<usize>();
         let wide = keys.iter().map(|k| k.hex.len()).sum::<usize>();
+        let (id_locks, id_wait_ns) = ids.lock_stats();
         eprintln!("profile {}",serde_json::json!({
             "stage":"click_work", "logical_input_bytes":input_bytes, "chunks":keys.len(),
             "valid_clicks":valid, "record_width":size_of::<Click>(),
@@ -1108,15 +1134,17 @@ fn read_click_records<P: ClickPiece>(
             "regrouped_record_bytes":valid*size_of::<Click>(),
             "hex_side_keys":wide, "hex_side_bytes":wide*size_of::<[u64;2]>(),
             "dictionary_calls":totals[4], "strict_hex_dictionary_calls":totals[5],
+            "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
             "identity_ready":totals[0], "identity_directory":totals[1],
             "identity_spill":totals[2], "identity_external":totals[3]
         }));
     }
     let width = users.person_slots_per_shard();
+    let comparisons = std::sync::atomic::AtomicU64::new(0);
     let clicks: Vec<Vec<Click>> = partitions
         .into_par_iter()
         .enumerate()
-        .map(|(shard, p)| order_clicks(p, width, shard, epoch))
+        .map(|(shard, p)| order_clicks(p, width, shard, epoch, work.then_some(&comparisons)))
         .collect();
     if work {
         let mut scatter_rows = 0usize;
@@ -1135,6 +1163,7 @@ fn read_click_records<P: ClickPiece>(
         }
         eprintln!("profile {}",serde_json::json!({
             "stage":"click_sort_work", "counting_scatter_rows":scatter_rows,
+            "key_comparisons":comparisons.load(std::sync::atomic::Ordering::Relaxed),
             "person_time_sorts_skipped":skipped_groups, "click_rows_skipping_time_sort":skipped_rows
         }));
     }
@@ -1287,7 +1316,7 @@ mod grouping_tests {
                 });
                 expected.push((person, time, id, campaign));
             }
-            let sorted = order_clicks(pieces, width, 7, -23);
+            let sorted = order_clicks(pieces, width, 7, -23, None);
             assert!(
                 sorted
                     .windows(2)

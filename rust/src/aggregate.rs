@@ -649,6 +649,7 @@ struct AttributionWork {
     sessions: [u64; 5],
     clicks: [u64; 5],
     tie_comparisons: u64,
+    cross_campaign_ties: u64,
     assist_campaigns_in_masks: u64,
 }
 
@@ -660,6 +661,7 @@ impl AttributionWork {
             self.clicks[i] += other.clicks[i];
         }
         self.tie_comparisons += other.tie_comparisons;
+        self.cross_campaign_ties += other.cross_campaign_ties;
         self.assist_campaigns_in_masks += other.assist_campaigns_in_masks;
     }
 }
@@ -673,9 +675,12 @@ impl AssistScratch {
         }
     }
 
-    fn wins_tie(&mut self, ids: &ClickIds, candidate: u64, incumbent: u64) -> bool {
-        if let Some(stats) = &mut self.work { stats.tie_comparisons += 1; }
-        ids.compare(candidate, incumbent).is_lt()
+    fn wins_tie(&mut self, ids: &ClickIds, candidate: &Click, incumbent: &Click) -> bool {
+        if let Some(stats) = &mut self.work {
+            stats.tie_comparisons += 1;
+            stats.cross_campaign_ties += u64::from(candidate.campaign != incumbent.campaign);
+        }
+        ids.compare(candidate.id, incumbent.id).is_lt()
     }
 }
 
@@ -956,6 +961,7 @@ pub fn campaign_daily(
             "stage":"attribution_work", "branches":["zero_or_one_click","single_session","interval","sorted_mask","unsorted_mask"],
             "people_by_branch":stats.groups, "sessions_by_branch":stats.sessions,
             "clicks_considered_by_branch":stats.clicks, "tie_comparisons":stats.tie_comparisons,
+            "cross_campaign_tie_comparisons":stats.cross_campaign_ties,
             "mask_user_campaign_pairs":stats.assist_campaigns_in_masks
         }));
     }
@@ -1018,7 +1024,7 @@ fn summarize_campaigns(
                     used += 1;
                     totals.add(click.campaign, current_day, CampaignDay::assists(1));
                 }
-                if click.time == best.time && scratch.wins_tie(ids, click.id, best.id) {
+                if click.time == best.time && scratch.wins_tie(ids, click, best) {
                     best = click;
                 }
             }
@@ -1117,7 +1123,7 @@ fn small_attribution(
             while bits != 0 {
                 let slot = &mut best[bits.trailing_zeros() as usize];
                 if slot.is_none_or(|old| click.time > old.time ||
-                    (click.time == old.time && scratch.wins_tie(ids, click.id, old.id))) {
+                    (click.time == old.time && scratch.wins_tie(ids, click, old))) {
                     *slot = Some(click);
                 }
                 bits &= bits - 1;
@@ -1154,7 +1160,7 @@ fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut C
         {
             let click = clicks.next().unwrap();
             if latest
-                .is_none_or(|best| click.time > best.time || scratch.wins_tie(ids, click.id, best.id))
+                .is_none_or(|best| click.time > best.time || scratch.wins_tie(ids, click, best))
             {
                 latest = Some(click);
             }
