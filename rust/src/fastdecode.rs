@@ -4,7 +4,11 @@
 
 pub(super) fn available() -> bool {
     #[cfg(target_arch = "x86_64")]
-    { std::is_x86_feature_detected!("avx2") }
+    {
+        std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("ssse3")
+            && std::is_x86_feature_detected!("sse4.1")
+    }
     #[cfg(not(target_arch = "x86_64"))]
     { false }
 }
