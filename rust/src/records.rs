@@ -870,6 +870,89 @@ pub struct Click {
     pub campaign: u32,
 }
 
+// The shard supplies the low person bits. A canonical long click ID keeps
+// its original 128 bits in ClickKeyChunk and only its handle travels here.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ShortClick {
+    id: u64,
+    offset: u32,
+    person_campaign: u32,
+}
+const _: () = assert!(size_of::<ShortClick>() == 16);
+
+impl ShortClick {
+    const CAMPAIGN_BITS: u32 = 12;
+    const CAMPAIGN_MASK: u32 = (1 << Self::CAMPAIGN_BITS) - 1;
+
+    fn pack(c: Click, epoch: i64) -> Option<Self> {
+        let local = c.person / SHARDS as u32;
+        if c.campaign > Self::CAMPAIGN_MASK || local > u32::MAX >> Self::CAMPAIGN_BITS {
+            return None;
+        }
+        Some(Self {
+            id: c.id,
+            offset: u32::try_from(c.time.checked_sub(epoch)?).ok()?,
+            person_campaign: (local << Self::CAMPAIGN_BITS) | c.campaign,
+        })
+    }
+
+    fn local(&self) -> usize { (self.person_campaign >> Self::CAMPAIGN_BITS) as usize }
+
+    fn expand(self, shard: usize, epoch: i64) -> Click {
+        Click {
+            id: self.id, time: epoch + i64::from(self.offset),
+            person: (self.local() * SHARDS + shard) as u32,
+            campaign: self.person_campaign & Self::CAMPAIGN_MASK,
+        }
+    }
+}
+
+trait ClickPiece: Default + Send {
+    fn store(&mut self, click: Click, compact_user: bool, epoch: i64);
+    fn len(&self) -> usize;
+    fn compact_count(&self) -> usize;
+    fn count_people(&self, counts: &mut [u32]);
+    fn rows(self, shard: usize, epoch: i64) -> impl Iterator<Item = Click>;
+}
+
+impl ClickPiece for Vec<Click> {
+    fn store(&mut self, click: Click, _: bool, _: i64) { self.push(click); }
+    fn len(&self) -> usize { Vec::len(self) }
+    fn compact_count(&self) -> usize { 0 }
+    fn count_people(&self, counts: &mut [u32]) {
+        for c in self { counts[c.person as usize / SHARDS] += 1; }
+    }
+    fn rows(self, _: usize, _: i64) -> impl Iterator<Item = Click> { self.into_iter() }
+}
+
+#[derive(Default)]
+struct PackedClicks {
+    compact: Vec<ShortClick>,
+    other: Vec<Click>,
+}
+
+impl ClickPiece for PackedClicks {
+    fn store(&mut self, click: Click, compact_user: bool, epoch: i64) {
+        if compact_user {
+            if let Some(row) = ShortClick::pack(click, epoch) {
+                self.compact.push(row);
+                return;
+            }
+        }
+        self.other.push(click);
+    }
+    fn len(&self) -> usize { self.compact.len() + self.other.len() }
+    fn compact_count(&self) -> usize { self.compact.len() }
+    fn count_people(&self, counts: &mut [u32]) {
+        for c in &self.compact { counts[c.local()] += 1; }
+        self.other.count_people(counts);
+    }
+    fn rows(self, shard: usize, epoch: i64) -> impl Iterator<Item = Click> {
+        self.compact.into_iter().map(move |c| c.expand(shard, epoch)).chain(self.other)
+    }
+}
+
 // Dense person IDs give a disjoint output range per person. For small or sparse
 // partitions, comparison sorting avoids initializing a larger offsets table.
 fn use_counting_sort(length: usize, width: usize) -> bool {
@@ -898,23 +981,21 @@ fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, 
     }
 }
 
-fn order_clicks(pieces: Vec<Vec<Click>>, width: usize) -> Vec<Click> {
-    let length = pieces.iter().map(Vec::len).sum();
+fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch: i64) -> Vec<Click> {
+    let length = pieces.iter().map(ClickPiece::len).sum();
     let mut clicks = Vec::with_capacity(length);
     if !use_counting_sort(length, width) {
         for piece in pieces {
-            clicks.extend(piece);
+            clicks.extend(piece.rows(shard, epoch));
         }
         clicks.par_sort_unstable_by_key(|c| (c.person, c.time));
         return clicks;
     }
     let mut ends = vec![0u32; width];
-    for c in pieces.iter().flatten() {
-        ends[c.person as usize / SHARDS] += 1;
-    }
+    for piece in &pieces { piece.count_people(&mut ends); }
     prefixes(&mut ends);
     let storage = clicks.spare_capacity_mut();
-    for c in pieces.into_iter().flatten() {
+    for c in pieces.into_iter().flat_map(|p| p.rows(shard, epoch)) {
         let head = &mut ends[c.person as usize / SHARDS];
         storage[*head as usize].write(c);
         *head += 1;
@@ -934,16 +1015,26 @@ pub fn read_clicks(
     users: &Names,
     aliases: &Aliases,
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
+    if std::env::var_os("PERF_CLICK_RECORDS").is_some_and(|v| v == "16") {
+        return read_click_records::<PackedClicks>(data, window, dimensions, users, aliases);
+    }
+    read_click_records::<Vec<Click>>(data, window, dimensions, users, aliases)
+}
+
+fn read_click_records<P: ClickPiece>(
+    data: &Path, window: Window, dimensions: &Dimensions, users: &Names, aliases: &Aliases,
+) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
     let calendar = input::Calendar::new(window);
     let work = work_enabled();
+    let epoch = window.start.saturating_sub(LOOKBACK);
     let chunks = chunks(&data.join("clicks"))?;
     let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
     let pieces = chunks
         .into_par_iter()
         .enumerate()
         .map_init(PersonCache::default, |people, (index, chunk)| {
-            let mut local = shards::<Vec<Click>>();
+            let mut local = shards::<P>();
             let mut keys = ClickKeyChunk::new(index);
             let mut counts = [0usize; 6];
             let mut store = |people: &mut PersonCache, id: &[u8], user: &[u8],
@@ -957,12 +1048,12 @@ pub fn read_clicks(
                         counts[5] += usize::from(input::hex_id(id, b'k').is_some());
                     }
                 }
-                local[person as usize % SHARDS].push(Click {
+                local[person as usize % SHARDS].store(Click {
                     time,
                     id: key,
                     person,
                     campaign,
-                });
+                }, proposal.work_class() < 2, epoch);
             };
             if crate::csv::batch_size() != 0 {
                 chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
@@ -990,16 +1081,18 @@ pub fn read_clicks(
             Ok::<_, anyhow::Error>((local, keys, counts))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut partitions = shards::<Vec<Vec<Click>>>();
+    let mut partitions = shards::<Vec<P>>();
     let mut keys = Vec::with_capacity(pieces.len());
     let mut totals = [0usize;6];
+    let mut compact_rows = 0;
     for (chunk, chunk_keys, counts) in pieces {
         if work {
             for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
         }
         keys.push(chunk_keys);
         for (partition, rows) in partitions.iter_mut().zip(chunk) {
-            if !rows.is_empty() {
+            if rows.len() != 0 {
+                if work { compact_rows += rows.compact_count(); }
                 partition.push(rows);
             }
         }
@@ -1010,7 +1103,9 @@ pub fn read_clicks(
         eprintln!("profile {}",serde_json::json!({
             "stage":"click_work", "logical_input_bytes":input_bytes, "chunks":keys.len(),
             "valid_clicks":valid, "record_width":size_of::<Click>(),
-            "initial_record_bytes":valid*size_of::<Click>(), "regrouped_record_bytes":valid*size_of::<Click>(),
+            "compact_record_width":size_of::<ShortClick>(), "compact_rows":compact_rows, "full_rows":valid-compact_rows,
+            "initial_record_bytes":compact_rows*size_of::<ShortClick>()+(valid-compact_rows)*size_of::<Click>(),
+            "regrouped_record_bytes":valid*size_of::<Click>(),
             "hex_side_keys":wide, "hex_side_bytes":wide*size_of::<[u64;2]>(),
             "dictionary_calls":totals[4], "strict_hex_dictionary_calls":totals[5],
             "identity_ready":totals[0], "identity_directory":totals[1],
@@ -1020,7 +1115,8 @@ pub fn read_clicks(
     let width = users.person_slots_per_shard();
     let clicks: Vec<Vec<Click>> = partitions
         .into_par_iter()
-        .map(|p| order_clicks(p, width))
+        .enumerate()
+        .map(|(shard, p)| order_clicks(p, width, shard, epoch))
         .collect();
     if work {
         let mut scatter_rows = 0usize;
@@ -1130,6 +1226,7 @@ mod id_tests {
         ];
         let names = Names::default();
         let mut chunks = [ClickKeyChunk::new(0), ClickKeyChunk::new(1)];
+        for chunk in &mut chunks { chunk.wide = true; }
         let left: Vec<_> = cases.iter().map(|s| chunks[0].encode(s, &names)).collect();
         let right: Vec<_> = cases.iter().map(|s| chunks[1].encode(s, &names)).collect();
         assert_eq!(chunks[0].hex.len(), 4);
@@ -1145,6 +1242,32 @@ mod id_tests {
 #[cfg(test)]
 mod grouping_tests {
     use super::*;
+
+    #[test]
+    fn compact_clicks_keep_full_keys_and_widen_overflowing_fields() {
+        let epoch = -10_000;
+        let shard = 7;
+        let local = u32::MAX >> ShortClick::CAMPAIGN_BITS;
+        let direct = Click {
+            person: local * SHARDS as u32 + shard as u32, id: HEX_CLICK | 123_456,
+            time: epoch + i64::from(u32::MAX), campaign: ShortClick::CAMPAIGN_MASK,
+        };
+        let mut rows = PackedClicks::default();
+        rows.store(direct, true, epoch);
+        assert_eq!(rows.compact_count(), 1);
+        let expected = [
+            Click { time: epoch - 1, ..direct },
+            Click { time: direct.time + 1, ..direct },
+            Click { campaign: direct.campaign + 1, ..direct },
+            Click { person: direct.person + SHARDS as u32, ..direct },
+            direct,
+        ];
+        for (i, row) in expected.iter().enumerate() {
+            rows.store(*row, i + 1 != expected.len(), epoch);
+        }
+        assert_eq!(rows.compact_count(), 1);
+        assert!(rows.rows(shard, epoch).eq(std::iter::once(direct).chain(expected)));
+    }
 
     #[test]
     fn large_and_sparse_partitions_keep_all_clicks_in_time_order() {
@@ -1164,7 +1287,7 @@ mod grouping_tests {
                 });
                 expected.push((person, time, id, campaign));
             }
-            let sorted = order_clicks(pieces, width);
+            let sorted = order_clicks(pieces, width, 7, -23);
             assert!(
                 sorted
                     .windows(2)
