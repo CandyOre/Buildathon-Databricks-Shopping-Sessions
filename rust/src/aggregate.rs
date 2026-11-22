@@ -101,9 +101,109 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
     SessionBatch { daily, sessions }
 }
 
-// Each range holds one person's millisecond offsets from the window start.
-// Sorting sparse purchases by the same clock places all sales at their session,
-// including sales sharing a timestamp with another event.
+const SESSION_GAP: u32 = 1_800_000;
+
+fn sorted_time_offsets(values: &mut [u32], scratch: &mut Vec<u32>) {
+    if values.len() < 2048 {
+        values.sort_unstable();
+        return;
+    }
+    if values.len() > 131_072 {
+        values.par_sort_unstable();
+        return;
+    }
+    // Partition on the highest byte that actually varies. Comparison-sort
+    // buckets of close timestamps independently in the reusable scratch space.
+    let first = values[0];
+    let changed = values.iter().fold(0, |bits, &t| bits | (t ^ first));
+    if changed == 0 { return; }
+    let shift = (31 - changed.leading_zeros()) & !7;
+    let mut ends = [0usize; 256];
+    let bucket = |t: u32| ((t >> shift) & 255) as usize;
+    for &time in values.iter() { ends[bucket(time)] += 1; }
+    let mut at = 0;
+    for count in &mut ends {
+        let len = *count;
+        *count = at;
+        at += len;
+    }
+    scratch.resize(values.len(), 0);
+    for &time in values.iter() {
+        let dst = &mut ends[bucket(time)];
+        scratch[*dst] = time;
+        *dst += 1;
+    }
+    let mut begin = 0;
+    for end in ends {
+        if end - begin > 1 { scratch[begin..end].sort_unstable(); }
+        begin = end;
+    }
+    values.copy_from_slice(scratch);
+}
+
+fn starts(times: &[u32], positions: &mut Vec<usize>) {
+    positions.clear();
+    positions.push(0);
+    let mut next = 1;
+    #[cfg(target_arch = "x86_64")]
+    if times.len() >= 9 && std::is_x86_feature_detected!("avx2") {
+        next = unsafe { vector_starts(times, positions) };
+    }
+    for index in next..times.len() {
+        if times[index] - times[index - 1] > SESSION_GAP { positions.push(index); }
+    }
+    positions.push(times.len());
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vector_starts(times: &[u32], positions: &mut Vec<usize>) -> usize {
+    use std::arch::x86_64::*;
+    let sign = _mm256_set1_epi32(i32::MIN);
+    let bound = _mm256_set1_epi32(i32::MIN ^ SESSION_GAP as i32);
+    let mut index = 1;
+    while index + 8 <= times.len() {
+        let current = unsafe { _mm256_loadu_si256(times.as_ptr().add(index).cast()) };
+        let previous = unsafe { _mm256_loadu_si256(times.as_ptr().add(index - 1).cast()) };
+        let delta = _mm256_xor_si256(_mm256_sub_epi32(current, previous), sign);
+        let above = _mm256_cmpgt_epi32(delta, bound);
+        let mut mask = _mm256_movemask_ps(_mm256_castsi256_ps(above)) as u32;
+        while mask != 0 {
+            positions.push(index + mask.trailing_zeros() as usize);
+            mask &= mask - 1;
+        }
+        index += 8;
+    }
+    index
+}
+
+#[derive(Default)]
+struct DayPurchases {
+    first: Option<(u32, i64)>,
+    others: AHashMap<u32, i64>,
+}
+
+impl DayPurchases {
+    fn add(&mut self, purchase: crate::records::Purchase, revenue: &mut i64) {
+        let amount = i64::from(purchase.cents);
+        *revenue += amount;
+        let first = self.first.get_or_insert((purchase.category, 0));
+        if first.0 == purchase.category {
+            first.1 += amount;
+        } else {
+            *self.others.entry(purchase.category).or_default() += amount;
+        }
+    }
+
+    fn top(&mut self) -> Option<u32> {
+        let first = self.first.take()?;
+        let best = self.others.drain().fold(first, |best, value| {
+            if value.1 > best.1 || (value.1 == best.1 && value.0 < best.0) { value } else { best }
+        });
+        Some(best.0)
+    }
+}
+
 pub fn compact_sessions(
     shard: usize,
     start: i64,
@@ -113,67 +213,60 @@ pub fn compact_sessions(
 ) -> SessionBatch {
     let mut daily = DailyColumns::default();
     let mut sessions = Vec::new();
-    let mut categories = AHashMap::<u32, i64>::new();
+    let mut starts_at = Vec::new();
+    let mut radix = Vec::new();
+    let mut heads = Vec::new();
+    let mut next_purchase = Vec::new();
+    let mut category = DayPurchases::default();
     let mut prev = (0, 0);
     for (index, (last, sold)) in ends.into_iter().enumerate() {
         let local = &mut times[prev.0 as usize..last as usize];
-        let purchases = &mut sales[prev.1 as usize..sold as usize];
+        let purchases = &sales[prev.1 as usize..sold as usize];
         prev = (last, sold);
-        if local.is_empty() {
-            continue;
+        if local.is_empty() { continue; }
+        sorted_time_offsets(local, &mut radix);
+        starts(local, &mut starts_at);
+        let count = starts_at.len() - 1;
+        heads.clear();
+        if count > 1 && !purchases.is_empty() {
+            heads.resize(count, 0_u32);
+            next_purchase.clear();
+            for &(time, _) in purchases {
+                // The sale is itself an event, so its owning session always exists.
+                let s = starts_at[..count].partition_point(|&pos| local[pos] <= time) - 1;
+                next_purchase.push(heads[s]);
+                heads[s] = next_purchase.len() as u32;
+            }
         }
-        if local.len() > 32768 {
-            local.par_sort_unstable();
-        } else {
-            local.sort_unstable();
-        }
-        purchases.sort_unstable_by_key(|p| p.0);
         let person = (index * crate::input::SHARDS + shard) as u32;
-        let mut previous = local[0];
-        let first = start + i64::from(previous);
-        let mut row = UserDay {
-            person,
-            day: day(first),
-            sessions: 1,
-            ..UserDay::default()
-        };
-        sessions.push(Session {
-            person,
-            time: first,
-            revenue: 0,
-        });
-        let mut next = 0;
-        for &mut offset in local {
-            if offset - previous > 1_800_000 {
-                let time = start + i64::from(offset);
-                let next_day = day(time);
-                if next_day != row.day {
-                    finish_day(row, &mut categories, &mut daily);
-                    row = UserDay {
-                        person,
-                        day: next_day,
-                        ..UserDay::default()
-                    };
+        let mut row = UserDay { person, ..UserDay::default() };
+        for (i, interval) in starts_at.windows(2).enumerate() {
+            let time = start + i64::from(local[interval[0]]);
+            let session_day = day(time);
+            if row.sessions > 0 && session_day != row.day {
+                row.top_category = category.top();
+                daily.push(row);
+                row = UserDay { person, ..UserDay::default() };
+            }
+            row.day = session_day;
+            row.sessions += 1;
+            row.events += (interval[1] - interval[0]) as i64;
+            let mut revenue = 0;
+            if count == 1 {
+                for &(_, p) in purchases { category.add(p, &mut revenue); }
+            } else if !heads.is_empty() {
+                let mut cursor = heads[i];
+                while cursor != 0 {
+                    let offset = cursor as usize - 1;
+                    category.add(purchases[offset].1, &mut revenue);
+                    cursor = next_purchase[offset];
                 }
-                row.sessions += 1;
-                sessions.push(Session {
-                    person,
-                    time,
-                    revenue: 0,
-                });
             }
-            previous = offset;
-            row.events += 1;
-            while next < purchases.len() && purchases[next].0 == offset {
-                let p = purchases[next].1;
-                let cents = i64::from(p.cents);
-                *categories.entry(p.category).or_default() += cents;
-                row.revenue += cents;
-                sessions.last_mut().unwrap().revenue += cents;
-                next += 1;
-            }
+            row.revenue += revenue;
+            sessions.push(Session { person, time, revenue });
         }
-        finish_day(row, &mut categories, &mut daily);
+        row.top_category = category.top();
+        daily.push(row);
     }
     SessionBatch { daily, sessions }
 }
@@ -424,6 +517,63 @@ mod compact_session_tests {
             .map(|s| (s.person, s.time, s.revenue))
             .collect()
     }
+    #[test]
+    fn grouped_sales_match_full_sort_across_gaps_midnight_and_endpoint_ties() {
+        let start = 7 * DAY - 111;
+        let shard = 3;
+        let mut times = Vec::new();
+        let mut sales = Vec::new();
+        let mut ends = Vec::new();
+        let mut expanded: Batch<Event> = Batch::default();
+        for group in 0..4 {
+            let person = (group * crate::input::SHARDS + shard) as u32;
+            let mut offsets: Vec<u32> = (0..108).map(|i| match group {
+                0 => (i % 3) * SESSION_GAP,
+                1 => (i * 31 % 12) * (SESSION_GAP + 1) + (i % 7),
+                2 => u32::MAX - ((i * 71 % 85) * (SESSION_GAP + 1) + i),
+                _ => (i * (SESSION_GAP + 1) + i) / 7,
+            }).collect();
+            offsets.extend([0, 111, SESSION_GAP, (SESSION_GAP + 1), u32::MAX, u32::MAX - SESSION_GAP]);
+            for (n, t) in offsets.into_iter().rev().enumerate() {
+                let purchase = if n % 3 == 0 {
+                    let p = Purchase { category: (n % 4) as u32, cents: (9 + n % 7) as u32 };
+                    sales.push((t, p));
+                    expanded.purchases.push(p);
+                    expanded.purchases.len() as u32
+                } else { 0 };
+                times.push(t);
+                expanded.rows.push(Event { person, time: start + i64::from(t), purchase });
+            }
+            ends.push((times.len() as u32, sales.len() as u32));
+        }
+        expanded.rows.sort_unstable_by_key(|e| (e.person, e.time));
+        let expected = sessionize(expanded);
+        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends);
+        assert_eq!(daily(&actual), daily(&expected));
+        assert_eq!(sessions(&actual), sessions(&expected));
+    }
+
+    #[test]
+    fn clock_partition_and_gap_boundaries_match_scalar() {
+        let mut scratch = Vec::new();
+        let mut positions = Vec::new();
+        for count in [1, 8, 9, 31, 256, 2048, 6000, 131_073] {
+            let mut values: Vec<_> = (0..count as u32).map(|i|
+                i.wrapping_mul(0x350c_619f).rotate_left(12) % 3_000_000_000
+            ).collect();
+            values.extend([0, SESSION_GAP, SESSION_GAP * 2 + 1, u32::MAX]);
+            let mut expected = values.clone();
+            expected.sort_unstable();
+            sorted_time_offsets(&mut values, &mut scratch);
+            assert_eq!(values, expected);
+            starts(&values, &mut positions);
+            let expected: Vec<_> = std::iter::once(0).chain((1..values.len()).filter(|&i|
+                values[i] - values[i - 1] > SESSION_GAP
+            )).chain(std::iter::once(values.len())).collect();
+            assert_eq!(positions, expected);
+        }
+    }
+
     #[test]
     fn compact_offsets_match_full_events_at_gaps_midnight_and_purchase_ties() {
         let start = DAY - 500;
