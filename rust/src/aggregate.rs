@@ -468,7 +468,34 @@ pub struct CampaignDay {
     pub assisted_sessions: i64,
 }
 
-pub type CampaignDays = AHashMap<(u32, i32), CampaignDay>;
+type CampaignMap = AHashMap<(u32, i32), CampaignDay>;
+pub struct CampaignDays(Counters);
+
+impl Default for CampaignDays {
+    fn default() -> Self { Self(Counters::Sparse(Default::default())) }
+}
+
+impl IntoIterator for CampaignDays {
+    type Item = ((u32, i32), CampaignDay);
+    type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.entries()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CampaignMode { Map, Dense, Columns, Buffered }
+
+fn campaign_mode() -> CampaignMode {
+    static MODE: std::sync::OnceLock<CampaignMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("PERF_CAMPAIGNS").as_deref() {
+        Ok("map") => CampaignMode::Map,
+        Ok("columns") => CampaignMode::Columns,
+        Ok("buffered") => CampaignMode::Buffered,
+        _ => CampaignMode::Dense,
+    })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AssistMode {
@@ -506,7 +533,92 @@ enum Counters {
         days: usize,
         rows: Vec<CampaignDay>,
     },
-    Sparse(CampaignDays),
+    Columns {
+        first_day: i32,
+        days: usize,
+        data: DenseColumns,
+    },
+    Sparse(CampaignMap),
+}
+
+struct DenseColumns {
+    sessions: Vec<u16>,
+    purchased: Vec<u16>,
+    assisted: Vec<u16>,
+    revenue: Vec<i64>,
+    high: AHashMap<usize, [i64; 3]>,
+    pending: Vec<(usize, CampaignDay)>,
+    buffered: bool,
+}
+
+impl DenseColumns {
+    fn new(size: usize, buffered: bool) -> Self {
+        Self {
+            sessions: vec![0; size], purchased: vec![0; size],
+            assisted: vec![0; size], revenue: vec![0; size],
+            high: Default::default(), pending: Vec::new(), buffered,
+        }
+    }
+
+    #[inline]
+    fn direct(&mut self, slot: usize, value: CampaignDay) {
+        let sessions = i64::from(self.sessions[slot]) + value.sessions;
+        let purchased = i64::from(self.purchased[slot]) + value.purchasing_sessions;
+        let assisted = i64::from(self.assisted[slot]) + value.assisted_sessions;
+        self.sessions[slot] = sessions as u16;
+        self.purchased[slot] = purchased as u16;
+        self.assisted[slot] = assisted as u16;
+        self.revenue[slot] += value.revenue;
+        if (sessions | purchased | assisted) > i64::from(u16::MAX) {
+            let high = self.high.entry(slot).or_default();
+            high[0] += sessions & !0xffff;
+            high[1] += purchased & !0xffff;
+            high[2] += assisted & !0xffff;
+        }
+    }
+
+    fn flush(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending);
+        #[cfg(target_arch = "x86_64")]
+        for &(slot, _) in &pending {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            unsafe {
+                _mm_prefetch(self.sessions.as_ptr().add(slot).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.purchased.as_ptr().add(slot).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.assisted.as_ptr().add(slot).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.revenue.as_ptr().add(slot).cast(), _MM_HINT_T0);
+            }
+        }
+        for (slot, value) in pending.drain(..) { self.direct(slot, value); }
+        self.pending = pending;
+    }
+
+    fn update(&mut self, slot: usize, value: CampaignDay) {
+        if self.buffered {
+            assert!(slot < self.sessions.len());
+            self.pending.push((slot, value));
+            if self.pending.len() == 32 { self.flush(); }
+        } else {
+            self.direct(slot, value);
+        }
+    }
+
+    fn value(&self, slot: usize) -> CampaignDay {
+        let mut value = CampaignDay {
+            sessions: i64::from(self.sessions[slot]),
+            purchasing_sessions: i64::from(self.purchased[slot]),
+            assisted_sessions: i64::from(self.assisted[slot]),
+            revenue: self.revenue[slot],
+        };
+        if !self.high.is_empty() {
+            if let Some(high) = self.high.get(&slot) {
+                value.sessions += high[0];
+                value.purchasing_sessions += high[1];
+                value.assisted_sessions += high[2];
+            }
+        }
+        value
+    }
 }
 
 impl Counters {
@@ -518,50 +630,80 @@ impl Counters {
             .checked_mul(days)
             .filter(|&n| n > 0 && n <= 131_072)
         {
-            Self::Dense {
-                first_day,
-                days,
-                rows: vec![CampaignDay::default(); size],
+            let mode = campaign_mode();
+            if matches!(mode, CampaignMode::Columns | CampaignMode::Buffered) {
+                Self::Columns { first_day, days, data: DenseColumns::new(size, mode == CampaignMode::Buffered) }
+            } else {
+                Self::Dense { first_day, days, rows: vec![CampaignDay::default(); size] }
             }
         } else {
-            Self::Sparse(CampaignDays::default())
+            Self::Sparse(CampaignMap::default())
         }
     }
 
-    fn row(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
+    fn add(&mut self, campaign: u32, day: i32, value: CampaignDay) {
         match self {
             Self::Dense {
                 first_day,
                 days,
                 rows,
-            } => &mut rows[campaign as usize * *days + (day - *first_day) as usize],
-            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
+            } => rows[campaign as usize * *days + (day - *first_day) as usize].add(value),
+            Self::Columns { first_day, days, data } =>
+                data.update(campaign as usize * *days + (day - *first_day) as usize, value),
+            Self::Sparse(rows) => rows.entry((campaign, day)).or_default().add(value),
         }
     }
 
     fn into_rows(self) -> CampaignDays {
+        if campaign_mode() == CampaignMode::Map && !matches!(&self, Self::Sparse(_)) {
+            return CampaignDays(Self::Sparse(self.entries().collect()));
+        }
+        CampaignDays(self)
+    }
+
+    fn entries(self) -> Box<dyn Iterator<Item = ((u32, i32), CampaignDay)>> {
         match self {
-            Self::Sparse(rows) => rows,
+            Self::Sparse(rows) => Box::new(rows.into_iter()),
             Self::Dense {
                 first_day,
                 days,
                 rows,
-            } => rows
+            } => Box::new(rows
                 .into_iter()
                 .enumerate()
                 .filter(|(_, row)| row.sessions != 0 || row.assisted_sessions != 0)
-                .map(|(index, row)| {
+                .map(move |(index, row)| {
                     (
                         ((index / days) as u32, first_day + (index % days) as i32),
                         row,
                     )
-                })
-                .collect(),
+                })),
+            Self::Columns { first_day, days, mut data } => {
+                data.flush();
+                Box::new((0..data.sessions.len()).filter_map(move |i| {
+                    let value = data.value(i);
+                    (value.sessions != 0 || value.assisted_sessions != 0).then_some((
+                        ((i / days) as u32, first_day + (i % days) as i32), value))
+                }))
+            }
         }
     }
 }
 
 impl CampaignDay {
+    fn credit(session: &Session, assisted: bool) -> Self {
+        Self {
+            sessions: 1,
+            purchasing_sessions: i64::from(session.revenue > 0),
+            revenue: session.revenue,
+            assisted_sessions: i64::from(assisted),
+        }
+    }
+
+    fn assists(n: i64) -> Self {
+        Self { assisted_sessions: n, ..Self::default() }
+    }
+
     fn add(&mut self, other: Self) {
         self.sessions += other.sessions;
         self.purchasing_sessions += other.purchasing_sessions;
@@ -581,6 +723,14 @@ impl Counters {
             (Self::Sparse(rows), Self::Sparse(right)) => {
                 for (key, value) in right {
                     rows.entry(key).or_default().add(value);
+                }
+            }
+            (Self::Columns { data: left, .. }, Self::Columns { data: mut right, .. }) => {
+                left.flush();
+                right.flush();
+                for i in 0..left.sessions.len() {
+                    let value = right.value(i);
+                    if value.sessions != 0 || value.assisted_sessions != 0 { left.direct(i, value); }
                 }
             }
             _ => unreachable!("all workers use the same window and campaign dimension"),
@@ -656,11 +806,7 @@ fn summarize_campaigns(
                 let campaign = click
                     .filter(|c| c.time <= session.time && c.time >= session.time - LOOKBACK)
                     .map_or(0, |c| c.campaign);
-                let row = totals.row(campaign, day(session.time));
-                row.sessions += 1;
-                row.purchasing_sessions += i64::from(session.revenue > 0);
-                row.revenue += session.revenue;
-                row.assisted_sessions += i64::from(campaign != 0);
+                totals.add(campaign, day(session.time), CampaignDay::credit(session, campaign != 0));
             }
             continue;
         }
@@ -674,16 +820,13 @@ fn summarize_campaigns(
                 if !unique[..used].contains(&click.campaign) {
                     unique[used] = click.campaign;
                     used += 1;
-                    totals.row(click.campaign, current_day).assisted_sessions += 1;
+                    totals.add(click.campaign, current_day, CampaignDay::assists(1));
                 }
                 if click.time == best.time && ids.compare(click.id, best.id).is_lt() {
                     best = click;
                 }
             }
-            let row = totals.row(best.campaign, current_day);
-            row.sessions += 1;
-            row.purchasing_sessions += i64::from(session.revenue > 0);
-            row.revenue += session.revenue;
+            totals.add(best.campaign, current_day, CampaignDay::credit(session, false));
             continue;
         }
         credit(sessions, person_clicks, ids, totals);
@@ -785,10 +928,8 @@ fn small_attribution(
     }
     if find_winners {
         for (session, winner) in sessions.iter().zip(best) {
-            let row = totals.row(winner.map_or(0, |c| c.campaign), day(session.time));
-            row.sessions += 1;
-            row.purchasing_sessions += i64::from(session.revenue > 0);
-            row.revenue += session.revenue;
+            totals.add(winner.map_or(0, |c| c.campaign), day(session.time),
+                       CampaignDay::credit(session, false));
         }
     }
     for (campaign, mut bits) in masks.drain() {
@@ -798,7 +939,7 @@ fn small_attribution(
             let midnight = (i64::from(d) + 1) * DAY;
             let end = i + sessions[i..].partition_point(|s| s.time < midnight);
             let through_day = low_bits(end);
-            totals.row(campaign, d).assisted_sessions += i64::from((bits & through_day).count_ones());
+            totals.add(campaign, d, CampaignDay::assists(i64::from((bits & through_day).count_ones())));
             bits &= !through_day;
         }
     }
@@ -822,10 +963,7 @@ fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut C
         let campaign = latest
             .filter(|click| click.time >= session.time - LOOKBACK)
             .map_or(0, |click| click.campaign);
-        let row = totals.row(campaign, day(session.time));
-        row.sessions += 1;
-        row.purchasing_sessions += i64::from(session.revenue > 0);
-        row.revenue += session.revenue;
+        totals.add(campaign, day(session.time), CampaignDay::credit(session, false));
     }
 }
 
@@ -838,7 +976,7 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
         let current_day = day(session.time);
         let next_day = (i64::from(current_day) + 1) * DAY;
         let count = covered.partition_point(|session| session.time < next_day);
-        totals.row(campaign, current_day).assisted_sessions += count as i64;
+        totals.add(campaign, current_day, CampaignDay::assists(count as i64));
         covered = &covered[count..];
     }
 }
@@ -847,6 +985,26 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
 mod mask_tests {
     use super::*;
     use crate::input::Names;
+
+    #[test]
+    fn buffered_narrow_counters_widen_exactly_across_worker_merges() {
+        let new = || Counters::Columns {
+            first_day: 900, days: 2, data: DenseColumns::new(6, true),
+        };
+        let mut left = new();
+        let mut right = new();
+        let value = CampaignDay { sessions: 70_000, purchasing_sessions: 68_999,
+            revenue: 9_876_543_210, assisted_sessions: 123_400 };
+        left.add(1, 901, value);
+        right.add(1, 901, value);
+        for _ in 0..32 { right.add(2, 900, CampaignDay::assists(2048)); }
+        let values: CampaignMap = left.merge(right).entries().collect();
+        assert_eq!(values.len(), 2);
+        let combined = values[&(1, 901)];
+        assert_eq!((combined.sessions, combined.purchasing_sessions, combined.revenue,
+                    combined.assisted_sessions), (140_000, 137_998, 19_753_086_420, 246_800));
+        assert_eq!(values[&(2,900)].assisted_sessions, 65_536);
+    }
 
     #[test]
     fn masks_match_brute_force_for_unsorted_clicks_and_full_64th_bit() {
@@ -870,14 +1028,12 @@ mod mask_tests {
             let valid: Vec<_> = clicks.iter().filter(|c|
                 c.time <= session.time && c.time >= session.time - LOOKBACK).collect();
             let best = valid.iter().min_by_key(|c| (std::cmp::Reverse(c.time), c.id));
-            let row = reference.row(best.map_or(0, |c| c.campaign), day(session.time));
-            row.sessions += 1;
-            row.revenue += session.revenue;
-            row.purchasing_sessions += i64::from(session.revenue > 0);
+            reference.add(best.map_or(0, |c| c.campaign), day(session.time),
+                          CampaignDay::credit(session, false));
             let mut campaigns: Vec<_> = valid.iter().map(|c| c.campaign).collect();
             campaigns.sort_unstable();
             campaigns.dedup();
-            for c in campaigns { reference.row(c, day(session.time)).assisted_sessions += 1; }
+            for c in campaigns { reference.add(c, day(session.time), CampaignDay::assists(1)); }
         }
         let expected = snapshot(reference);
         for mode in [AssistMode::Masks, AssistMode::Unsorted, AssistMode::Simd] {
