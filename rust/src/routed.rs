@@ -1,6 +1,14 @@
 //! Resolve identity once per raw spelling, after event-ID winner selection.
 //! A connected component can have aliases in several raw partitions, so every
 //! member of such a component (including its representative) is forwarded.
+//!
+//! `PERF_ROUTE_WRITES=direct|buffered|stream` selects the full-record Vec
+//! writer. To time that choice across all event candidates, use
+//! `PERF_ROUTE_PACK=0 PERF_ROUTE_SLAB=0`. A slab writes its own fixed
+//! prefixes directly and sends full-record overflow to the selected writer.
+//! Packed records use a separate 16-byte lane and also write directly.
+//! `PERF_ROUTE_ARENA` controls later page-backed scans and is independent
+//! of the reader's writes.
 mod packed;
 mod storage;
 use std::path::Path;
@@ -1080,7 +1088,7 @@ impl People {
             let section = &mut ordered[begin..end];
             if section.len() > 32768 {
                 section.par_sort_unstable_by_key(|c| c.time);
-            } else if section.len() > 1 {
+            } else if section.len() > 1 && !aggregate::skip_click_sort(section.len()) {
                 section.sort_unstable_by_key(|c| c.time);
             }
             begin = end;
