@@ -119,6 +119,22 @@ const _: () = assert!(std::mem::size_of::<EventRow>() == 24);
 struct EventKeys {
     wide: Vec<[u64; 2]>,
     ingests: Vec<i64>,
+    stripe: Option<EventStripe>,
+}
+
+enum EventStripe {
+    Full(storage::Stripe<EventRow>),
+    Short(storage::Stripe<packed::ShortEvent>),
+}
+
+impl EventKeys {
+    fn prefixes(&self,part:usize)->(&[EventRow],&[packed::ShortEvent]) {
+        match &self.stripe {
+            None => (&[],&[]),
+            Some(EventStripe::Full(s)) => (s.prefix(part),&[]),
+            Some(EventStripe::Short(s)) => (&[],s.prefix(part)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -295,6 +311,7 @@ struct Work {
     exchange_time: Duration,
     winner_time: Duration,
     scan_tasks: usize,
+    stripe_rows:usize,
 }
 
 struct Winners {
@@ -337,6 +354,7 @@ struct Plan {
     packed: bool,
     flat: bool,
     chunk_group: usize,
+    slab:bool,
 }
 
 impl Plan {
@@ -366,6 +384,7 @@ impl Plan {
             packed: switch("PERF_ROUTE_PACK", "0") == "1",
             flat: switch("PERF_ROUTE_GROUPS", "map") == "flat",
             chunk_group,
+            slab:switch("PERF_ROUTE_SLAB","0")=="1",
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
             p1: switch("PERF_ROUTE_P1", "1") != "0",
             early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
@@ -451,13 +470,15 @@ struct Scratch {
 
 struct Fragment {
     chunk: u32,
+    bucket: u16,
+    prefix_len: u32,
     full: Vec<EventRow>,
     short: Vec<packed::ShortEvent>,
 }
 
 impl Fragment {
     fn len(&self) -> usize {
-        self.full.len() + self.short.len()
+        self.full.len() + self.short.len()+self.prefix_len as usize
     }
     fn rows<'a>(
         &'a self,
@@ -467,10 +488,10 @@ impl Fragment {
         let chunk = self.chunk;
         let k = &keys[chunk as usize];
         let p = &payloads[chunk as usize];
-        self.full
-            .iter()
+        let (full,small)=k.prefixes(self.bucket as usize);
+        full.iter().chain(&self.full)
             .copied()
-            .chain(self.short.iter().map(move |&s| s.unpack(k, p)))
+            .chain(small.iter().chain(&self.short).map(move |&s| s.unpack(k, p)))
             .map(move |row| Candidate { row, chunk })
     }
 }
@@ -481,6 +502,18 @@ enum Rows {
 }
 
 impl Rows {
+    fn visit_ids(&self,keys:&[EventKeys], mut emit:impl FnMut(u64)) {
+        match self {
+            Self::Fragments(pieces)=>for p in pieces {
+                let keys=&keys[p.chunk as usize];
+                let (full,short)=keys.prefixes(p.bucket as usize);
+                for row in full.iter().chain(&p.full) {emit(row.id);}
+                for row in short.iter().chain(&p.short) {emit(row.key(keys));}
+            },
+            Self::Pages(p)=>p.iter().for_each(|c| emit(c.row.id)),
+        }
+    }
+
     fn visit(&self, keys: &[EventKeys], payloads: &[EventData], mut emit: impl FnMut(Candidate)) {
         match self {
             Self::Fragments(p) => {
@@ -515,6 +548,14 @@ fn event_winners(
                 Vec::new()
             };
             let (mut keys, mut data) = (EventKeys::default(), EventData::default());
+            let mut stripe=plan.slab.then(||{
+                // This reserve uses the same conservative byte density as
+                // the original scorer. Actual keys still determine all rows.
+                let bytes=sources.iter().map(Chunk::byte_len).sum::<usize>();
+                let stride=bytes.div_ceil(70*plan.event_parts)+8;
+                if plan.packed {EventStripe::Short(storage::Stripe::new(plan.event_parts,stride))}
+                else {EventStripe::Full(storage::Stripe::new(plan.event_parts,stride))}
+            });
             let mut valid_count = 0;
             for chunk in sources {
                 chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
@@ -538,13 +579,20 @@ fn event_winners(
                 let bucket = hash(key) as usize & (plan.event_parts - 1);
                 if plan.packed {
                     if let Some(s) = packed::ShortEvent::pack(row) {
+                        if let Some(EventStripe::Short(slab))=&mut stripe {
+                            if slab.push(bucket,s) {return;}
+                        }
                         narrow[bucket].push(s);
                         return;
                     }
                 }
+                if let Some(EventStripe::Full(slab))=&mut stripe {
+                    if slab.push(bucket,row) {return;}
+                }
                 sink.push(bucket, row);
                 })?;
             }
+            keys.stripe=stripe;
             Ok::<_, anyhow::Error>((sink.finish(), narrow, keys, data, valid_count))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -564,19 +612,25 @@ fn event_winners(
         work.wide_users += p.users.len();
         work.ingest_side += k.ingests.len();
         work.side_rows += p.extra.len();
-        keys.push(k);
+        if let Some(s)=&k.stripe {
+            work.event_capacity+=match s {EventStripe::Full(v)=>v.capacity_bytes(),EventStripe::Short(v)=>v.capacity_bytes()};
+        }
         payloads.push(p);
         let mut narrow = narrow.into_iter();
-        for (dest, full) in pieces.iter_mut().zip(buckets) {
+        for (part,(dest, full)) in pieces.iter_mut().zip(buckets).enumerate() {
             let short = narrow.next().unwrap_or_default();
-            work.parsed += full.len() + short.len();
-            work.packed_events += short.len();
+            let (full_prefix,short_prefix)=k.prefixes(part);
+            let prefix_len=u32::try_from(full_prefix.len()+short_prefix.len())?;
+            work.stripe_rows+=prefix_len as usize;
+            work.parsed += full.len() + short.len()+prefix_len as usize;
+            work.packed_events += short.len()+short_prefix.len();
             work.event_capacity += full.capacity() * size_of::<EventRow>()
                 + short.capacity() * size_of::<packed::ShortEvent>();
-            if !(full.is_empty() && short.is_empty()) {
-                dest.push(Fragment { chunk, full, short });
+            if prefix_len!=0 || !(full.is_empty() && short.is_empty()) {
+                dest.push(Fragment { chunk, bucket:part as u16, prefix_len, full, short });
             }
         }
+        keys.push(k);
     }
     if plan.profile {
         let mut sizes: Vec<usize> = pieces
@@ -621,8 +675,8 @@ fn event_winners(
                 repeated.resize(slots / 64, 0u64);
                 crate::runtime::huge_pages(seen);
                 crate::runtime::huge_pages(repeated);
-                rows.visit(&keys, &payloads, |c| {
-                    let i = slot(c.row.id);
+                rows.visit_ids(&keys, |id| {
+                    let i = slot(id);
                     let bit = 1u64 << (i % 64);
                     repeated[i / 64] |= seen[i / 64] & bit;
                     seen[i / 64] |= bit;
@@ -1377,7 +1431,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "packed_events":work.packed_events,"packed_clicks":packed_clicks,
             "event_scan_s":work.scan_time.as_secs_f64(),"event_exchange_s":work.exchange_time.as_secs_f64(),
             "event_winner_route_s":work.winner_time.as_secs_f64(),"click_scan_route_s":click_time.as_secs_f64(),
-            "event_scan_tasks":work.scan_tasks,"p1_group_task_sum_s":p1_group_tasks.as_secs_f64(),
+            "event_scan_tasks":work.scan_tasks,"stripe_rows":work.stripe_rows,"p1_group_task_sum_s":p1_group_tasks.as_secs_f64(),
             "p1_local_aggregate_task_sum_s":p1_finish_tasks.as_secs_f64()
         });
         eprintln!("profile {storage}");

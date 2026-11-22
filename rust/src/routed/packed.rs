@@ -65,6 +65,10 @@ fn from_code(value: u64, width: u32, wide: &[[u64; 2]]) -> u64 {
 pub(super) struct ShortEvent(u64, u64);
 
 impl ShortEvent {
+    #[inline]
+    pub fn key(self, k:&EventKeys)->u64 {
+        from_code(self.0 & ((1 << 42) - 1),42,&k.wide)
+    }
     pub fn pack(e: EventRow) -> Option<Self> {
         const NO_TIME: u32 = (1 << 21) - 1;
         const PAYLOAD_REF: u32 = NO_TIME - 65535;
@@ -93,7 +97,7 @@ impl ShortEvent {
         const PAYLOAD_REF: u32 = NO_TIME - 65535;
         let stamp = ((self.1 >> 20) & ((1 << 21) - 1)) as u32;
         EventRow {
-            id: from_code(self.0 & ((1 << 42) - 1), 42, &k.wide),
+            id: self.key(k),
             user: from_code(
                 (self.0 >> 42) | ((self.1 & ((1 << 20) - 1)) << 22),
                 42,

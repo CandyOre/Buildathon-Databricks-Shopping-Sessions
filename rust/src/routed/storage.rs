@@ -4,6 +4,40 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// One contiguous backing for a reader's adaptive event buckets. Only the
+/// observed prefix of a bucket is initialized. The caller stores overflow
+/// records in its existing exact lane, so capacity estimates affect speed only.
+pub(super) struct Stripe<T:Copy> {
+    slots: Vec<MaybeUninit<T>>,
+    used: Vec<u32>,
+    stride:usize,
+}
+
+impl<T:Copy> Stripe<T> {
+    pub fn new(parts:usize, stride:usize)->Self {
+        let count=stride.checked_mul(parts).expect("bucket stripe capacity");
+        let mut slots=Vec::with_capacity(count);
+        slots.resize_with(count,MaybeUninit::uninit);
+        crate::runtime::huge_pages(&slots);
+        Self{slots,used:vec![0;parts],stride}
+    }
+    #[inline]
+    pub fn push(&mut self,part:usize,row:T)->bool {
+        let used=self.used[part] as usize;
+        if used==self.stride {return false;}
+        self.slots[part*self.stride+used].write(row);
+        self.used[part]+=1;
+        true
+    }
+    pub fn prefix(&self,part:usize)->&[T] {
+        let start=part*self.stride;
+        let src=&self.slots[start..start+self.used[part] as usize];
+        // push initializes entries in order before increasing the visible length.
+        unsafe {std::slice::from_raw_parts(src.as_ptr().cast::<T>(),src.len())}
+    }
+    pub fn capacity_bytes(&self)->usize {self.slots.capacity()*size_of::<T>()}
+}
+
 const PAGE: usize = 4096;
 const REGION: usize = 2 << 20;
 
@@ -165,6 +199,18 @@ impl<T: Copy> Drop for Pages<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimated_stripes_expose_only_written_rows_and_signal_overflow() {
+        let mut s=Stripe::new(4,2);
+        assert!(s.push(1,10));
+        assert!(s.push(3,30));
+        assert!(s.push(1,11));
+        assert!(!s.push(1,12));
+        assert_eq!(s.prefix(0),&[]);
+        assert_eq!(s.prefix(1),&[10,11]);
+        assert_eq!(s.prefix(3),&[30]);
+    }
 
     #[test]
     fn released_pages_can_hold_other_records_without_touching_live_ranges() {
