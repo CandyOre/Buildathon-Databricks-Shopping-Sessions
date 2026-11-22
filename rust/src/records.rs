@@ -36,43 +36,8 @@ fn id_for(id: &[u8], prefix: u8, fallback: &Names) -> u64 {
     EXTERNAL_ID | u64::from(fallback.intern(text(id)))
 }
 
-const HEX_DIGITS: [u8; 256] = {
-    let mut digits = [0x80; 256];
-    let mut n = 0;
-    while n < 16 {
-        let byte = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
-        digits[byte as usize] = n;
-        n += 1;
-    }
-    digits
-};
-
 fn hex_event_id(id: &[u8]) -> Option<[u64; 2]> {
-    hex_key(id, b'e')
-}
-
-#[inline]
-fn hex_key(id: &[u8], prefix: u8) -> Option<[u64; 2]> {
-    let (&first, digits) = id.split_first()?;
-    if first != prefix {
-        return None;
-    }
-    let digits: &[u8; 32] = digits.try_into().ok()?;
-    let mut bytes = [0u8; 16];
-    let mut invalid = 0;
-    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-        let hi = HEX_DIGITS[pair[0] as usize];
-        let lo = HEX_DIGITS[pair[1] as usize];
-        invalid |= hi | lo;
-        *byte = (hi << 4) | lo;
-    }
-    if invalid & 0x80 != 0 {
-        return None;
-    }
-    Some([
-        u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-        u64::from_be_bytes(bytes[8..].try_into().unwrap()),
-    ])
+    input::hex_id(id, b'e')
 }
 
 enum EventId {
@@ -113,7 +78,7 @@ impl ClickKeyChunk {
 
     pub(crate) fn encode(&mut self, id: &[u8], names: &Names) -> u64 {
         if id.len() == 33 && self.index < 1 << 30 {
-            if let Some(words) = hex_key(id, b'k') {
+            if let Some(words) = input::hex_id(id, b'k') {
                 if let Ok(slot) = u32::try_from(self.hex.len()) {
                     self.hex.push(words);
                     return HEX_CLICK | ((self.index as u64) << 32) | u64::from(slot);
@@ -1065,7 +1030,7 @@ mod id_tests {
             b"k123456789",
             b"K12",
             b"kx\xc3\xa9",
-            "k用户".as_bytes(),
+            "k鐢ㄦ埛".as_bytes(),
         ];
         let fallback = Names::default();
         let codes: Vec<_> = cases
