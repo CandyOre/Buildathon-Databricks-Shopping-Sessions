@@ -1,0 +1,254 @@
+{
+  "git": {
+    "A": "a63538115ef0f316c6c7dd307b3698a764efb799",
+    "B": "a0f08920c19c21610174852dd41129795f0d33e3"
+  },
+  "retained": "B",
+  "official_timing_order": "ABBAAB",
+  "preflight_seconds": 1.803103,
+  "candidate_source_zip_sha256": "db7abaf5439bba2f42ea3a7fe965c269449eda02a8f748f2309141d5fc39616d",
+  "provenance": {
+    "generator_sha256": "78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a",
+    "answer_sha256": "c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20",
+    "starter_sha256": "b84ff8726c43749043c33c250548a9ac9987b9132d28ac818a47515bd128f77c",
+    "images": {
+      "rust:1.85-slim-bookworm": "sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36",
+      "debian:bookworm-slim": "sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+      "shopping-v5-event-key-7ab997cbf800:generator": "sha256:3c8b0c5330886ee574225c4e5eb686d3328570f6f1409a3b680562a5f1c5959b",
+      "shopping-v5-event-key-7ab997cbf800:a": "sha256:8a5691de5e46e6f6dafd1d21011803472df53f0d4c17e428993ebb5a32194fcd",
+      "shopping-v5-event-key-7ab997cbf800:b": "sha256:a2cc4e672a165546b9682fdb6e684d54391e3ba95b0813143dd294c33fadb9d8"
+    },
+    "resources": {
+      "cpuset": "0,2,4,6,8,10,12,14",
+      "cpu_max": "800000 100000",
+      "memory_max": "25769803776",
+      "filesystem": "ext4"
+    },
+    "inputs": {
+      "dev": "49fa51b19d1f95031620f12feb14112b14ae57c4a8fc68af84d48e3b06e0643e",
+      "s83-20m": "53d88a4d836695500d79c66c07016349d18a9e09a06f0f890b760b13fbf9052f",
+      "s37-20m": "e8a1f083875d091b8652c9160511ace7024537f8149b1aa4bcb9a0f87aa77d82",
+      "s83-60m": "5cbde1589f8be9d2e62955f3f17fbd29900301167b8ca2f461b50652d546d815"
+    }
+  },
+  "measurements": {
+    "volume": "shopping-v5-event-key-7ab997cbf800",
+    "cpuset": "0,2,4,6,8,10,12,14",
+    "image_ids": {
+      "a": "sha256:8a5691de5e46e6f6dafd1d21011803472df53f0d4c17e428993ebb5a32194fcd",
+      "b": "sha256:a2cc4e672a165546b9682fdb6e684d54391e3ba95b0813143dd294c33fadb9d8",
+      "a-count": "sha256:335379180de777d2c36c648fb7d128edc3b44b6bfbe5b51515f64444e8ca86ab",
+      "b-count": "sha256:8ea3a44a8aa648168ee93926866e90011e0b1fa52c773ab3a890bedb02c5b26d",
+      "a-timing": "sha256:9f03290b28460646a012873524d35b496560226c60fa7d386a54ac2a8a25daa6",
+      "b-timing": "sha256:7252872c3b3c2af9e92ef7e141b231ea5abe6b8469409396ec2484e71190bbd6"
+    },
+    "datasets": {
+      "s83-20m": {
+        "input_page_bytes": 2031599616,
+        "A": {
+          "container_seconds": [
+            1.308149,
+            1.703661,
+            1.268463
+          ],
+          "median_container_seconds": 1.308149,
+          "dictionary": {
+            "strict_seen": 2609358,
+            "strict_intern_calls": 2609358,
+            "all_event_intern_calls": 2609465,
+            "other_long_intern_calls": 15
+          },
+          "median_stage_seconds": {
+            "parse_events": 0.687120665,
+            "event_id_dedup": 0.023962044,
+            "dedup_and_sessionize": 0.079029087
+          },
+          "process_peak_rss_mib": {
+            "median": 1256.21875,
+            "max": 1260.48046875
+          },
+          "cgroup_peak_mib": {
+            "median": 1274.75,
+            "max": 1278.54296875
+          }
+        },
+        "B": {
+          "container_seconds": [
+            0.879108,
+            0.949821,
+            0.830892
+          ],
+          "median_container_seconds": 0.879108,
+          "dictionary": {
+            "strict_seen": 2609358,
+            "strict_intern_calls": 0,
+            "all_event_intern_calls": 107,
+            "other_long_intern_calls": 15
+          },
+          "median_stage_seconds": {
+            "parse_events": 0.325777114,
+            "event_id_dedup": 0.034321251,
+            "dedup_and_sessionize": 0.096823422
+          },
+          "process_peak_rss_mib": {
+            "median": 988.0859375,
+            "max": 1012.08203125
+          },
+          "cgroup_peak_mib": {
+            "median": 1006.25,
+            "max": 1030.52734375
+          }
+        },
+        "saved_seconds": 0.429041,
+        "saved_percent": 32.79756358029552,
+        "speedup": 1.488041287304859
+      },
+      "s37-20m": {
+        "input_page_bytes": 2089807872,
+        "A": {
+          "container_seconds": [
+            1.501778,
+            1.416066,
+            1.358191
+          ],
+          "median_container_seconds": 1.416066,
+          "dictionary": {
+            "strict_seen": 2685178,
+            "strict_intern_calls": 2685178,
+            "all_event_intern_calls": 2685298,
+            "other_long_intern_calls": 15
+          },
+          "median_stage_seconds": {
+            "parse_events": 0.873490821,
+            "event_id_dedup": 0.026753607,
+            "dedup_and_sessionize": 0.086295009
+          },
+          "process_peak_rss_mib": {
+            "median": 1278.70703125,
+            "max": 1284.72265625
+          },
+          "cgroup_peak_mib": {
+            "median": 1296.5234375,
+            "max": 1303.10546875
+          }
+        },
+        "B": {
+          "container_seconds": [
+            0.75802,
+            0.916457,
+            0.824134
+          ],
+          "median_container_seconds": 0.824134,
+          "dictionary": {
+            "strict_seen": 2685178,
+            "strict_intern_calls": 0,
+            "all_event_intern_calls": 120,
+            "other_long_intern_calls": 15
+          },
+          "median_stage_seconds": {
+            "parse_events": 0.329400359,
+            "event_id_dedup": 0.043469522,
+            "dedup_and_sessionize": 0.112677595
+          },
+          "process_peak_rss_mib": {
+            "median": 1044.1640625,
+            "max": 1052.015625
+          },
+          "cgroup_peak_mib": {
+            "median": 1061.74609375,
+            "max": 1070.01953125
+          }
+        },
+        "saved_seconds": 0.591932,
+        "saved_percent": 41.801158985527515,
+        "speedup": 1.7182472753217317
+      },
+      "s83-60m": {
+        "input_page_bytes": 6088687616,
+        "A": {
+          "container_seconds": [
+            4.429172,
+            3.961152,
+            3.481231
+          ],
+          "median_container_seconds": 3.961152,
+          "dictionary": {
+            "strict_seen": 7830733,
+            "strict_intern_calls": 7830733,
+            "all_event_intern_calls": 7831038,
+            "other_long_intern_calls": 41
+          },
+          "median_stage_seconds": {
+            "parse_events": 2.205234774,
+            "event_id_dedup": 0.101501289,
+            "dedup_and_sessionize": 0.293838677
+          },
+          "process_peak_rss_mib": {
+            "median": 3179.484375,
+            "max": 3187.32421875
+          },
+          "cgroup_peak_mib": {
+            "median": 3238.26953125,
+            "max": 3245.7578125
+          }
+        },
+        "B": {
+          "container_seconds": [
+            2.58238,
+            3.549382,
+            2.275449
+          ],
+          "median_container_seconds": 2.58238,
+          "dictionary": {
+            "strict_seen": 7830733,
+            "strict_intern_calls": 0,
+            "all_event_intern_calls": 305,
+            "other_long_intern_calls": 41
+          },
+          "median_stage_seconds": {
+            "parse_events": 1.173979071,
+            "event_id_dedup": 0.15330846,
+            "dedup_and_sessionize": 0.377588744
+          },
+          "process_peak_rss_mib": {
+            "median": 2472.8515625,
+            "max": 2507.67578125
+          },
+          "cgroup_peak_mib": {
+            "median": 2530.03125,
+            "max": 2565.1015625
+          }
+        },
+        "saved_seconds": 1.3787719999999997,
+        "saved_percent": 34.80734897322798,
+        "speedup": 1.5339152254896644
+      }
+    }
+  },
+  "verification": {
+    "checks": 82,
+    "passed": 82,
+    "comparison_rows": {
+      "dev": {
+        "user_daily": 118107,
+        "campaign_daily": 27449
+      },
+      "s83-20m": {
+        "user_daily": 2267027,
+        "campaign_daily": 28014
+      },
+      "s37-20m": {
+        "user_daily": 2245360,
+        "campaign_daily": 28014
+      },
+      "s83-60m": {
+        "user_daily": 6720282,
+        "campaign_daily": 28014
+      }
+    },
+    "unit_tests": {
+      "portable": 32,
+      "large": 35
+    }
+  }
+}
