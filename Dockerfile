@@ -5,7 +5,7 @@ ARG SCORER_STATIC=0
 ARG SCORER_CASCADE=0
 ARG SCORER_CASCADE_PKU=1
 ARG SCORER_PGO=1
-ARG SCORER_PROFILE=large-57c9e2a55f6e6c1c73068ac7b06062342f3dc2d0af82a279457a701cc06175d7.profdata
+ARG SCORER_PROFILE=large-9632629575bf299833a2a6d88e241c19715d293fbcc53378747caee37e3f6809.profdata
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/${SCORER_PROFILE} /profile/large.profdata
@@ -37,7 +37,7 @@ RUN set -eu; flags=""; if [ "$SCORER_STATIC" = 1 ]; then flags=-Ctarget-feature=
     if [ "$SCORER_CASCADE" = 1 ]; then cp /cascade /scorers; fi
 
 FROM ${RUNTIME_IMAGE}
-ARG SCORER_ARCH=default
+ARG SCORER_ARCH=B
 COPY --from=build /scorers/ /usr/local/bin/
 ENV MIMALLOC_PURGE_DELAY=10000
 ENV PERF_WIDE_SCAN=1
