@@ -45,9 +45,10 @@ fn cascade_cpu() -> bool {
     let x = unsafe { __cpuid_count(7,0) };
     let state = unsafe { __cpuid_count(0xd,1) }.eax;
     let ebx = (1<<0) | (1<<10) | (1<<18) | (1<<19) | (1<<23) | (1<<24);
+    let ecx = (1<<3) | (1<<4) | (1<<11); // PKU, OS support for PKU, AVX512VNNI
     wide_vectors() && optimized_cpu() && std::is_x86_feature_detected!("pclmulqdq")
         && std::is_x86_feature_detected!("rdrand") && x.ebx & ebx == ebx
-        && x.ecx & ((1<<3)|(1<<11)) == (1<<3)|(1<<11) && state & 0b1011 == 0b1011
+        && x.ecx & ecx == ecx && state & 0b1011 == 0b1011
 }
 #[cfg(not(target_arch = "x86_64"))]
 fn cascade_cpu() -> bool { false }

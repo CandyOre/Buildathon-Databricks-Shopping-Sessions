@@ -15,6 +15,7 @@ CONTROL = {"PERF_ASSISTS":"interval", "PERF_CAMPAIGNS":"map", "PERF_TIME_SORT":"
 # this treatment. Routing is introduced with all people forwarded first.
 TRIALS = {
     "control": (None, CONTROL),
+    "intern-clicks": ("control", {"PERF_CLICK_KEYS":"intern"}),
     "defaults": (None, {}),
     "mmap": ("control", {"PERF_IO":"mmap"}),
     "adaptive": ("mmap", {"PERF_CHUNK":"adaptive"}),
@@ -90,6 +91,8 @@ TRIALS = {
     "reuse": ("arena", {"PERF_ROUTE_REUSE":"1"}),
     "huge": ("reuse", {"PERF_THP":"1"}),
 }
+for prefix in ("read","lines","fields","decode","bucket"):
+    TRIALS["prefix-"+prefix] = ("control", {"PERF_PROBE":prefix})
 
 
 def settings(name):
@@ -157,6 +160,7 @@ def main():
     p.add_argument("--reference",action="store_true",help="also export and compare the candidate's large tables")
     p.add_argument("--baseline-image",help="use an explicit image as the control")
     p.add_argument("--cold",action="store_true")
+    p.add_argument("--lean",action="store_true",help="profile stage timings without detailed work or dictionary-lock instrumentation")
     args=p.parse_args()
     if args.settings:
         TRIALS.update(json.loads(args.settings.read_text()))
@@ -177,7 +181,8 @@ def main():
             if args.action=="sweep":
                 race(work,volume,name,case,control,candidate,study/"tables" if args.reference else None,args.cold)
             else:
-                detailed={**candidate,"env":{**candidate["env"],"PROFILE_WORK":"1","PROFILE_LOCKS":"1"}}
+                details = {} if args.lean else {"PROFILE_WORK":"1","PROFILE_LOCKS":"1"}
+                detailed = {**candidate,"env":{**candidate["env"],**details}}
                 call(work,volume,case,["B"],{"B":detailed},name,profile=True)
                 print(name,case,"profiled",flush=True)
 

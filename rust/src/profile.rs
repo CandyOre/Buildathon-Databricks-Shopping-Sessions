@@ -40,6 +40,9 @@ struct Sample {
 struct SystemSample {
     counts: BTreeMap<String, u64>,
     threads: BTreeMap<String, u64>,
+    running_ns: BTreeMap<String, u64>,
+    runnable_wait_ns: BTreeMap<String, u64>,
+    last_cpu: BTreeMap<String, u64>,
 }
 
 fn ticks(line: &str) -> Option<(u64, u64, u64, u64)> {
@@ -67,8 +70,19 @@ impl SystemSample {
         }
         if let Ok(tasks) = fs::read_dir("/proc/self/task") {
             for entry in tasks.flatten() {
-                if let Some((_,_,u,s))=fs::read_to_string(entry.path().join("stat")).ok().and_then(|s| ticks(&s)) {
-                    out.threads.insert(entry.file_name().to_string_lossy().into_owned(),u+s);
+                let tid = entry.file_name().to_string_lossy().into_owned();
+                if let Ok(stat) = fs::read_to_string(entry.path().join("stat")) {
+                    if let Some((_,_,u,s)) = ticks(&stat) { out.threads.insert(tid.clone(),u+s); }
+                    // /proc/<pid>/stat field 39 is the last processor number.
+                    if let Some(cpu) = stat.rsplit_once(") ").and_then(|(_,s)|s.split_whitespace().nth(36))
+                        .and_then(|s|s.parse().ok()) { out.last_cpu.insert(tid.clone(),cpu); }
+                }
+                if let Ok(stat) = fs::read_to_string(entry.path().join("schedstat")) {
+                    let mut values = stat.split_whitespace().filter_map(|s|s.parse::<u64>().ok());
+                    if let (Some(run),Some(wait)) = (values.next(),values.next()) {
+                        out.running_ns.insert(tid.clone(),run);
+                        out.runnable_wait_ns.insert(tid,wait);
+                    }
                 }
             }
         }
@@ -171,6 +185,9 @@ impl Profiler {
                 "start_rss_kib": sample.start_rss_kib, "end_rss_kib": end_rss, "peak_rss_kib": sample.peak_rss_kib,
                 "os_delta":SystemSample::delta(&observation.counts,&sample.system.counts),
                 "thread_cpu_ticks":SystemSample::delta(&observation.threads,&sample.system.threads),
+                "thread_running_ns":SystemSample::delta(&observation.running_ns,&sample.system.running_ns),
+                "thread_runnable_wait_ns":SystemSample::delta(&observation.runnable_wait_ns,&sample.system.runnable_wait_ns),
+                "thread_last_cpu":observation.last_cpu,
             });
             sample.system=observation;
             eprintln!("profile {data}");

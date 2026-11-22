@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,8 @@ def main():
     parser.add_argument("output", type=Path, help="New merged .profdata file")
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
     parser.add_argument("--setting", action="append", default=[], metavar="PERF_KEY=VALUE")
+    parser.add_argument("--revision", help="train from this exact local source commit")
+    parser.add_argument("--lto", choices=("thin","fat"), default="thin")
     args = parser.parse_args()
     if any(not s.startswith("PERF_") or "=" not in s for s in args.setting):
         parser.error("--setting expects PERF_KEY=VALUE")
@@ -47,10 +50,19 @@ def main():
         work = Path(temporary)
         context = work / "source"
         context.mkdir()
+        source = ROOT / "rust"
+        if args.revision:
+            archive = work / "training-source.zip"
+            subprocess.run(["git","archive","--format=zip","-o",str(archive),args.revision,
+                "rust/Cargo.toml","rust/Cargo.lock","rust/src"],cwd=ROOT,check=True)
+            with zipfile.ZipFile(archive) as files:
+                files.extractall(work / "snapshot")
+            source = work / "snapshot/rust"
         for name in ("Cargo.toml", "Cargo.lock"):
-            shutil.copyfile(ROOT / "rust" / name, context / name)
-        shutil.copytree(ROOT / "rust" / "src", context / "src")
-        (context / "Dockerfile").write_text(RECIPE, encoding="utf-8")
+            shutil.copyfile(source / name, context / name)
+        shutil.copytree(source / "src", context / "src")
+        recipe = RECIPE.replace("WORKDIR /src", f"ENV CARGO_PROFILE_RELEASE_LTO={args.lto}\nWORKDIR /src")
+        (context / "Dockerfile").write_text(recipe, encoding="utf-8")
         tools = build(context, "tools", work / "tools.id")
         scorer = build(context, "scorer", work / "scorer.id")
         counts = work / "counts"
