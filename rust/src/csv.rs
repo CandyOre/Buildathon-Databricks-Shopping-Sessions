@@ -804,9 +804,60 @@ pub fn chunks(directory: &Path) -> Result<Vec<Chunk>> {
     Ok(jobs.collect())
 }
 
+// Tiny chunks and header-only files must not each retain a complete matrix
+// of per-bucket Vec headers/slab padding for the duration of event ingestion.
+// Grouping changes neither file reads nor ownership of crossing records.
+pub(crate) fn work_groups(chunks: &[Chunk], requested: usize, metadata_per_task: usize) -> Vec<&[Chunk]> {
+    const METADATA_TARGET: usize = 128 << 20;
+    group_slices(chunks, requested, metadata_per_task, METADATA_TARGET)
+}
+
+fn group_slices(chunks: &[Chunk], requested: usize, metadata: usize, budget: usize) -> Vec<&[Chunk]> {
+    let requested = requested.max(1);
+    let max_groups = (budget / metadata.max(1)).max(1);
+    let count = chunks.len().div_ceil(max_groups).max(requested);
+    if count == requested {
+        return chunks.chunks(requested).collect();
+    }
+    let mut groups = Vec::new();
+    let mut first = 0;
+    let mut bytes = 0;
+    // A scorer using one original chunk per job can encode each candidate
+    // position in 22 bits. Keep the same limit, including groups across files.
+    let max_bytes = requested.saturating_mul(CHUNK_BYTES as usize);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let len = chunk.byte_len();
+        if i > first && (i - first == count || bytes > max_bytes - len) {
+            groups.push(&chunks[first..i]);
+            first = i;
+            bytes = 0;
+        }
+        bytes += len;
+    }
+    if first < chunks.len() { groups.push(&chunks[first..]); }
+    groups
+}
+
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn task_metadata_groups_small_inputs_without_overflowing_packed_positions() {
+        let source = Arc::new(Source::new(PathBuf::new(), 0, false));
+        let make = |sizes: &[usize]| sizes.iter().map(|&n| Chunk {
+            source: source.clone(), start: 0, end: n as u64,
+        }).collect::<Vec<_>>();
+        let tiny = make(&[4096; 128]);
+        assert_eq!(group_slices(&tiny, 1, 64, 128).len(), 2);
+        let sizes = [1, 3 << 20, 1, 2 << 20, 2, 3 << 20];
+        let varied = make(&sizes);
+        let groups = group_slices(&varied, 1, 1024, 1);
+        assert_eq!(groups.iter().map(|g| g.len()).sum::<usize>(), sizes.len());
+        assert!(groups.iter().all(|g| g.iter().map(Chunk::byte_len).sum::<usize>() <= CHUNK_BYTES as usize));
+        assert_eq!(group_slices(&varied, 1, 64, 1 << 20).len(), varied.len());
+        assert!(group_slices(&[], 1, 64, 1).is_empty());
+    }
 
     #[test]
     fn long_rows_are_owned_by_the_chunk_containing_their_first_byte() -> Result<()> {
