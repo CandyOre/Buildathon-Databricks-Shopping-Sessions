@@ -1320,18 +1320,18 @@ fn second_flat(pieces:Vec<Forward>, data:&[EventData],window:Window,bits:u32)->(
     People::finish_groups(groups,events,clicks,event_count,true,window,data)
 }
 
-pub type Routed = (
-    Vec<SessionBatch>,
-    Vec<Vec<Click>>,
-    ClickIds,
-    PersonNames,
-    usize,
-);
+pub enum Campaigns {
+    Pending(Vec<Vec<Click>>,ClickIds),
+    Ready(aggregate::CampaignDays),
+}
+
+pub type Routed = (Vec<SessionBatch>,Campaigns,PersonNames,usize);
 
 pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Routed> {
     let tasks = chunks(&data.join("events"))?;
     let bytes = tasks.iter().map(Chunk::byte_len).sum();
     let plan = Plan::new(bytes)?;
+    let fused=crate::runtime::flag("PERF_ROUTE_FUSED").then(||aggregate::FusedCampaigns::new(dimensions.campaigns.len(),window));
     let arena = storage::Arena::new(plan.reuse);
     let started = Instant::now();
     let read_links = || -> Result<_> {
@@ -1389,7 +1389,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         .into_par_iter()
         .zip(clicks)
         .map(|(e, c)| {
-            first_pass(
+            let mut result=first_pass(
                 e,
                 c,
                 &payloads,
@@ -1400,7 +1400,9 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
                 window,
                 plan,
                 &arena,
-            )
+            );
+            if let Some(acc)=&fused {acc.consume(&mut result.local.0,&mut result.local.1,&ids);}
+            result
         })
         .collect::<Vec<_>>();
     drop(other);
@@ -1430,7 +1432,11 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let rest = later
         .into_par_iter()
         .filter(|p| !p.is_empty())
-        .map(|p| second_pass(p, &payloads, window,plan))
+        .map(|p| {
+            let (mut batch,mut clicks)=second_pass(p,&payloads,window,plan);
+            if let Some(acc)=&fused {acc.consume(&mut batch,&mut clicks,&ids);}
+            (batch,clicks)
+        })
         .collect::<Vec<_>>();
     for (s, c) in rest {
         sessions.push(s);
@@ -1469,7 +1475,9 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         });
         eprintln!("profile {v}");
     }
-    Ok((sessions, click_lists, ids, users.into_people(), count))
+    let campaigns=if let Some(acc)=fused {Campaigns::Ready(acc.finish(&sessions))}
+        else {Campaigns::Pending(click_lists,ids)};
+    Ok((sessions,campaigns,users.into_people(),count))
 }
 
 #[cfg(test)]

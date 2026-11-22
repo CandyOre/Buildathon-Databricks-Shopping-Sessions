@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         profile.finish();
         return Ok(());
     }
-    let (mut session_batches, clicks, click_ids, user_names, event_count) =
+    let (mut session_batches, campaigns, user_names, event_count) =
         if probe::use_routing(&data, window)? {
             profile.stage("load_dimensions");
             let rows = routed::run(&data, window, &dimensions)?;
@@ -84,18 +84,21 @@ fn main() -> Result<()> {
             };
             drop(aliases);
             let names = users.into_people();
-            (sessions, clicks, ids, names, count)
+            (sessions, routed::Campaigns::Pending(clicks,ids), names, count)
         };
 
     let dictionaries = output::prepare_names(&session_batches, &user_names)?;
-    let campaign_daily = aggregate::campaign_daily(
-        &mut session_batches,
-        clicks,
-        click_ids,
-        dimensions.campaigns.len(),
-        window,
-    );
-    profile.stage("attribution_and_assists");
+    let campaign_daily = match campaigns {
+        routed::Campaigns::Ready(days) => {
+            profile.stage("prepare_output_after_fused_attribution");
+            days
+        }
+        routed::Campaigns::Pending(clicks,ids) => {
+            let days=aggregate::campaign_daily(&mut session_batches,clicks,ids,dimensions.campaigns.len(),window);
+            profile.stage("attribution_and_assists");
+            days
+        }
+    };
     output::write(
         &out,
         session_batches,

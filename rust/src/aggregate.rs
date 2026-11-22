@@ -900,16 +900,7 @@ impl Counters {
     }
 }
 
-pub fn campaign_daily(
-    batches: &mut [SessionBatch],
-    clicks: Vec<Vec<Click>>,
-    ids: ClickIds,
-    campaigns: usize,
-    window: crate::input::Window,
-) -> CampaignDays {
-    let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
-    let work = crate::records::work_enabled();
-    if work {
+fn log_session_work(batches: &[SessionBatch]) {
         let mut total = SessionWork::default();
         for w in batches.iter().filter_map(|b| b.work.as_deref()) {
             total.groups += w.groups;
@@ -932,7 +923,18 @@ pub fn campaign_daily(
             "purchase_bin_lookups":total.purchase_bin_lookups,
             "single_purchase_groups":total.single_purchase_groups
         }));
-    }
+}
+
+pub fn campaign_daily(
+    batches: &mut [SessionBatch],
+    clicks: Vec<Vec<Click>>,
+    ids: ClickIds,
+    campaigns: usize,
+    window: crate::input::Window,
+) -> CampaignDays {
+    let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
+    let work = crate::records::work_enabled();
+    if work { log_session_work(batches); }
     let result = batches
         .par_iter_mut()
         .zip(clicks)
@@ -953,10 +955,18 @@ pub fn campaign_daily(
             },
         )
         .map(|(totals, scratch)| (totals, scratch.work))
-        .reduce_with(|(left, mut stats), (right, other)| {
-            if let (Some(s), Some(t)) = (&mut stats, other) { s.merge(t); }
-            (left.merge(right), stats)
-        });
+        .reduce_with(merge_campaign_work);
+    finish_campaigns(result)
+}
+
+type LocalCampaigns=(Counters,Option<AttributionWork>);
+
+fn merge_campaign_work((left,mut stats):LocalCampaigns,(right,other):LocalCampaigns)->LocalCampaigns {
+    if let (Some(s), Some(t))=(&mut stats,other) { s.merge(t); }
+    (left.merge(right),stats)
+}
+
+fn finish_campaigns(result:Option<LocalCampaigns>)->CampaignDays {
     let Some((totals, stats)) = result else { return CampaignDays::default() };
     if let Some(stats) = stats {
         eprintln!("profile {}",serde_json::json!({
@@ -968,6 +978,67 @@ pub fn campaign_daily(
         }));
     }
     totals.into_rows()
+}
+
+pub(crate) struct FusedCampaigns {
+    // A partition can create at most one short critical section on its own
+    // Rayon worker. The mutex also covers execution outside the global pool.
+    workers:Vec<std::sync::Mutex<Option<(Counters,AssistScratch)>>>,
+    campaigns:usize,
+    window:crate::input::Window,
+    work:bool,
+}
+
+impl FusedCampaigns {
+    pub fn new(campaigns:usize,window:crate::input::Window)->Self {
+        Self {
+            workers:(0..rayon::current_num_threads()).map(|_|std::sync::Mutex::new(None)).collect(),
+            campaigns,window,work:crate::records::work_enabled(),
+        }
+    }
+    pub fn consume(&self,batch:&mut SessionBatch,clicks:&mut Vec<Click>,ids:&ClickIds) {
+        let sessions=std::mem::take(&mut batch.sessions);
+        let mut clicks=std::mem::take(clicks);
+        if sessions.is_empty(){return;}
+        let index=rayon::current_thread_index().unwrap_or(0);
+        let mut worker=self.workers[index].lock().unwrap();
+        let (totals,scratch)=worker.get_or_insert_with(||(
+            Counters::new(self.campaigns,self.window),
+            AssistScratch{work:self.work.then(AttributionWork::default),..AssistScratch::default()}
+        ));
+        summarize_campaigns(sessions,&mut clicks,ids,totals,scratch);
+    }
+    pub fn finish(self,batches:&[SessionBatch])->CampaignDays {
+        if self.work {log_session_work(batches);}
+        let merged=self.workers.into_par_iter()
+            .filter_map(|s|s.into_inner().unwrap().map(|(counts,scratch)|(counts,scratch.work)))
+            .reduce_with(merge_campaign_work);
+        finish_campaigns(merged)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fused_campaigns_release_local_buffers_and_merge_both_passes() {
+    let window=crate::input::Window{start:0,end:3*DAY};
+    let ids=ClickIds::new(crate::input::Names::default(),Vec::new());
+    let local=FusedCampaigns::new(3,window);
+    for person in [5,7,11] {
+        let mut batch=SessionBatch{daily:DailyColumns::default(),work:None,
+            sessions:vec![Session{time:DAY,revenue:10,person}]};
+        let mut clicks=if person==7 {Vec::new()} else {vec![
+            Click{person,time:0,campaign:2,id:2},Click{person,time:0,campaign:1,id:1},
+            Click{person,time:0,campaign:2,id:2}
+        ]};
+        local.consume(&mut batch,&mut clicks,&ids);
+        assert_eq!(batch.sessions.capacity(),0);
+        assert_eq!(clicks.capacity(),0);
+    }
+    let rows:std::collections::BTreeMap<_,_>=local.finish(&[]).into_iter()
+        .map(|(k,d)|(k,[d.sessions,d.purchasing_sessions,d.revenue,d.assisted_sessions])).collect();
+    assert_eq!(rows[&(0,1)],[1,1,10,0]);
+    assert_eq!(rows[&(1,1)],[2,2,20,2]);
+    assert_eq!(rows[&(2,1)],[0,0,0,2]);
 }
 
 fn summarize_campaigns(
