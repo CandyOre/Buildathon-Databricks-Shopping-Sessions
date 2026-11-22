@@ -583,9 +583,9 @@ pub fn read_events(
                 chunk.scan_parsed(|f: [&[u8]; 7]| {
                     if f[0].is_empty() { return; }
                     let proposal = people.prepare(users, aliases, f[1]);
-                    let ingest = calendar.ingest(f[3]);
+                    let (time, ingest) = calendar.event_times(f[2], f[3]);
                     let id = EventId::parse(f[0], &ids);
-                    let payload = crate::csv::event_payload(&f, calendar.parse(f[2]), ingest, window, dimensions);
+                    let payload = crate::csv::event_payload(&f, time, ingest, window, dimensions);
                     store(people, proposal, id, f[1], ingest, payload);
                 })?;
             }

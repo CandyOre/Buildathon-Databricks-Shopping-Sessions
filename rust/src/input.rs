@@ -15,6 +15,9 @@ pub const DAY: i64 = 86_400_000;
 pub const LOOKBACK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
 
+#[path = "fastdecode.rs"]
+mod fastdecode;
+
 const HEX: [u8; 256] = {
     let mut digits = [0x80; 256];
     let mut n = 0;
@@ -315,6 +318,7 @@ struct CachedDay {
 pub struct Calendar {
     days: [CachedDay; 64],
     epochs: [(u32, i64); 16],
+    pub(crate) paired_times: bool,
 }
 
 impl Calendar {
@@ -322,6 +326,7 @@ impl Calendar {
         let mut table = Self {
             days: [CachedDay::default(); 64],
             epochs: [(0, 0); 16],
+            paired_times: fastdecode::available() && perf_on("PERF_FAST_TIMES"),
         };
         let first = window.start.saturating_sub(LOOKBACK + DAY).div_euclid(DAY);
         let last = window
@@ -383,6 +388,24 @@ impl Calendar {
 
     #[inline]
     pub fn parse(&self, s: &[u8]) -> Option<i64> {
+        #[cfg(target_arch="x86_64")]
+        if self.paired_times {
+            return unsafe { fastdecode::single(self, s) };
+        }
+        self.parse_reference(s)
+    }
+
+    #[inline]
+    pub(crate) fn event_times(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64) {
+        #[cfg(target_arch="x86_64")]
+        if self.paired_times {
+            return unsafe { fastdecode::pair(self, event, ingest) };
+        }
+        (self.parse_reference(event), self.ingest(ingest))
+    }
+
+    #[inline]
+    fn parse_reference(&self, s: &[u8]) -> Option<i64> {
         if s.len() == 13 {
             let (key, base) = self.epochs[(s[3] & 15) as usize];
             if key != 0 && key == u32::from_le_bytes(s[..4].try_into().unwrap()) {

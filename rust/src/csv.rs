@@ -963,12 +963,20 @@ impl Chunk {
         if size == 0 {
             return self.scan_parsed(|f: [&[u8]; 7]| {
                 if f[0].is_empty() { return; }
-                let ingest = calendar.ingest(f[3]);
-                let payload = event_payload(&f, calendar.parse(f[2]), ingest, window, dim);
+                let (time, ingest) = calendar.event_times(f[2], f[3]);
+                let payload = event_payload(&f, time, ingest, window, dim);
                 emit(f[0], f[1], ingest, payload)
             });
         }
         self.spans(|span| parsed_groups::<7>(span, size, &mut |rows| {
+            if calendar.paired_times {
+                for f in rows {
+                    let (time, ingest) = calendar.event_times(f[2], f[3]);
+                    let payload = event_payload(f, time, ingest, window, dim);
+                    emit(f[0], f[1], ingest, payload);
+                }
+                return;
+            }
             let mut times = [None; MAX_BATCH];
             calendar.times(rows, 2, &mut times[..rows.len()]);
             for (f, time) in rows.iter().zip(times) {
@@ -992,6 +1000,10 @@ impl Chunk {
         let size = batch_size();
         if size == 0 { return self.scan_parsed(|f| valid(&f, calendar.parse(f[3]))); }
         self.spans(|span| parsed_groups::<4>(span, size, &mut |rows| {
+            if calendar.paired_times {
+                for f in rows { valid(f, calendar.parse(f[3])); }
+                return;
+            }
             let mut times = [None; MAX_BATCH];
             calendar.times(rows, 3, &mut times[..rows.len()]);
             for (f, time) in rows.iter().zip(times) { valid(f, time); }
