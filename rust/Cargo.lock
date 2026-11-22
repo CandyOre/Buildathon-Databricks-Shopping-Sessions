@@ -747,6 +747,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "chrono",
+ "libc",
  "memchr",
  "mimalloc",
  "parquet",
