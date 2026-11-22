@@ -803,18 +803,17 @@ mod scan_tests {
         data.resize(3 * block + 17, b'b');
         data.extend_from_slice(b"\nz");
         fs::write(&part, data)?;
-        let mut actual = Vec::new();
+        let rows = [(7, block - 8), (block, 2 * block + 17), (3 * block + 18, 1)];
         for chunk in chunks(&directory)? {
             let mut lengths = Vec::new();
             chunk.scan(|line| lengths.push(line.len()))?;
-            actual.push(lengths);
+            let expected: Vec<_> = rows.iter().filter_map(|&(start, len)| {
+                (chunk.start <= start as u64 && (start as u64) < chunk.end).then_some(len)
+            }).collect();
+            assert_eq!(lengths, expected, "chunk {}..{}", chunk.start, chunk.end);
         }
         fs::remove_file(part)?;
         fs::remove_dir(directory)?;
-        assert_eq!(
-            actual,
-            vec![vec![block - 8], vec![2 * block + 17], vec![], vec![1]]
-        );
         Ok(())
     }
 

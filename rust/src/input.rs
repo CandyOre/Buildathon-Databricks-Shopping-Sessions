@@ -631,6 +631,8 @@ impl Dimensions {
 #[derive(Default)]
 struct NameShard {
     offset: usize,
+    lock_calls: u64,
+    lock_ns: u64,
     keys: Vec<u64>,
     ids: AHashMap<Arc<str>, u32>,
     wide: Option<AHashMap<[u64;2], u32>>,
@@ -654,6 +656,7 @@ impl NameShard {
 pub struct Names {
     packed: Option<Arc<NameTable>>,
     wide_users: bool,
+    profile_locks: bool,
     hash: RandomState,
     shards: Vec<Mutex<NameShard>>,
 }
@@ -663,6 +666,7 @@ impl Default for Names {
         Self {
             packed: None,
             wide_users: false,
+            profile_locks: perf_on("PROFILE_LOCKS") || perf_on("PERF_LOCKS"),
             hash: RandomState::new(),
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
         }
@@ -670,6 +674,24 @@ impl Default for Names {
 }
 
 impl Names {
+    #[inline]
+    fn lock_for_intern(&self, shard: usize) -> std::sync::MutexGuard<'_, NameShard> {
+        if !self.profile_locks { return self.shards[shard].lock().unwrap(); }
+        let start = std::time::Instant::now();
+        let mut state = self.shards[shard].lock().unwrap();
+        state.lock_ns += start.elapsed().as_nanos() as u64;
+        state.lock_calls += 1;
+        state
+    }
+
+    pub(crate) fn lock_stats(&self) -> (u64, u64) {
+        if !self.profile_locks { return (0, 0); }
+        self.shards.iter().fold((0, 0), |(calls, ns), shard| {
+            let state = shard.lock().unwrap();
+            (calls + state.lock_calls, ns + state.lock_ns)
+        })
+    }
+
     pub fn intern(&self, name: &str) -> u32 {
         if self.wide_users {
             if let Some(key) = hex_id(name.as_bytes(), b'u') {
@@ -682,11 +704,11 @@ impl Names {
     }
 
     fn intern_in(&self, shard: usize, name: &str) -> u32 {
-        self.shards[shard].lock().unwrap().intern(shard, name)
+        self.lock_for_intern(shard).intern(shard, name)
     }
 
     fn intern_wide(&self, shard: usize, key: [u64;2], name: &str) -> u32 {
-        let mut state = self.shards[shard].lock().unwrap();
+        let mut state = self.lock_for_intern(shard);
         if let Some(&id) = state.wide.as_ref().and_then(|map| map.get(&key)) { return id; }
         let id = id_for(shard, state.offset + state.keys.len());
         let spelling = EXTERNAL_NAME | state.names.len() as u64;
@@ -702,7 +724,7 @@ impl Names {
 
     fn register_bounded(&self, key: u64, hash: usize, limit: u64) -> Option<u32> {
         let shard = hash % SHARDS;
-        let mut state = self.shards[shard].lock().unwrap();
+        let mut state = self.lock_for_intern(shard);
         let id = id_for(shard, state.offset + state.keys.len());
         if u64::from(id) >= limit {
             return None;
