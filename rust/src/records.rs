@@ -522,9 +522,8 @@ pub fn read_events(
     let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
     let overhead = size_of::<(ChunkIds, ChunkPeople)>()
         + 9 * SHARDS * (size_of::<EntryId>() + size_of::<PersonEvent>());
-    let parsed: Vec<_> = crate::csv::work_groups(&chunks, 1, overhead)
-        .into_par_iter()
-        .map_init(PersonCache::default, |people, group| {
+    let groups=crate::csv::work_groups(&chunks,1,overhead);
+    let parsed: Vec<_> = crate::runtime::stage_map_init("decode_events",groups,1,PersonCache::default, |people, group| {
             // Approximate only the backing capacity. Arbitrary CSV lengths and
             // shard skew are handled by the exact per-shard continuation.
             let bytes = group.iter().map(|c| c.byte_len()).sum::<usize>();
@@ -598,7 +597,7 @@ pub fn read_events(
             }
             Ok::<_, anyhow::Error>((id_rows, people_rows))
         })
-        .collect::<Result<_>>()?;
+        .into_iter().collect::<Result<_>>()?;
     drop(chunks);
 
     if work {
@@ -719,17 +718,14 @@ pub fn dedup_and_sessionize(
     candidates: Candidates,
     width: usize,
 ) -> (Vec<crate::aggregate::SessionBatch>, usize) {
-    let losses: Vec<_> = (0..SHARDS)
-        .into_par_iter()
-        .map(|shard| {
+    let losses = crate::runtime::stage_map("event_dedup",(0..SHARDS).collect(),|shard| {
             let runs = candidates
                 .blocks
                 .iter()
                 .map(|(ids, _)| ids.run(shard))
                 .collect();
             losing_positions(runs, candidates.origin_seconds)
-        })
-        .collect();
+        });
     let mut people: Vec<_> = candidates
         .blocks
         .into_iter()
@@ -752,11 +748,8 @@ pub fn dedup_and_sessionize(
             by_person[position as usize % SHARDS].push((chunk, position as usize / SHARDS));
         }
     }
-    let events: Vec<_> = person_runs
-        .into_par_iter()
-        .zip(by_person)
-        .enumerate()
-        .map(|(shard, (mut fragments, losers))| {
+    let parts=person_runs.into_iter().zip(by_person).enumerate().collect();
+    let events = crate::runtime::stage_map("session_partitions",parts,|(shard, (mut fragments, losers))| {
             let size: usize = fragments
                 .iter()
                 .map(|run| run.prefix.len() + run.overflow.len())
@@ -859,8 +852,7 @@ pub fn dedup_and_sessionize(
             }
             output.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
             (crate::aggregate::sessionize(output), length)
-        })
-        .collect();
+        });
     let event_count = events.iter().map(|(_, count)| *count).sum();
     (
         events.into_iter().map(|(batch, _)| batch).collect(),
@@ -1059,10 +1051,8 @@ fn read_click_records<P: ClickPiece>(
     let epoch = window.start.saturating_sub(LOOKBACK);
     let chunks = chunks(&data.join("clicks"))?;
     let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
-    let pieces = crate::csv::work_groups(&chunks, 1, SHARDS * size_of::<P>())
-        .into_par_iter()
-        .enumerate()
-        .map_init(PersonCache::default, |people, (index, group)| {
+    let groups=crate::csv::work_groups(&chunks,1,SHARDS*size_of::<P>()).into_iter().enumerate().collect();
+    let pieces = crate::runtime::stage_map_init("decode_clicks",groups,1,PersonCache::default, |people, (index, group)| {
             let mut local = shards::<P>();
             let mut keys = ClickKeyChunk::new(index);
             let mut counts = [0usize; 6];
@@ -1109,7 +1099,7 @@ fn read_click_records<P: ClickPiece>(
             })?;
             Ok::<_, anyhow::Error>((local, keys, counts))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .into_iter().collect::<Result<Vec<_>>>()?;
     drop(chunks);
     let mut partitions = shards::<Vec<P>>();
     let mut keys = Vec::with_capacity(pieces.len());
@@ -1146,11 +1136,8 @@ fn read_click_records<P: ClickPiece>(
     }
     let width = users.person_slots_per_shard();
     let comparisons = std::sync::atomic::AtomicU64::new(0);
-    let clicks: Vec<Vec<Click>> = partitions
-        .into_par_iter()
-        .enumerate()
-        .map(|(shard, p)| order_clicks(p, width, shard, epoch, work.then_some(&comparisons)))
-        .collect();
+    let parts=partitions.into_iter().enumerate().collect();
+    let clicks = crate::runtime::stage_map("order_click_partitions",parts,|(shard,p)|order_clicks(p,width,shard,epoch,work.then_some(&comparisons)));
     if work {
         let mut scatter_rows = 0usize;
         let mut skipped_groups = 0usize;

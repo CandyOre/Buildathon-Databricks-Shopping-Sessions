@@ -606,8 +606,7 @@ fn event_winners(
     let bucket_header=size_of::<Vec<EventRow>>() * if plan.packed {2} else {1};
     let stripe_padding=if plan.slab {8*if plan.packed {size_of::<packed::ShortEvent>()} else {size_of::<EventRow>()} + size_of::<u32>()} else {0};
     let groups=crate::csv::work_groups(&plans,plan.chunks_per_task(plans.len()),plan.event_parts*(bucket_header+stripe_padding));
-    let chunks = groups.into_par_iter()
-        .map(|sources| {
+    let chunks = crate::runtime::stage_map("route_decode_events",groups,|sources| {
             let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.event_parts,plan));
             let mut sink = BucketWriter::new(if plan.input_pages {0} else {plan.event_parts}, plan.writes);
             let mut narrow = if plan.packed && !plan.input_pages {
@@ -665,7 +664,7 @@ fn event_winners(
             keys.stripe=stripe;
             Ok::<_, anyhow::Error>((sink.finish(), narrow, pages.map(NativeWriters::finish).unwrap_or_default(),keys, data, valid_count))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .into_iter().collect::<Result<Vec<_>>>()?;
     drop(other_ids);
     let exchange_start=Instant::now();
 
@@ -718,10 +717,7 @@ fn event_winners(
     }
     let winner_start=Instant::now();
     work.exchange_time=winner_start.duration_since(exchange_start);
-    let results = pieces
-        .into_par_iter()
-        .with_min_len(4)
-        .map_init(Scratch::default, |scratch, pieces| {
+    let results = crate::runtime::stage_map_init("route_event_dedup",pieces,4,Scratch::default, |scratch, pieces| {
             if !plan.reuse {
                 *scratch = Scratch::default();
             }
@@ -809,8 +805,7 @@ fn event_winners(
                 route(c);
             }
             (output, count, disputed, duplicate, linear.probes)
-        })
-        .collect::<Vec<_>>();
+        });
     drop(keys);
     let mut partitions: Vec<Pieces<WinnerRow>> = empty_buckets(plan.user_parts);
     let mut count = 0;
@@ -873,9 +868,8 @@ fn raw_clicks(
     let sources = chunks(&data.join("clicks"))?;
     let metadata=plan.user_parts*size_of::<Vec<RawClick>>() * if plan.packed {2} else {1};
     let groups=crate::csv::work_groups(&sources,plan.chunks_per_task(sources.len()),metadata);
-    let pieces = groups.into_par_iter()
-        .enumerate()
-        .map(|(i, sources)| {
+    let groups=groups.into_iter().enumerate().collect();
+    let pieces = crate::runtime::stage_map("route_decode_clicks",groups,|(i, sources)| {
             let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.user_parts,plan));
             let mut output: Pieces<RawClick> = if plan.input_pages { Vec::new() } else {empty_buckets(plan.user_parts)};
             let mut narrow = if plan.packed && !plan.input_pages {
@@ -931,7 +925,7 @@ fn raw_clicks(
             }
             Ok::<_, anyhow::Error>((output, narrow, pages.map(NativeWriters::finish).unwrap_or_default(),users, ids))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .into_iter().collect::<Result<Vec<_>>>()?;
     let mut partitions: Vec<Vec<ClickBlock>> = empty_buckets(plan.user_parts);
     let mut users = Vec::with_capacity(pieces.len());
     let mut ids = Vec::with_capacity(pieces.len());
@@ -1460,10 +1454,8 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     } else {
         0
     };
-    let results = events
-        .into_par_iter()
-        .zip(clicks)
-        .map(|(e, c)| {
+    let partitions=events.into_iter().zip(clicks).collect();
+    let results = crate::runtime::stage_map("route_first_pass",partitions,|(e, c)| {
             let mut result=first_pass(
                 e,
                 c,
@@ -1478,8 +1470,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             );
             if let Some(acc)=&fused {acc.consume(&mut result.local.0,&mut result.local.1,&ids);}
             result
-        })
-        .collect::<Vec<_>>();
+        });
     drop(other);
     drop(aliases);
     drop(click_users);
@@ -1504,15 +1495,12 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         }
     }
     let p2_start = Instant::now();
-    let rest = later
-        .into_par_iter()
-        .filter(|p| !p.is_empty())
-        .map(|p| {
+    let later=later.into_iter().filter(|p| !p.is_empty()).collect();
+    let rest = crate::runtime::stage_map("route_second_pass",later,|p| {
             let (mut batch,mut clicks)=forward::finish(p,&payloads,window,plan);
             if let Some(acc)=&fused {acc.consume(&mut batch,&mut clicks,&ids);}
             (batch,clicks)
-        })
-        .collect::<Vec<_>>();
+        });
     for (s, c) in rest {
         sessions.push(s);
         click_lists.push(c);

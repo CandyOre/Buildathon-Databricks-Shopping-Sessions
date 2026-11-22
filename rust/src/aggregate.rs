@@ -992,7 +992,7 @@ pub(crate) struct FusedCampaigns {
 impl FusedCampaigns {
     pub fn new(campaigns:usize,window:crate::input::Window)->Self {
         Self {
-            workers:(0..rayon::current_num_threads()).map(|_|std::sync::Mutex::new(None)).collect(),
+            workers:(0..crate::runtime::worker_slots()).map(|_|std::sync::Mutex::new(None)).collect(),
             campaigns,window,work:crate::records::work_enabled(),
         }
     }
@@ -1000,7 +1000,7 @@ impl FusedCampaigns {
         let sessions=std::mem::take(&mut batch.sessions);
         let mut clicks=std::mem::take(clicks);
         if sessions.is_empty(){return;}
-        let index=rayon::current_thread_index().unwrap_or(0);
+        let index=crate::runtime::worker_slot().unwrap_or(0)%self.workers.len();
         let mut worker=self.workers[index].lock().unwrap();
         let (totals,scratch)=worker.get_or_insert_with(||(
             Counters::new(self.campaigns,self.window),
