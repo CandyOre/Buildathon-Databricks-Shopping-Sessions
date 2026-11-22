@@ -161,3 +161,21 @@ impl<T: Copy> Drop for Pages<T> {
             .extend(self.pieces.drain(..).map(|(key, _, _)| key));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn released_pages_can_hold_other_records_without_touching_live_ranges() {
+        let arena = Arena::new(true);
+        let live = arena.pack(0..4000u32);
+        let old = arena.pack((0..10000u64).map(|n| [n; 2]));
+        assert_eq!(old.iter().last(), Some([9999; 2]));
+        drop(old);
+        let next = arena.pack((0..10000u64).map(|n| [n; 3]));
+        assert!(arena.stats.reused.load(Ordering::Relaxed) > 0);
+        assert!(next.iter().enumerate().all(|(i, row)| row == [i as u64; 3]));
+        assert!(live.iter().eq(0..4000u32));
+    }
+}

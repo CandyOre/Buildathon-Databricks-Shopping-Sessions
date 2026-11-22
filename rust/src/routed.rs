@@ -1,6 +1,7 @@
 //! Resolve identity once per raw spelling, after event-ID winner selection.
 //! A connected component can have aliases in several raw partitions, so every
 //! member of such a component (including its representative) is forwarded.
+mod packed;
 mod storage;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,10 +39,23 @@ fn hash(handle: u64) -> u32 {
 // Compact handles contain the actual suffix. A wide handle addresses its
 // chunk-local, full 128-bit key; the upper 30 hash bits are only a routing hint.
 #[inline]
-fn encode(bytes: &[u8], prefix: u8, wide: &mut Vec<[u64; 2]>, fallback: &Names) -> u64 {
+fn encode(
+    bytes: &[u8],
+    prefix: u8,
+    wide: &mut Vec<[u64; 2]>,
+    fallback: &Names,
+    numeric: bool,
+) -> u64 {
     if bytes.first() == Some(&prefix) {
         let tail = &bytes[1..];
-        if tail.len() <= 8 && tail.first().copied().unwrap_or(0) < 128 && tail.last() != Some(&0) {
+        if numeric && tail.len() <= 8 {
+            if let Some(n) = packed::number(tail) {
+                return n;
+            }
+        } else if tail.len() <= 8
+            && tail.first().copied().unwrap_or(0) < 128
+            && tail.last() != Some(&0)
+        {
             let word = if let Ok(full) = <&[u8; 8]>::try_from(tail) {
                 u64::from_be_bytes(*full)
             } else {
@@ -66,12 +80,17 @@ fn user_bytes<'a>(
     wide: &[[u64; 2]],
     other: &'a [Vec<Arc<str>>],
     buffer: &'a mut [u8; 33],
+    numeric: bool,
 ) -> &'a [u8] {
     if handle >= OTHER {
         return input::name_for(other, handle as u32).as_bytes();
     }
     buffer[0] = b'u';
     if handle < WIDE {
+        if numeric {
+            let len = packed::write_number(handle, (&mut buffer[1..9]).try_into().unwrap());
+            return &buffer[..len + 1];
+        }
         buffer[1..9].copy_from_slice(&handle.to_be_bytes());
         return &buffer[..9 - (handle.trailing_zeros() / 8) as usize];
     }
@@ -271,6 +290,7 @@ struct Work {
     repeated_rows: usize,
     real_duplicates: usize,
     linear_probes: usize,
+    packed_events: usize,
 }
 
 struct Winners {
@@ -310,6 +330,7 @@ struct Plan {
     factor: usize,
     arena: bool,
     reuse: bool,
+    packed: bool,
 }
 
 impl Plan {
@@ -331,6 +352,7 @@ impl Plan {
             factor: config_size("PERF_ROUTE_BITMAP_FACTOR", 8)?,
             arena: switch("PERF_ROUTE_ARENA", "0") == "1",
             reuse: switch("PERF_ROUTE_REUSE", "1") != "0",
+            packed: switch("PERF_ROUTE_PACK", "0") == "1",
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
             p1: switch("PERF_ROUTE_P1", "1") != "0",
             early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
@@ -414,19 +436,43 @@ struct Scratch {
     wide: AHashMap<[u64; 2], Candidate>,
 }
 
+struct Fragment {
+    chunk: u32,
+    full: Vec<EventRow>,
+    short: Vec<packed::ShortEvent>,
+}
+
+impl Fragment {
+    fn len(&self) -> usize {
+        self.full.len() + self.short.len()
+    }
+    fn rows<'a>(
+        &'a self,
+        keys: &'a [EventKeys],
+        payloads: &'a [EventData],
+    ) -> impl Iterator<Item = Candidate> + 'a {
+        let chunk = self.chunk;
+        let k = &keys[chunk as usize];
+        let p = &payloads[chunk as usize];
+        self.full
+            .iter()
+            .copied()
+            .chain(self.short.iter().map(move |&s| s.unpack(k, p)))
+            .map(move |row| Candidate { row, chunk })
+    }
+}
+
 enum Rows {
-    Fragments(Vec<(u32, Vec<EventRow>)>),
+    Fragments(Vec<Fragment>),
     Pages(storage::Pages<Candidate>),
 }
 
 impl Rows {
-    fn visit(&self, mut emit: impl FnMut(Candidate)) {
+    fn visit(&self, keys: &[EventKeys], payloads: &[EventData], mut emit: impl FnMut(Candidate)) {
         match self {
             Self::Fragments(p) => {
-                for (chunk, rows) in p {
-                    for &row in rows {
-                        emit(Candidate { row, chunk: *chunk });
-                    }
+                for part in p {
+                    part.rows(keys, payloads).for_each(&mut emit);
                 }
             }
             Self::Pages(p) => p.iter().for_each(emit),
@@ -449,15 +495,20 @@ fn event_winners(
         .into_par_iter()
         .map(|chunk| {
             let mut sink = BucketWriter::new(plan.event_parts, plan.writes);
+            let mut narrow = if plan.packed {
+                empty_buckets(plan.event_parts)
+            } else {
+                Vec::new()
+            };
             let (mut keys, mut data) = (EventKeys::default(), EventData::default());
             let mut valid_count = 0;
             chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
-                let key = encode(id, b'e', &mut keys.wide, &other_ids);
+                let key = encode(id, b'e', &mut keys.wide, &other_ids, plan.packed);
                 let (user, stamp) = match valid {
                     Some((time, sale)) => {
                         valid_count += 1;
                         (
-                            encode(user, b'u', &mut data.users, raw_users),
+                            encode(user, b'u', &mut data.users, raw_users, plan.packed),
                             data.stamp(window.start, time, sale),
                         )
                     }
@@ -469,18 +520,25 @@ fn event_winners(
                     stamp,
                     ingest: keys.ingest(base, ingest),
                 };
-                sink.push(hash(key) as usize & (plan.event_parts - 1), row);
+                let bucket = hash(key) as usize & (plan.event_parts - 1);
+                if plan.packed {
+                    if let Some(s) = packed::ShortEvent::pack(row) {
+                        narrow[bucket].push(s);
+                        return;
+                    }
+                }
+                sink.push(bucket, row);
             })?;
-            Ok::<_, anyhow::Error>((sink.finish(), keys, data, valid_count))
+            Ok::<_, anyhow::Error>((sink.finish(), narrow, keys, data, valid_count))
         })
         .collect::<Result<Vec<_>>>()?;
     drop(other_ids);
 
-    let mut pieces: Vec<Vec<(u32, Vec<EventRow>)>> = empty_buckets(plan.event_parts);
+    let mut pieces: Vec<Vec<Fragment>> = empty_buckets(plan.event_parts);
     let mut keys = Vec::with_capacity(chunks.len());
     let mut payloads = Vec::with_capacity(chunks.len());
     let mut work = Work::default();
-    for (i, (buckets, k, p, valid)) in chunks.into_iter().enumerate() {
+    for (i, (buckets, narrow, k, p, valid)) in chunks.into_iter().enumerate() {
         let chunk = u32::try_from(i)?;
         work.valid += valid;
         work.wide_events += k.wide.len();
@@ -489,18 +547,22 @@ fn event_winners(
         work.side_rows += p.extra.len();
         keys.push(k);
         payloads.push(p);
-        for (dest, bucket) in pieces.iter_mut().zip(buckets) {
-            work.parsed += bucket.len();
-            work.event_capacity += bucket.capacity();
-            if !bucket.is_empty() {
-                dest.push((chunk, bucket));
+        let mut narrow = narrow.into_iter();
+        for (dest, full) in pieces.iter_mut().zip(buckets) {
+            let short = narrow.next().unwrap_or_default();
+            work.parsed += full.len() + short.len();
+            work.packed_events += short.len();
+            work.event_capacity += full.capacity() * size_of::<EventRow>()
+                + short.capacity() * size_of::<packed::ShortEvent>();
+            if !(full.is_empty() && short.is_empty()) {
+                dest.push(Fragment { chunk, full, short });
             }
         }
     }
     if plan.profile {
         let mut sizes: Vec<usize> = pieces
             .iter()
-            .map(|p| p.iter().map(|(_, b)| b.len()).sum())
+            .map(|p| p.iter().map(Fragment::len).sum())
             .collect();
         sizes.sort_unstable();
         work.nonempty_event_buckets = sizes.iter().filter(|&&n| n > 0).count();
@@ -514,12 +576,10 @@ fn event_winners(
             if !plan.reuse {
                 *scratch = Scratch::default();
             }
-            let n: usize = pieces.iter().map(|(_, b)| b.len()).sum();
+            let n: usize = pieces.iter().map(Fragment::len).sum();
             let slots = (n.saturating_mul(plan.factor)).max(64).next_power_of_two();
             let rows = if plan.arena {
-                let all = pieces.into_iter().flat_map(|(chunk, rows)| {
-                    rows.into_iter().map(move |row| Candidate { row, chunk })
-                });
+                let all = pieces.iter().flat_map(|p| p.rows(&keys, &payloads));
                 Rows::Pages(arena.pack(all))
             } else {
                 Rows::Fragments(pieces)
@@ -540,7 +600,7 @@ fn event_winners(
                 repeated.resize(slots / 64, 0u64);
                 crate::runtime::huge_pages(seen);
                 crate::runtime::huge_pages(repeated);
-                rows.visit(|c| {
+                rows.visit(&keys, &payloads, |c| {
                     let i = slot(c.row.id);
                     let bit = 1u64 << (i % 64);
                     repeated[i / 64] |= seen[i / 64] & bit;
@@ -561,7 +621,7 @@ fn event_winners(
                     count += 1;
                 }
             };
-            rows.visit(|c| {
+            rows.visit(&keys, &payloads, |c| {
                 let row = c.row;
                 let meta = &keys[c.chunk as usize];
                 let i = slot(row.id);
@@ -621,8 +681,14 @@ fn event_winners(
     })
 }
 
+struct ClickBlock {
+    chunk: u32,
+    full: Vec<RawClick>,
+    short: Vec<packed::ShortClick>,
+}
+
 struct ClickInput {
-    partitions: Vec<Pieces<RawClick>>,
+    partitions: Vec<Vec<ClickBlock>>,
     users: Vec<Vec<[u64; 2]>>,
     ids: ClickIds,
 }
@@ -641,13 +707,45 @@ fn raw_clicks(
         .enumerate()
         .map(|(i, chunk)| {
             let mut output: Pieces<RawClick> = empty_buckets(plan.user_parts);
+            let mut narrow = if plan.packed {
+                empty_buckets(plan.user_parts)
+            } else {
+                Vec::new()
+            };
             let mut users = Vec::new();
             let mut ids = ClickKeyChunk::new(i);
             let chunk_id = u32::try_from(i)?;
             chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
-                let user = encode(user, b'u', &mut users, raw_users);
-                let id = ids.encode(id, &fallback);
-                output[hash(user) as usize & (plan.user_parts - 1)].push(RawClick {
+                let user = encode(user, b'u', &mut users, raw_users, plan.packed);
+                let part = hash(user) as usize & (plan.user_parts - 1);
+                let mut encoded = None;
+                if plan.packed {
+                    let code = if id.len() == 33 {
+                        let handle = ids.encode(id, &fallback);
+                        encoded = Some(handle);
+                        (handle >= crate::records::HEX_CLICK)
+                            .then_some(packed::ShortClick::WIDE_SLOT | u64::from(handle as u32))
+                    } else {
+                        id.strip_prefix(b"k")
+                            .and_then(packed::number)
+                            .filter(|n| *n < packed::ShortClick::WIDE_SLOT)
+                    };
+                    let compact = code.and_then(|click| {
+                        packed::ShortClick::pack(
+                            user,
+                            click,
+                            time,
+                            window.start.saturating_sub(input::LOOKBACK),
+                            campaign,
+                        )
+                    });
+                    if let Some(c) = compact {
+                        narrow[part].push(c);
+                        return;
+                    }
+                }
+                let id = encoded.unwrap_or_else(|| ids.encode(id, &fallback));
+                output[part].push(RawClick {
                     user,
                     time,
                     id,
@@ -655,18 +753,24 @@ fn raw_clicks(
                     chunk: chunk_id,
                 });
             })?;
-            Ok::<_, anyhow::Error>((output, users, ids))
+            Ok::<_, anyhow::Error>((output, narrow, users, ids))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut partitions: Vec<Pieces<RawClick>> = empty_buckets(plan.user_parts);
+    let mut partitions: Vec<Vec<ClickBlock>> = empty_buckets(plan.user_parts);
     let mut users = Vec::with_capacity(pieces.len());
     let mut ids = Vec::with_capacity(pieces.len());
-    for (out, u, k) in pieces {
+    for (i, (out, narrow, u, k)) in pieces.into_iter().enumerate() {
         users.push(u);
         ids.push(k);
-        for (dest, rows) in partitions.iter_mut().zip(out) {
-            if !rows.is_empty() {
-                dest.push(rows);
+        let mut narrow = narrow.into_iter();
+        for (dest, full) in partitions.iter_mut().zip(out) {
+            let short = narrow.next().unwrap_or_default();
+            if !(full.is_empty() && short.is_empty()) {
+                dest.push(ClickBlock {
+                    chunk: i as u32,
+                    full,
+                    short,
+                });
             }
         }
     }
@@ -868,6 +972,7 @@ struct Resolver<'a> {
     aliases: &'a Aliases,
     cache: PersonCache,
     p1: bool,
+    numeric: bool,
 }
 
 impl Resolver<'_> {
@@ -877,7 +982,7 @@ impl Resolver<'_> {
             ($map:expr, $key:expr) => {
                 *$map.entry($key).or_insert_with(|| {
                     let mut buf = [0u8; 33];
-                    let s = user_bytes(user, wide, self.names, &mut buf);
+                    let s = user_bytes(user, wide, self.names, &mut buf, self.numeric);
                     let q = self.cache.prepare(self.people, self.aliases, s);
                     let person = self.cache.prepared(q, self.people, self.aliases, s);
                     if self.p1 && !self.aliases.is_linked_person(person) {
@@ -907,7 +1012,7 @@ struct P1 {
 #[allow(clippy::too_many_arguments)]
 fn first_pass(
     events: Pieces<WinnerRow>,
-    clicks: Pieces<RawClick>,
+    clicks: Vec<ClickBlock>,
     data: &[EventData],
     click_users: &[Vec<[u64; 2]>],
     other: &[Vec<Arc<str>>],
@@ -926,6 +1031,7 @@ fn first_pass(
         aliases,
         cache: PersonCache::default(),
         p1: plan.p1,
+        numeric: plan.packed,
     };
     let mut local = People::default();
     let mut forwarded = AHashMap::<usize, Forward>::default();
@@ -968,13 +1074,21 @@ fn first_pass(
                 .push(row),
         }
     };
+    let base = window.start.saturating_sub(input::LOOKBACK);
+    let decoded = clicks.into_iter().flat_map(|block| {
+        let chunk = block.chunk;
+        let wide = &click_users[chunk as usize];
+        block.full.into_iter().chain(
+            block
+                .short
+                .into_iter()
+                .map(move |s| s.unpack(chunk, base, wide)),
+        )
+    });
     if plan.arena {
-        arena
-            .pack(clicks.into_iter().flatten())
-            .iter()
-            .for_each(accept_click);
+        arena.pack(decoded).iter().for_each(accept_click);
     } else {
-        clicks.into_iter().flatten().for_each(&mut accept_click);
+        decoded.for_each(&mut accept_click);
     }
     let spells = ids.compact.len() + ids.wide.len();
     let direct = local.groups.len();
@@ -1062,10 +1176,15 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         ids,
     } = clicks;
     let p1_start = Instant::now();
-    let click_count: usize = if plan.profile {
-        clicks.iter().flatten().map(Vec::len).sum()
+    let (click_count, packed_clicks) = if plan.profile {
+        clicks
+            .iter()
+            .flatten()
+            .fold((0usize, 0usize), |(total, small), c| {
+                (total + c.full.len() + c.short.len(), small + c.short.len())
+            })
     } else {
-        0
+        (0, 0)
     };
     let click_wide: usize = if plan.profile {
         click_users.iter().map(Vec::len).sum()
@@ -1125,7 +1244,8 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         let storage = serde_json::json!({
             "stage":"route_storage","exact_duplicate_rows":work.real_duplicates,"linear_probes":work.linear_probes,
             "arena_2mib_regions":arena.stats.regions.load(Relaxed),"arena_pages_claimed":arena.stats.pages.load(Relaxed),
-            "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor
+            "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor,
+            "packed_events":work.packed_events,"packed_clicks":packed_clicks
         });
         eprintln!("profile {storage}");
         let v = serde_json::json!({
@@ -1139,14 +1259,76 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "median_event_bucket":work.median_event_bucket,"event_candidates":work.parsed,"valid_before_dedup":work.valid,
             "repeated_bucket_rows":work.repeated_rows,"valid_winners":count,"valid_clicks":click_count,
             "identity_queries":spells,"p1_complete_raw_groups":direct,"p2_raw_groups":spells-direct,
-            "candidate_bytes":work.parsed*size_of::<EventRow>(),"candidate_capacity_bytes":work.event_capacity*size_of::<EventRow>(),
+            "candidate_bytes":(work.parsed-work.packed_events)*size_of::<EventRow>()+work.packed_events*16,"candidate_capacity_bytes":work.event_capacity,
             "wide_event_key_bytes":work.wide_events*16,"wide_raw_user_bytes":(work.wide_users+click_wide)*16,
             "event_payload_side_bytes":work.side_rows*size_of::<(i64,Option<Purchase>)>(),
             "ingest_side_bytes":work.ingest_side*8,"winner_route_bytes":count*size_of::<WinnerRow>(),
-            "click_route_bytes":click_count*size_of::<RawClick>(),"forwarded_events":forwarded_events,
+            "click_route_bytes":(click_count-packed_clicks)*size_of::<RawClick>()+packed_clicks*16,"forwarded_events":forwarded_events,
             "forwarded_clicks":forwarded_clicks,"forwarded_bytes":forwarded_events*size_of::<PersonEvent>()+forwarded_clicks*size_of::<Click>(),
         });
         eprintln!("profile {v}");
     }
     Ok((sessions, click_lists, ids, users.into_people(), count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colliding_wide_keys_and_the_zero_short_handle_keep_separate_winners() {
+        let mut keys = vec![EventKeys::default(), EventKeys::default()];
+        let mut table = ExactTable::default();
+        let dict = Names::default();
+        let mut mk = |chunk: usize, raw: &[u8], stamp: u32| Candidate {
+            row: EventRow {
+                id: encode(raw, b'e', &mut keys[chunk].wide, &dict, true),
+                user: 0,
+                ingest: 0,
+                stamp,
+            },
+            chunk: chunk as u32,
+        };
+        let short = mk(0, b"e", 1);
+        let a = mk(0, b"e00000000000000000000000000000000", 2);
+        let b = mk(0, b"e00000000008000000000000000000001", 3);
+        let again = mk(1, b"e00000000000000000000000000000000", 4);
+        assert_eq!(hash(short.row.id), hash(a.row.id));
+        assert_eq!(hash(a.row.id), hash(b.row.id));
+        for c in [short, a, b, again] {
+            table.insert(c, &keys);
+        }
+        assert_eq!(table.entries.len(), 3);
+        assert_eq!(table.insert(again, &keys).row.stamp, 2);
+    }
+
+    #[test]
+    fn raw_user_keys_expand_to_the_exact_quoted_field_contents() {
+        let spellings = [
+            b"u".as_slice(),
+            b"u0",
+            b"u00",
+            b"uAB",
+            b"u0000000a",
+            b"u123456789",
+            b"u00000000000000000000000000000000",
+            b"u0000000000000000000000000000000a",
+            b"u0000000000000000000000000000000A",
+            b"U0",
+            b"uA\0B",
+            b"uB\0",
+        ];
+        for numeric in [false, true] {
+            let dict = Names::default();
+            let mut wide = Vec::new();
+            let handles = spellings.map(|s| encode(s, b'u', &mut wide, &dict, numeric));
+            let names = dict.into_names();
+            for (raw, handle) in spellings.into_iter().zip(handles) {
+                assert_eq!(
+                    user_bytes(handle, &wide, &names, &mut [0; 33], numeric),
+                    raw
+                );
+            }
+        }
+    }
 }
