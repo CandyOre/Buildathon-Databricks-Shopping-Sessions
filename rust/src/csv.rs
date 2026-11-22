@@ -11,6 +11,9 @@ use crate::records::Purchase;
 
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
+#[path = "structural.rs"]
+mod structural;
+
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "x86_64")]
     if (32..=128).contains(&line.len())
@@ -737,6 +740,9 @@ impl Chunk {
     }
 
     pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
+        if structural::enabled::<N>() {
+            return self.spans(|span| structural::scan::<N>(span,&mut row));
+        }
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2")
             && std::is_x86_feature_detected!("bmi1")
@@ -969,20 +975,25 @@ fn parsed_groups<'a, const N: usize>(
 ) {
     let mut rows = [[&[][..]; N]; MAX_BATCH];
     let mut len = 0;
-    each_line(span, &mut |line| {
-        if let Some(parts) = fields::<N>(line) {
-            // A structurally valid event or click with empty ID is discarded
-            // before any validity checks or deduplication.
-            if !parts[0].is_empty() {
-                rows[len] = parts;
-                len += 1;
-                if len == size {
-                    visit(&rows[..len]);
-                    len = 0;
-                }
+    let mut accept = |parts: [&'a [u8]; N]| {
+        // A structurally valid event or click with empty ID is discarded
+        // before any validity checks or deduplication.
+        if !parts[0].is_empty() {
+            rows[len] = parts;
+            len += 1;
+            if len == size {
+                visit(&rows[..len]);
+                len = 0;
             }
         }
-    });
+    };
+    if structural::enabled::<N>() {
+        structural::scan::<N>(span,&mut accept);
+    } else {
+        each_line(span,&mut |line| {
+            if let Some(parts) = fields::<N>(line) { accept(parts); }
+        });
+    }
     if len != 0 { visit(&rows[..len]); }
 }
 
