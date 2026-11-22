@@ -36,6 +36,60 @@ fn id_for(id: &[u8], prefix: u8, fallback: &Names) -> u64 {
     EXTERNAL_ID | u64::from(fallback.intern(text(id)))
 }
 
+const HEX_DIGITS: [u8; 256] = {
+    let mut digits = [0x80; 256];
+    let mut n = 0;
+    while n < 16 {
+        let byte = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+        digits[byte as usize] = n;
+        n += 1;
+    }
+    digits
+};
+
+fn hex_event_id(id: &[u8]) -> Option<[u64; 2]> {
+    let digits: &[u8; 32] = id.strip_prefix(b"e")?.try_into().ok()?;
+    let mut bytes = [0u8; 16];
+    let mut invalid = 0;
+    for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+        let hi = HEX_DIGITS[pair[0] as usize];
+        let lo = HEX_DIGITS[pair[1] as usize];
+        invalid |= hi | lo;
+        *byte = (hi << 4) | lo;
+    }
+    if invalid & 0x80 != 0 {
+        return None;
+    }
+    Some([
+        u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+    ])
+}
+
+enum EventId {
+    Compact(u64),
+    Hex([u64; 2]),
+}
+
+impl EventId {
+    fn parse(id: &[u8], fallback: &Names) -> Self {
+        if id.len() == 33 {
+            if let Some(key) = hex_event_id(id) {
+                return Self::Hex(key);
+            }
+        }
+        // The compact ID's mixing steps are bijections, so the resulting word
+        // still suffices for exact equality.
+        Self::Compact(mix_event_word(id_for(id, b'e', fallback)))
+    }
+}
+
+#[inline]
+fn mix_event_word(word: u64) -> u64 {
+    let mixed = (word ^ (word >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed ^ (mixed >> 31)
+}
+
 pub struct ClickIds(Vec<Vec<Arc<str>>>);
 
 impl ClickIds {
@@ -82,6 +136,8 @@ const QUOTIENT_HIGH_MASK: u32 = (1 << QUOTIENT_HIGH_BITS) - 1;
 const POSITION_BITS: u32 = 18;
 const POSITION_MASK: u32 = (1 << POSITION_BITS) - 1;
 const EXCEPTIONAL: u64 = (1 << (32 + ID_SHARD_BITS)) - (1 << 22);
+// Each of the two reserved ranges can address every line in a 4 MiB chunk.
+const HEX_ENTRY: u64 = EXCEPTIONAL - (1 << 22);
 const _: () = assert!(SHARDS == 128);
 
 #[repr(C)]
@@ -175,12 +231,31 @@ impl<T: Copy> ShardSlab<T> {
 struct ChunkIds {
     rows: ShardSlab<EntryId>,
     exceptional: Vec<(i64, u32)>,
+    hex: Vec<HexEntry>,
+}
+
+struct HexEntry {
+    key: [u64; 2],
+    location: u64,
 }
 
 impl ChunkIds {
+    fn new(stride: usize) -> Self {
+        Self {
+            rows: ShardSlab::new(stride),
+            exceptional: Vec::new(),
+            hex: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     fn push(&mut self, id: u64, ingested: i64, position: u32, origin_seconds: i64) {
+        self.push_event(EventId::Compact(id), ingested, position, origin_seconds);
+    }
+
+    fn push_event(&mut self, id: EventId, ingested: i64, position: u32, origin_seconds: i64) {
         let seconds = (ingested.div_euclid(1000) - origin_seconds) as u64;
-        let code = if seconds < (EXCEPTIONAL >> POSITION_BITS)
+        let location = if seconds < (HEX_ENTRY >> POSITION_BITS)
             && (position < POSITION_MASK || position == u32::MAX)
         {
             (seconds << POSITION_BITS) | u64::from(position & POSITION_MASK)
@@ -191,6 +266,18 @@ impl ChunkIds {
             assert!(index < 1 << 22);
             self.exceptional.push((ingested, position));
             EXCEPTIONAL + index as u64
+        };
+        let (id, code) = match id {
+            EventId::Compact(word) => (word, location),
+            EventId::Hex(key) => {
+                // This folded hash selects a bucket only. Colliding candidates
+                // are compared on both complete words from this chunk's table.
+                let hash = mix_event_word(key[0] ^ key[1].rotate_left(23));
+                let index = self.hex.len();
+                assert!(index < 1 << 22);
+                self.hex.push(HexEntry { key, location });
+                (hash, HEX_ENTRY + index as u64)
+            }
         };
         let quotient = id >> ID_SHARD_BITS;
         let high_code = (quotient >> 32) as u32 | ((code >> 32) as u32) << QUOTIENT_HIGH_BITS;
@@ -210,6 +297,7 @@ impl ChunkIds {
             prefix,
             overflow,
             exceptional: &self.exceptional,
+            hex: &self.hex,
         }
     }
 }
@@ -218,6 +306,7 @@ struct IdRun<'a> {
     prefix: &'a [EntryId],
     overflow: &'a [EntryId],
     exceptional: &'a [(i64, u32)],
+    hex: &'a [HexEntry],
 }
 
 impl IdRun<'_> {
@@ -225,9 +314,19 @@ impl IdRun<'_> {
         self.prefix.iter().chain(self.overflow)
     }
 
-    #[inline]
+    #[cfg(test)]
     fn winner(&self, row: &EntryId, origin_seconds: i64, chunk: usize) -> (i64, usize, u32) {
         let code = row.code();
+        let location = if (HEX_ENTRY..EXCEPTIONAL).contains(&code) {
+            self.hex[(code - HEX_ENTRY) as usize].location
+        } else {
+            code
+        };
+        self.winner_at(location, origin_seconds, chunk)
+    }
+
+    #[inline]
+    fn winner_at(&self, code: u64, origin_seconds: i64, chunk: usize) -> (i64, usize, u32) {
         let (ingest, position) = if code < EXCEPTIONAL {
             let seconds = (code >> POSITION_BITS) as i64;
             let short = code as u32 & POSITION_MASK;
@@ -364,7 +463,7 @@ const PENDING_LOOKUPS: usize = 16;
 #[cfg(feature = "large-input")]
 struct WaitingEvent {
     query: input::Prepared,
-    event_id: u64,
+    event_id: EventId,
     ingest: i64,
     time: i64,
     purchase: Option<Purchase>,
@@ -386,10 +485,7 @@ pub fn read_events(
             // Approximate only the backing capacity. Arbitrary CSV lengths and
             // shard skew are handled by the exact per-shard continuation.
             let stride = chunk.byte_len().div_ceil(70 * SHARDS) + 8;
-            let mut id_rows = ChunkIds {
-                rows: ShardSlab::new(stride),
-                exceptional: Vec::new(),
-            };
+            let mut id_rows = ChunkIds::new(stride);
             let mut people_rows = ChunkPeople {
                 rows: ShardSlab::new(stride),
                 extra: Vec::new(),
@@ -405,7 +501,7 @@ pub fn read_events(
                           id_rows: &mut ChunkIds| {
                 let person = people.prepared(job.query, users, aliases, &[]);
                 let position = people_rows.push(person, job.time, job.purchase, window.start);
-                id_rows.push(job.event_id, job.ingest, position, origin_seconds);
+                id_rows.push_event(job.event_id, job.ingest, position, origin_seconds);
             };
             chunk.scan_parsed(|[id, user, ts, ingested, kind, product, price]| {
                 if id.is_empty() {
@@ -413,11 +509,7 @@ pub fn read_events(
                 }
                 let proposal = people.prepare(users, aliases, user);
                 let ingested = calendar.ingest(ingested);
-                let id = id_for(id, b'e', &ids);
-                // All three operations are bijective, including the multiplication
-                // by an odd number. Using the mixed value as the ID stays exact.
-                let mixed = (id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                let id = mixed ^ (mixed >> 31);
+                let id = EventId::parse(id, &ids);
                 #[allow(unused_mut)]
                 let mut valid = || {
                     if user.is_empty() || product.is_empty() {
@@ -491,7 +583,7 @@ pub fn read_events(
                 } else {
                     u32::MAX
                 };
-                id_rows.push(id, ingested, position, origin_seconds);
+                id_rows.push_event(id, ingested, position, origin_seconds);
             })?;
             #[cfg(feature = "large-input")]
             for job in waiting {
@@ -537,31 +629,44 @@ fn losing_positions(fragments: Vec<IdRun<'_>>, origin_seconds: i64) -> Vec<(usiz
 
     let mut losers = Vec::new();
     let mut winners = AHashMap::<u64, (i64, usize, u32)>::new();
+    let mut hex_winners = AHashMap::<[u64; 2], (i64, usize, u32)>::new();
     for (chunk, batch) in fragments.iter().enumerate() {
         for row in batch.rows() {
             let slot = bucket(row);
             if repeated[slot / 64] & (1_u64 << (slot % 64)) != 0 {
-                let current = batch.winner(row, origin_seconds, chunk);
-                let (_, old_chunk, old_row) = match winners.entry(row.quotient()) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(current);
-                        continue;
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if current.0 < entry.get().0 {
-                            entry.insert(current)
-                        } else {
-                            current
-                        }
-                    }
-                };
-                if old_row != u32::MAX {
-                    losers.push((old_chunk, old_row));
+                let code = row.code();
+                if (HEX_ENTRY..EXCEPTIONAL).contains(&code) {
+                    let entry = &batch.hex[(code - HEX_ENTRY) as usize];
+                    let current = batch.winner_at(entry.location, origin_seconds, chunk);
+                    keep_earliest(hex_winners.entry(entry.key), current, &mut losers);
+                } else {
+                    let current = batch.winner_at(code, origin_seconds, chunk);
+                    keep_earliest(winners.entry(row.quotient()), current, &mut losers);
                 }
             }
         }
     }
     losers
+}
+
+#[inline]
+fn keep_earliest<K>(
+    entry: std::collections::hash_map::Entry<'_, K, (i64, usize, u32)>,
+    current: (i64, usize, u32),
+    losers: &mut Vec<(usize, u32)>,
+) {
+    use std::collections::hash_map::Entry;
+    let (_, chunk, position) = match entry {
+        Entry::Vacant(entry) => {
+            entry.insert(current);
+            return;
+        }
+        Entry::Occupied(mut entry) if current.0 < entry.get().0 => entry.insert(current),
+        Entry::Occupied(_) => current,
+    };
+    if position != u32::MAX {
+        losers.push((chunk, position));
+    }
 }
 
 pub fn dedup_and_sessionize(
@@ -842,6 +947,45 @@ mod id_tests {
     use super::*;
 
     #[test]
+    fn canonical_hex_decodes_all_nibbles_and_rejects_every_other_spelling() {
+        let text = b"e0123456789abcdef0000000000000001";
+        assert_eq!(hex_event_id(text), Some([0x0123_4567_89ab_cdef, 1]));
+        assert_eq!(hex_event_id(&text[..32]), None);
+        assert_eq!(hex_event_id(b"e00123456789abcdef0000000000000001"), None);
+        let mut key = *text;
+        key[0] = b'E';
+        assert_eq!(hex_event_id(&key), None);
+        for index in 1..33 {
+            for byte in 0..=u8::MAX {
+                let mut key = *text;
+                key[index] = byte;
+                assert_eq!(
+                    hex_event_id(&key).is_some(),
+                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folded_hash_collisions_preserve_distinct_long_and_compact_keys() {
+        // All three keys produce exactly the same 64-bit shard/bucket word.
+        let a = [0, 0];
+        let b = [1 << 23, 1];
+        let mut blocks = [ChunkIds::new(1), ChunkIds::new(1)];
+        blocks[0].push_event(EventId::Hex(a), 2000, 10, 0);
+        blocks[0].push_event(EventId::Hex(b), 4000, 11, 0);
+        blocks[0].push_event(EventId::Compact(0), 3000, 12, 0);
+        // The invalid earliest copy of A suppresses the valid copy. B has
+        // an exceptional timestamp/position and must still be kept exactly.
+        blocks[1].push_event(EventId::Hex(a), 1000, u32::MAX, 0);
+        blocks[1].push_event(EventId::Hex(b), -1000, POSITION_MASK + 1, 0);
+        let mut losers = losing_positions(blocks.iter().map(|block| block.run(0)).collect(), 0);
+        losers.sort_unstable();
+        assert_eq!(losers, [(0, 10), (0, 11)]);
+    }
+
+    #[test]
     fn click_ids_distinguish_padding_and_preserve_mixed_byte_order() {
         let cases: &[&[u8]] = &[
             b"k",
@@ -964,10 +1108,7 @@ mod shard_slab_tests {
         let start = -1000;
         let locals = [15, 65533, 65534, 65535, 65536];
         let run = |compact_times| {
-            let mut ids = ChunkIds {
-                rows: ShardSlab::new(1),
-                exceptional: Vec::new(),
-            };
+            let mut ids = ChunkIds::new(1);
             let mut people = ChunkPeople {
                 rows: ShardSlab::new(1),
                 extra: Vec::new(),
@@ -1061,10 +1202,7 @@ mod shard_slab_tests {
     #[test]
     fn earliest_invalid_can_remove_rows_in_a_different_chunks_overflow() {
         let mut blocks: Vec<_> = (0..2)
-            .map(|_| ChunkIds {
-                rows: ShardSlab::new(1),
-                exceptional: Vec::new(),
-            })
+            .map(|_| ChunkIds::new(1))
             .collect();
         let shard = 7;
         let a = SHARDS as u64 + shard as u64;
@@ -1087,13 +1225,10 @@ mod packed_id_tests {
     #[test]
     fn quotient_and_location_round_trip_across_all_encoding_boundaries() {
         let origin = -86_400i64;
-        let inline_limit = (EXCEPTIONAL >> POSITION_BITS) as i64;
+        let inline_limit = (HEX_ENTRY >> POSITION_BITS) as i64;
         let keys = [0, 1, 127, 128, (1u64 << 39) - 1, 1 << 39, 1 << 63, u64::MAX];
         for id in keys {
-            let mut block = ChunkIds {
-                rows: ShardSlab::new(1),
-                exceptional: Vec::new(),
-            };
+            let mut block = ChunkIds::new(1);
             let mut expected = Vec::new();
             for offset in [
                 -1,
@@ -1131,10 +1266,7 @@ mod packed_id_tests {
     fn equal_low_words_distinct_quotients_ties_and_invalid_winners_match_full_ids() {
         let shard = 101usize;
         let mut blocks: Vec<_> = (0..5)
-            .map(|_| ChunkIds {
-                rows: ShardSlab::new(2),
-                exceptional: Vec::new(),
-            })
+            .map(|_| ChunkIds::new(2))
             .collect();
         let mut flat: Vec<Vec<(u64, i64, u32)>> = (0..blocks.len()).map(|_| Vec::new()).collect();
         for i in 0..1900usize {
