@@ -36,19 +36,28 @@ def build(work, tag, revision, arguments):
         build_args=arguments, archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest()),indent=2))
 
 
-def check(work):
-    ctx = work / "unit-context"
-    (ctx / "rust").mkdir(parents=True,exist_ok=True)
-    for name in ("Cargo.toml","Cargo.lock"):
-        shutil.copyfile(ROOT / "rust" / name,ctx / "rust" / name)
-    shutil.copytree(ROOT / "rust/src",ctx / "rust/src",dirs_exist_ok=True)
+def check(work, revision=None):
+    if revision:
+        sha = run("git","rev-parse",revision,text=True,capture_output=True).stdout.strip()
+        ctx = work / ("unit-"+sha[:12])
+        archive = ctx.with_suffix(".zip")
+        run("git","archive","--format=zip","-o",archive,sha,"rust/Cargo.toml","rust/Cargo.lock","rust/src")
+        with zipfile.ZipFile(archive) as files:
+            files.extractall(ctx)
+    else:
+        ctx = work / "unit-context"
+        (ctx / "rust").mkdir(parents=True,exist_ok=True)
+        for name in ("Cargo.toml","Cargo.lock"):
+            shutil.copyfile(ROOT / "rust" / name,ctx / "rust" / name)
+        shutil.copytree(ROOT / "rust/src",ctx / "rust/src",dirs_exist_ok=True)
     recipe = """FROM rust:1.85-slim-bookworm
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target,sharing=locked cargo clean --release -p shopping-sessions && cargo test --offline --locked --release && RUSTFLAGS="-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+aes" cargo test --release --locked --offline --features large-input
 """
-    with (work/"unit.log").open("w",encoding="utf8") as log:
+    log_path = ctx.with_suffix(".log") if revision else work/"unit.log"
+    with log_path.open("w",encoding="utf8") as log:
         run("docker","buildx","build","--platform","linux/amd64","--progress","plain","-f","-",ctx,
             input=recipe,text=True,stdout=log,stderr=subprocess.STDOUT)
 
@@ -85,7 +94,7 @@ def main():
     b.add_argument("tag")
     b.add_argument("revision")
     b.add_argument("--build-arg", action="append", default=[])
-    sub.add_parser("check")
+    sub.add_parser("check").add_argument("--revision")
     r = sub.add_parser("race")
     r.add_argument("volume")
     r.add_argument("name")
@@ -98,7 +107,7 @@ def main():
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     if args.action == "check":
-        check(work)
+        check(work,args.revision)
     elif args.action == "build":
         build(work,args.tag,args.revision,args.build_arg)
     else:

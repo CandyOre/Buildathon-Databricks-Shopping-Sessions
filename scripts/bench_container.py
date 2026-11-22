@@ -95,10 +95,16 @@ def main():
             result.check_returncode()
             container = json.loads(docker("inspect", run, capture=True))[0]
             state = container["State"]
+            config = container["HostConfig"]
+            limits = {k: config.get(k) for k in ("CpusetCpus","NanoCpus","Memory","MemorySwap","NetworkMode")}
+            expected = dict(CpusetCpus=args.cpuset,NanoCpus=8_000_000_000,Memory=24 << 30,
+                            MemorySwap=24 << 30,NetworkMode="none")
+            if limits != expected:
+                raise RuntimeError(f"Unexpected benchmark resources: {limits}")
             duration = (datetime.fromisoformat(state["FinishedAt"])
                         - datetime.fromisoformat(state["StartedAt"])).total_seconds()
             row = dict(image=image, image_id=container["Image"], dataset=args.dataset,
-                       volume=args.volume, cpuset=args.cpuset, started=state["StartedAt"],
+                       volume=args.volume, cpuset=args.cpuset, limits=limits, started=state["StartedAt"],
                        finished=state["FinishedAt"], seconds=duration, cli_seconds=host_wall,
                        profile=args.profile, output=output,
                        cache=args.cache, resident_input_bytes=resident_bytes, input_page_bytes=input_page_bytes,
