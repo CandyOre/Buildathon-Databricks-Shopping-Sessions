@@ -3,8 +3,10 @@ import argparse
 import json
 from pathlib import Path
 from statistics import median
+import tempfile
 
-from design_matrix import TRIALS, call, settings
+from confirm_design import export
+from design_matrix import TRIALS, call, compare, settings
 
 
 def main():
@@ -16,12 +18,33 @@ def main():
     parser.add_argument("--study", type=Path, default=Path(".buildathon/event-key-v5-a635381"))
     parser.add_argument("--settings", type=Path)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--verify-retained", action="store_true",
+                        help="validate previously timed B outputs on the study volume without rerunning the scorer")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("positive repeats required")
     if args.settings:
         TRIALS.update(json.loads(args.settings.read_text()))
     volume = (args.study / "volume").read_text().strip()
+    if args.verify_retained:
+        source=args.work/"pairs"/(args.case+".jsonl")
+        rows=[json.loads(s) for s in source.read_text().splitlines()]
+        dest=args.work/"checks"/args.case
+        dest.mkdir(parents=True,exist_ok=True)
+        for name in args.names:
+            matched=[r for r in rows if r["image"]==name+"-B" and r["image_ref"]==args.image and r["volume"]==volume]
+            if not matched:
+                raise ValueError(f"No retained candidate output for {name}")
+            with tempfile.TemporaryDirectory(dir=dest) as tmp:
+                tables=Path(tmp)/"tables"
+                export(volume,matched[-1],tables)
+                try:
+                    compare(tables,args.study/"tables"/args.case/"b")
+                finally:
+                    if tables.with_suffix(".sql.log").exists():
+                        tables.with_suffix(".sql.log").replace(dest/(name+".sql.log"))
+            print(name,args.case,"MATCH",flush=True)
+        return
     variants = {}
     order = []
     for n in range(args.repeats):

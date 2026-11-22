@@ -28,6 +28,7 @@ struct Session {
 
 #[derive(Default)]
 pub struct DailyColumns {
+    pub(crate) prepared_names: Option<crate::output::PreparedNames>,
     pub person: Vec<u32>,
     pub day: Vec<i32>,
     pub sessions: Vec<i64>,
@@ -37,6 +38,26 @@ pub struct DailyColumns {
 }
 
 impl DailyColumns {
+    fn for_people(names: Option<&crate::input::Names>) -> Self {
+        Self {
+            prepared_names: names.map(|_| Default::default()),
+            ..Self::default()
+        }
+    }
+
+    fn finish_person(&mut self, person: u32, names: Option<&crate::input::Names>) {
+        if let (Some(names), Some(dictionary)) = (names, self.prepared_names.as_mut()) {
+            let end = self.person.len();
+            if names
+                .with_spelling(person, |s| dictionary.push_run(end, s))
+                .is_err()
+            {
+                // The ordinary writer reports the checked Parquet length error.
+                self.prepared_names = None;
+            }
+        }
+    }
+
     fn push(&mut self, row: UserDay) {
         self.person.push(row.person);
         self.day.push(row.day);
@@ -66,8 +87,8 @@ struct SessionWork {
     single_purchase_groups: usize,
 }
 
-pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
-    let mut daily = DailyColumns::default();
+pub fn sessionize(batch: Batch<Event>, names: Option<&crate::input::Names>) -> SessionBatch {
+    let mut daily = DailyColumns::for_people(names);
     let mut sessions: Vec<Session> = Vec::new();
     let mut categories = AHashMap::<u32, i64>::new();
     for events in batch.rows.chunk_by(|a, b| a.person == b.person) {
@@ -113,6 +134,7 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
             }
         }
         finish_day(current, &mut categories, &mut daily);
+        daily.finish_person(first.person, names);
     }
     SessionBatch {
         daily,
@@ -451,8 +473,9 @@ pub fn compact_sessions(
     times: &mut [u32],
     sales: &mut [(u32, crate::records::Purchase)],
     ends: Vec<(u32, u32)>,
+    names: Option<&crate::input::Names>,
 ) -> SessionBatch {
-    compact_for_people(start, times, sales, ends, |index| {
+    compact_for_people(start, times, sales, ends, names, |index| {
         (index * crate::input::SHARDS + shard) as u32
     })
 }
@@ -463,8 +486,9 @@ pub(crate) fn compact_named_sessions(
     sales: &mut [(u32, crate::records::Purchase)],
     ends: Vec<(u32, u32)>,
     people: &[u32],
+    names: Option<&crate::input::Names>,
 ) -> SessionBatch {
-    compact_for_people(start, times, sales, ends, |index| people[index])
+    compact_for_people(start, times, sales, ends, names, |index| people[index])
 }
 
 fn compact_for_people(
@@ -472,9 +496,10 @@ fn compact_for_people(
     times: &mut [u32],
     sales: &mut [(u32, crate::records::Purchase)],
     ends: Vec<(u32, u32)>,
+    names: Option<&crate::input::Names>,
     person_at: impl Fn(usize) -> u32,
 ) -> SessionBatch {
-    let mut daily = DailyColumns::default();
+    let mut daily = DailyColumns::for_people(names);
     let mut sessions = Vec::new();
     let mut starts_at = Vec::new();
     let mut time_bins = Vec::new();
@@ -597,6 +622,7 @@ fn compact_for_people(
         }
         row.top_category = category.top();
         daily.push(row);
+        daily.finish_person(person, names);
     }
     SessionBatch {
         daily,
@@ -697,6 +723,7 @@ struct AttributionWork {
     tie_comparisons: u64,
     cross_campaign_ties: u64,
     assist_campaigns_in_masks: u64,
+    large_simd_groups: u64,
 }
 
 impl AttributionWork {
@@ -709,6 +736,7 @@ impl AttributionWork {
         self.tie_comparisons += other.tie_comparisons;
         self.cross_campaign_ties += other.cross_campaign_ties;
         self.assist_campaigns_in_masks += other.assist_campaigns_in_masks;
+        self.large_simd_groups += other.large_simd_groups;
     }
 }
 
@@ -1075,7 +1103,8 @@ fn finish_campaigns(result: Option<LocalCampaigns>) -> CampaignDays {
                 "people_by_branch":stats.groups, "sessions_by_branch":stats.sessions,
                 "clicks_considered_by_branch":stats.clicks, "tie_comparisons":stats.tie_comparisons,
                 "cross_campaign_tie_comparisons":stats.cross_campaign_ties,
-                "mask_user_campaign_pairs":stats.assist_campaigns_in_masks
+                "mask_user_campaign_pairs":stats.assist_campaigns_in_masks,
+                "large_simd_groups":stats.large_simd_groups
             })
         );
     }
@@ -1318,19 +1347,29 @@ fn summarize_campaigns(
             continue;
         }
         scratch.record(2, sessions, person_clicks);
+        let days = if sessions.len() > 64 && large_assists_simd() {
+            DayCoverage::new(sessions)
+        } else {
+            None
+        };
+        if days.is_some() {
+            if let Some(work) = &mut scratch.work {
+                work.large_simd_groups += 1;
+            }
+        }
         let intervals = &mut scratch.intervals;
         for click in person_clicks {
             let interval = intervals
                 .entry(click.campaign)
                 .or_insert((click.time, click.time + LOOKBACK));
             if click.time > interval.1 {
-                assist(sessions, click.campaign, *interval, totals);
+                assist(sessions, click.campaign, *interval, totals, days.as_ref());
                 interval.0 = click.time;
             }
             interval.1 = click.time + LOOKBACK;
         }
         for (campaign, interval) in intervals.drain() {
-            assist(sessions, campaign, interval, totals);
+            assist(sessions, campaign, interval, totals, days.as_ref());
         }
     }
 }
@@ -1481,9 +1520,97 @@ fn credit(
     }
 }
 
-fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals: &mut Counters) {
+fn large_assists_simd() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("PERF_LARGE_ASSISTS").is_some_and(|v| v == "simd"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+// Day boundaries in the sorted session array. Reuse these for every merged
+// campaign interval of a person. Four AVX2 vectors cover at most 32 days.
+struct DayCoverage {
+    first_day: i32,
+    len: usize,
+    offsets: [i32; 33],
+}
+
+impl DayCoverage {
+    fn new(sessions: &[Session]) -> Option<Self> {
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return None;
+        }
+        let first_day = day(sessions.first()?.time);
+        let last_day = day(sessions.last()?.time);
+        let len = usize::try_from(i64::from(last_day) - i64::from(first_day) + 1).ok()?;
+        if len > 32 || sessions.len() > i32::MAX as usize {
+            return None;
+        }
+        // Padding with the end index makes every unused day cover zero rows.
+        let mut offsets = [sessions.len() as i32; 33];
+        offsets[0] = 0;
+        for i in 1..len {
+            let midnight = (i64::from(first_day) + i as i64) * DAY;
+            offsets[i] = sessions.partition_point(|s| s.time < midnight) as i32;
+        }
+        Some(Self {
+            first_day,
+            len,
+            offsets,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn add(&self, start: i32, end: i32, campaign: u32, totals: &mut Counters) {
+        use std::arch::x86_64::*;
+        // Intersect [start, end) with eight independent daily index ranges.
+        let first = _mm256_set1_epi32(start);
+        let last = _mm256_set1_epi32(end);
+        for i in (0..self.len).step_by(8) {
+            let mut counts = [0i32; 8];
+            unsafe {
+                let p = self.offsets.as_ptr().add(i);
+                let lo = _mm256_max_epi32(first, _mm256_loadu_si256(p.cast()));
+                let hi = _mm256_min_epi32(last, _mm256_loadu_si256(p.add(1).cast()));
+                _mm256_storeu_si256(counts.as_mut_ptr().cast(), _mm256_sub_epi32(hi, lo));
+            }
+            for (lane, count) in counts.into_iter().enumerate() {
+                if count > 0 {
+                    totals.add(
+                        campaign,
+                        self.first_day + (i + lane) as i32,
+                        CampaignDay::assists(i64::from(count)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assist(
+    sessions: &[Session],
+    campaign: u32,
+    (first, last): (i64, i64),
+    totals: &mut Counters,
+    days: Option<&DayCoverage>,
+) {
     let start = sessions.partition_point(|session| session.time < first);
     let end = sessions.partition_point(|session| session.time <= last);
+    #[cfg(target_arch = "x86_64")]
+    if let Some(days) = days {
+        if start < end {
+            // DayCoverage was selected only on a host with AVX2 and i32 offsets.
+            unsafe { days.add(start as i32, end as i32, campaign, totals) };
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = days;
     let mut covered = &sessions[start..end];
     // Count by day without materializing a row for each matching session/campaign.
     while let Some(session) = covered.first() {
@@ -1499,6 +1626,85 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
 mod mask_tests {
     use super::*;
     use crate::input::Names;
+
+    #[test]
+    fn large_day_vectors_match_scalar_across_empty_days_and_window_edges() {
+        let ids = ClickIds::new(Names::default(), vec![]);
+        for span in [6, 8, 9, 31, 32, 33, 80] {
+            let start_day = -19i64;
+            let sessions: Vec<_> = (0..span)
+                .filter(|&d| d == 0 || d + 1 == span || d % 4 != 1)
+                .flat_map(|d| {
+                    (0..20).map(move |h| Session {
+                        time: (start_day + d) * DAY + h * 3_600_000,
+                        person: 42,
+                        revenue: (d * 31 + h) % 5,
+                    })
+                })
+                .collect();
+            let first = sessions[0].time;
+            let last = sessions.last().unwrap().time;
+            let clicks: Vec<_> = [
+                (first - LOOKBACK - 1, 1),
+                (first - LOOKBACK, 2),
+                (first, 2),
+                (first + 4 * DAY, 4),
+                (last, 2),
+                (last, 3),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (time, campaign))| Click {
+                time,
+                campaign,
+                person: 42,
+                id: i as u64,
+            })
+            .collect();
+            let days = DayCoverage::new(&sessions);
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                days.is_some(),
+                span <= 32 && std::is_x86_feature_detected!("avx2")
+            );
+            let snapshot = |days| {
+                let mut totals = Counters::Sparse(Default::default());
+                credit(
+                    &sessions,
+                    &clicks,
+                    &ids,
+                    &mut totals,
+                    &mut AssistScratch::default(),
+                );
+                for (campaign, from, through) in [
+                    (1, first - LOOKBACK - 1, first - 1),
+                    (2, first - LOOKBACK, first + LOOKBACK),
+                    (4, first + 4 * DAY, first + 4 * DAY + LOOKBACK),
+                    (3, last, last + LOOKBACK),
+                    (5, last + 1, last + LOOKBACK),
+                    (6, first + DAY, first + DAY),
+                    (7, first - 1, last + 1),
+                ] {
+                    assist(&sessions, campaign, (from, through), &mut totals, days);
+                }
+                totals
+                    .entries()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            [
+                                v.sessions,
+                                v.purchasing_sessions,
+                                v.revenue,
+                                v.assisted_sessions,
+                            ],
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            assert_eq!(snapshot(days.as_ref()), snapshot(None));
+        }
+    }
 
     #[test]
     fn buffered_narrow_counters_widen_exactly_across_worker_merges() {
@@ -1768,8 +1974,8 @@ mod compact_session_tests {
             ends.push((times.len() as u32, sales.len() as u32));
         }
         expanded.rows.sort_unstable_by_key(|e| (e.person, e.time));
-        let expected = sessionize(expanded);
-        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends);
+        let expected = sessionize(expanded, None);
+        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends, None);
         assert_eq!(daily(&actual), daily(&expected));
         assert_eq!(sessions(&actual), sessions(&expected));
     }
@@ -1835,8 +2041,8 @@ mod compact_session_tests {
             ends.push((times.len() as u32, sales.len() as u32));
         }
         expanded.rows.sort_unstable_by_key(|e| (e.person, e.time));
-        let expected = sessionize(expanded);
-        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends);
+        let expected = sessionize(expanded, None);
+        let actual = compact_sessions(shard, start, &mut times, &mut sales, ends, None);
         assert_eq!(daily(&actual), daily(&expected));
         assert_eq!(sessions(&actual), sessions(&expected));
     }

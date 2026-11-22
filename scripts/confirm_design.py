@@ -2,7 +2,9 @@
 import argparse
 import json
 from pathlib import Path
+import re
 from statistics import median
+import tempfile
 
 from design_bench import CASES, run
 from design_matrix import call, compare
@@ -10,11 +12,17 @@ from design_stress import HELPER, setting
 
 
 def export(volume, row, target):
-    target.mkdir(parents=True)
-    run("docker","run","--rm","--network","none","--pull=never","--mount",
-        f"type=volume,source={volume},volume-subpath=out,target=/output,readonly",
-        "--mount",f"type=bind,source={target.resolve()},target=/export",HELPER,"sh","-ec",
-        'cp -R -- "$1"/. /export/',"export",row["output"])
+    if not re.fullmatch(r"/output/shopping-bench-[0-9a-f]{32}",row["output"]):
+        raise ValueError("Unexpected benchmark output location")
+    target.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=target.parent,prefix="export-") as temporary:
+        part=Path(temporary)/"tables"
+        part.mkdir()
+        run("docker","run","--rm","--network","none","--pull=never","--mount",
+            f"type=volume,source={volume},volume-subpath=out,target=/output,readonly",
+            "--mount",f"type=bind,source={part.resolve()},target=/export",HELPER,"sh","-ec",
+            'cp -R -- "$1"/. /export/',"export",row["output"])
+        part.rename(target)
 
 
 def trial(work, study, volume, case, name, variants, check_each):

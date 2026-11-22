@@ -1196,7 +1196,12 @@ impl People {
         self.clicks.push(c);
     }
 
-    fn finish(self, window: Window, data: &[EventData]) -> (SessionBatch, Vec<Click>) {
+    fn finish(
+        self,
+        window: Window,
+        data: &[EventData],
+        names: Option<&Names>,
+    ) -> (SessionBatch, Vec<Click>) {
         let Self {
             groups,
             events,
@@ -1211,6 +1216,7 @@ impl People {
             false,
             window,
             data,
+            names,
         )
     }
 
@@ -1222,6 +1228,7 @@ impl People {
         ordered_ids: bool,
         window: Window,
         data: &[EventData],
+        names: Option<&Names>,
     ) -> (SessionBatch, Vec<Click>) {
         let mut indexes: Vec<_> = (0..groups.len())
             .filter(|&i| groups[i].1.events > 0)
@@ -1283,6 +1290,7 @@ impl People {
                 &mut sales,
                 boundaries,
                 &person_ids,
+                names,
             )
         } else {
             let mut batch = Batch::<Event>::default();
@@ -1304,7 +1312,7 @@ impl People {
                 });
             }
             batch.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
-            aggregate::sessionize(batch)
+            aggregate::sessionize(batch, names)
         };
         let mut ordered = Vec::<Click>::with_capacity(totals.clicks);
         let dest = ordered.spare_capacity_mut();
@@ -1503,7 +1511,7 @@ fn first_pass(
     drop(ids);
     let group_time = start.elapsed();
     let finish_start = Instant::now();
-    let local = local.finish(window, data);
+    let local = local.finish(window, data, crate::output::aggregate_names(users));
     let finish_time = finish_start.elapsed();
     P1 {
         local,
@@ -1521,9 +1529,16 @@ fn second_pass(
     data: &[EventData],
     window: Window,
     plan: Plan,
+    names: Option<&Names>,
 ) -> (SessionBatch, Vec<Click>) {
     if plan.flat {
-        return second_flat(pieces, data, window, plan.user_parts.trailing_zeros());
+        return second_flat(
+            pieces,
+            data,
+            window,
+            plan.user_parts.trailing_zeros(),
+            names,
+        );
     }
     let mut groups = AHashMap::<u32, u32>::default();
     let mut local = People::default();
@@ -1542,7 +1557,7 @@ fn second_pass(
         }
     }
     drop(groups);
-    local.finish(window, data)
+    local.finish(window, data, names)
 }
 
 fn second_flat(
@@ -1550,6 +1565,7 @@ fn second_flat(
     data: &[EventData],
     window: Window,
     bits: u32,
+    names: Option<&Names>,
 ) -> (SessionBatch, Vec<Click>) {
     // Names assigns monotonic IDs inside interleaved shards. A destination
     // owns all people sharing its low bits, so the quotient is an exact index.
@@ -1596,7 +1612,16 @@ fn second_flat(
             c.person >>= bits;
             c
         });
-    People::finish_groups(groups, events, clicks, event_count, true, window, data)
+    People::finish_groups(
+        groups,
+        events,
+        clicks,
+        event_count,
+        true,
+        window,
+        data,
+        names,
+    )
 }
 
 pub enum Campaigns {
@@ -1717,7 +1742,13 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let p2_start = Instant::now();
     let later = later.into_iter().filter(|p| !p.is_empty()).collect();
     let rest = crate::runtime::stage_map("route_second_pass", later, |p| {
-        let (mut batch, mut clicks) = forward::finish(p, &payloads, window, plan);
+        let (mut batch, mut clicks) = forward::finish(
+            p,
+            &payloads,
+            window,
+            plan,
+            crate::output::aggregate_names(&users),
+        );
         if let Some(acc) = &fused {
             acc.consume(&mut batch, &mut clicks, &ids);
         }

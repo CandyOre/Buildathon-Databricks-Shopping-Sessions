@@ -64,6 +64,7 @@ fn main() -> Result<()> {
         } else {
             let mut users = input::Names::default();
             let aliases = input::read_aliases(&data, &mut users)?;
+            let aggregate_names = output::aggregate_names(&users);
             profile.stage("load_dimensions_and_links");
             let (sessions, count, clicks, ids) = if runtime::flag("PERF_OVERLAP_STREAMS") {
                 let (events, clicks) = rayon::join(
@@ -73,6 +74,7 @@ fn main() -> Result<()> {
                         Ok(records::dedup_and_sessionize(
                             candidates,
                             users.person_slots_per_shard(),
+                            aggregate_names,
                         ))
                     },
                     || records::read_clicks(&data, window, &dimensions, &users, &aliases),
@@ -85,8 +87,11 @@ fn main() -> Result<()> {
                 let candidates =
                     records::read_events(&data, window, &dimensions, &users, &aliases)?;
                 profile.stage("parse_events");
-                let (sessions, count) =
-                    records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
+                let (sessions, count) = records::dedup_and_sessionize(
+                    candidates,
+                    users.person_slots_per_shard(),
+                    aggregate_names,
+                );
                 profile.stage("dedup_and_sessionize");
                 let (clicks, ids) =
                     records::read_clicks(&data, window, &dimensions, &users, &aliases)?;

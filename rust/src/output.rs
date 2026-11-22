@@ -42,11 +42,36 @@ pub struct PreparedNames {
     bytes: Vec<u8>,
 }
 
+impl PreparedNames {
+    pub(crate) fn push_run(&mut self, end: usize, name: &str) -> Result<()> {
+        let offset = self.bytes.len();
+        direct::plain_string(&mut self.bytes, name)?;
+        self.runs.push((end, offset));
+        Ok(())
+    }
+
+    fn append(&mut self, part: Self) {
+        let row_base = self.runs.last().map_or(0, |r| r.0);
+        let byte_base = self.bytes.len();
+        self.runs.extend(
+            part.runs
+                .into_iter()
+                .map(|(end, at)| (row_base + end, byte_base + at)),
+        );
+        self.bytes.extend(part.bytes);
+    }
+}
+
+pub(crate) fn aggregate_names(names: &crate::input::Names) -> Option<&crate::input::Names> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    (*ENABLED.get_or_init(|| crate::runtime::flag("PERF_AGGREGATE_NAMES"))).then_some(names)
+}
+
 pub fn prepare_names(
     batches: &[SessionBatch],
     names: &PersonNames,
 ) -> Result<Option<Vec<PreparedNames>>> {
-    if !crate::runtime::flag("PERF_PREPARE_NAMES") {
+    if !crate::runtime::flag("PERF_PREPARE_NAMES") || crate::runtime::flag("PERF_AGGREGATE_NAMES") {
         return Ok(None);
     }
     (0..USER_PARTS)
@@ -64,12 +89,7 @@ pub fn prepare_names(
             {
                 if last != Some(person) {
                     let name = names.get(person, &mut buffer);
-                    let offset = dictionary.bytes.len();
-                    dictionary
-                        .bytes
-                        .extend_from_slice(&i32::try_from(name.len())?.to_le_bytes());
-                    dictionary.bytes.extend_from_slice(name.as_bytes());
-                    dictionary.runs.push((i + 1, offset));
+                    dictionary.push_run(i + 1, name)?;
                     last = Some(person);
                 } else {
                     dictionary.runs.last_mut().unwrap().0 = i + 1;
@@ -293,7 +313,7 @@ mod direct {
         out.push(value as u8);
     }
 
-    fn plain_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    pub(super) fn plain_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
         out.extend_from_slice(&i32::try_from(value.len())?.to_le_bytes());
         out.extend_from_slice(value.as_bytes());
         Ok(())
@@ -480,23 +500,25 @@ mod direct {
             let limit = daily.person.len().min(start.saturating_add(options().rows));
             let mut run = prepared.map_or(0, |p| p.runs.partition_point(|r| r.0 <= base + start));
             while end != limit {
-                let person = daily.person[end];
-                let changed = previous != Some(person);
-                let name = if changed && prepared.is_none() {
-                    Some(names.get(person, &mut buffer))
-                } else {
-                    None
-                };
-                let encoded = if changed {
-                    prepared.map(|p| {
-                        if p.runs[run].0 <= base + end {
-                            run += 1;
-                        }
+                let (changed, name, encoded) = if let Some(p) = prepared {
+                    let advance = p.runs[run].0 == base + end;
+                    run += usize::from(advance);
+                    let changed = end == start || advance;
+                    let encoded = changed.then(|| {
                         let stop = p.runs.get(run + 1).map_or(p.bytes.len(), |r| r.1);
                         &p.bytes[p.runs[run].1..stop]
-                    })
+                    });
+                    (changed, None, encoded)
                 } else {
-                    None
+                    let person = daily.person[end];
+                    let changed = previous != Some(person);
+                    previous = Some(person);
+                    let name = if changed {
+                        Some(names.get(person, &mut buffer))
+                    } else {
+                        None
+                    };
+                    (changed, name, None)
                 };
                 let extra_name =
                     encoded.map_or_else(|| name.map_or(0, |s| 4 + s.len()), |s| s.len());
@@ -519,7 +541,6 @@ mod direct {
                         plain_string(&mut self.dictionary, name.unwrap())?;
                     }
                     self.runs.push(1);
-                    previous = Some(person);
                 } else {
                     *self.runs.last_mut().unwrap() += 1;
                 }
@@ -833,6 +854,18 @@ mod direct {
         if options().merge && columns.len() > 1 {
             let mut merged = DailyColumns::default();
             let n = columns.iter().map(|s| s.person.len()).sum();
+            if columns
+                .iter()
+                .all(|s| s.prepared_names.is_some() || s.person.is_empty())
+            {
+                let mut dictionary = PreparedNames::default();
+                for part in &mut columns {
+                    if let Some(d) = part.prepared_names.take() {
+                        dictionary.append(d);
+                    }
+                }
+                merged.prepared_names = Some(dictionary);
+            }
             macro_rules! append_column {
                 ($field:ident) => {{
                     merged.$field.reserve_exact(n);
@@ -850,12 +883,21 @@ mod direct {
             columns = vec![merged];
         }
         let measure = crate::csv::work_enabled();
+        let (mut aggregate_name_rows, mut aggregate_name_runs, mut aggregate_name_bytes) =
+            (0, 0, 0);
         let mut prepare_ns = 0u64;
         let mut encode_write_ns = 0u64;
         let mut base = 0;
         let mut held = Vec::new();
         let hold = crate::runtime::flag("PERF_RELEASE_AFTER_CLOSE");
         for daily in columns {
+            if measure {
+                if let Some(prepared) = &daily.prepared_names {
+                    aggregate_name_rows += daily.person.len();
+                    aggregate_name_runs += prepared.runs.len();
+                    aggregate_name_bytes += prepared.bytes.len();
+                }
+            }
             crate::runtime::huge_pages(&daily.person);
             let mut start = 0;
             while start < daily.person.len() {
@@ -866,8 +908,12 @@ mod direct {
                     names,
                     dimensions,
                     categories.as_ref(),
-                    dictionary,
-                    base,
+                    daily.prepared_names.as_ref().or(dictionary),
+                    if daily.prepared_names.is_some() {
+                        0
+                    } else {
+                        base
+                    },
                 )?;
                 if let Some(t) = t {
                     prepare_ns += t.elapsed().as_nanos() as u64;
@@ -897,7 +943,9 @@ mod direct {
             eprintln!(
                 "profile {}",
                 serde_json::json!({"stage":"user_writer_work","part":part,
-                "rows":base,"row_groups":groups,"prepare_ns":prepare_ns,"encode_write_ns":encode_write_ns})
+                "rows":base,"row_groups":groups,"prepare_ns":prepare_ns,"encode_write_ns":encode_write_ns,
+                "aggregate_name_rows":aggregate_name_rows,"aggregate_name_runs":aggregate_name_runs,
+                "aggregate_name_bytes":aggregate_name_bytes})
             );
         }
         drop(held);
@@ -929,7 +977,49 @@ mod direct {
             let labels: Vec<String> = (0..300).map(|i| format!("ユーザー\0{i}")).collect();
             let ids: Vec<_> = labels.iter().map(|s| registry.intern(s)).collect();
             drop(aliases);
+            // Sessionization emits one name/run per whole person even when
+            // that person's sessions occupy several daily rows.
+            let aggregate = |people: &[u32]| {
+                let rows = people
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &person)| crate::records::Event {
+                        person,
+                        time: i as i64 * crate::input::DAY,
+                        purchase: 0,
+                    })
+                    .collect();
+                crate::aggregate::sessionize(
+                    crate::records::Batch {
+                        rows,
+                        purchases: Vec::new(),
+                    },
+                    Some(&registry),
+                )
+                .daily
+            };
+            let mut initial = aggregate(&[ids[0], ids[0]]);
+            let mut later = aggregate(&[ids[1], ids[1], ids[1], ids[2]]);
+            let mut combined = initial.prepared_names.take().unwrap();
+            combined.append(aggregate(&[]).prepared_names.unwrap());
+            combined.append(later.prepared_names.take().unwrap());
+            assert_eq!(
+                combined.runs.iter().map(|r| r.0).collect::<Vec<_>>(),
+                [2, 5, 6]
+            );
             let names = registry.into_people();
+            // A new row group can start midway through a run in a later shard.
+            for start in 0..later.person.len() {
+                let mut reference = Group::default();
+                let mut actual = Group::default();
+                let end = reference.prepare(&later, start, &names, &dims, None)?;
+                assert_eq!(
+                    actual.prepare_rows(&later, start, &names, &dims, None, Some(&combined), 2)?,
+                    end
+                );
+                assert_eq!(actual.dictionary, reference.dictionary);
+                assert_eq!(actual.indices, reference.indices);
+            }
             let path = dir.join("values.parquet");
             let mut writer = Writer::open(&path)?;
             let mut group = Group::default();

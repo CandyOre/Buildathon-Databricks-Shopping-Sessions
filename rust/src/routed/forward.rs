@@ -2,7 +2,7 @@
 //! appears once per destination block, irrespective of its raw spellings.
 use super::{Counts, Destinations, EventData, Forward, People, PersonEvent, Plan};
 use crate::aggregate::SessionBatch;
-use crate::input::Window;
+use crate::input::{Names, Window};
 use crate::records::Click;
 use ahash::AHashMap;
 use std::mem::size_of;
@@ -191,6 +191,7 @@ pub(super) fn finish(
     data: &[EventData],
     window: Window,
     plan: Plan,
+    names: Option<&Names>,
 ) -> (SessionBatch, Vec<Click>) {
     if !plan.forward_blocks {
         let rows = packets
@@ -200,7 +201,7 @@ pub(super) fn finish(
                 Packet::Groups(_) => unreachable!(),
             })
             .collect();
-        return super::second_pass(rows, data, window, plan);
+        return super::second_pass(rows, data, window, plan, names);
     }
     let blocks = packets
         .into_iter()
@@ -215,6 +216,7 @@ pub(super) fn finish(
         window,
         plan.flat,
         plan.user_parts.trailing_zeros(),
+        names,
     )
 }
 
@@ -224,6 +226,7 @@ fn merge(
     window: Window,
     flat: bool,
     bits: u32,
+    names: Option<&Names>,
 ) -> (SessionBatch, Vec<Click>) {
     let mut slots = AHashMap::default();
     let mut groups = Vec::<(u32, Counts)>::new();
@@ -288,7 +291,16 @@ fn merge(
             })
         })
     });
-    People::finish_groups(groups, events, clicks, event_count, flat, window, data)
+    People::finish_groups(
+        groups,
+        events,
+        clicks,
+        event_count,
+        flat,
+        window,
+        data,
+        names,
+    )
 }
 
 #[cfg(test)]
@@ -387,7 +399,7 @@ mod tests {
                     (work.descriptor_bytes, work.event_bytes, work.click_bytes),
                     (5 * 16, 3 * 8, 4 * 20)
                 );
-                let (actual, actual_clicks) = finish(packets, &data, window, plan);
+                let (actual, actual_clicks) = finish(packets, &data, window, plan, None);
 
                 let mut reference = People::default();
                 let a = reference.group(10);
@@ -434,7 +446,7 @@ mod tests {
                     time: start + 1,
                     campaign: 8,
                 });
-                let (expected, expected_clicks) = reference.finish(window, &data);
+                let (expected, expected_clicks) = reference.finish(window, &data, None);
                 assert!(actual_clicks == expected_clicks);
                 assert_eq!(actual.daily.person, expected.daily.person);
                 assert_eq!(actual.daily.day, expected.daily.day);

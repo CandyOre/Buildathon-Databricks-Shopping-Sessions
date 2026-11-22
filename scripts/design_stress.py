@@ -16,6 +16,7 @@ from verify_performance_design import setting
 
 
 CASES = ("low-dup", "high-dup", "small-files", "long-lines")
+WINNER_CASES = ("winner-valid", "winner-invalid")
 START = datetime(2028, 2, 28, tzinfo=timezone.utc)
 BASE = int(START.timestamp()) * 1000
 EVENT = b"event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents\n"
@@ -34,6 +35,46 @@ def report(path, value):
 
 def command(*args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, **kwargs)
+
+
+def generate_winner_events(output, case, args):
+    distinct = args.events // 2
+    file_pairs = args.files // 2
+    digits = args.key_bytes - 1
+    mask = (1 << (digits * 4)) - 1
+    ingests = [timestamp(START + timedelta(seconds=s)).encode() for s in (0, 1)]
+    all_rows, fixed_fields = hashlib.sha256(), hashlib.sha256()
+    length = longest = 0
+    for f in range(args.files):
+        pair, side = divmod(f, 2)
+        with (output / "events" / f"part-{f:06}.csv").open("wb") as stream:
+            stream.write(EVENT)
+            for i in range(pair * distinct // file_pairs, (pair + 1) * distinct // file_pairs):
+                # Alternate the order of earliest/latest copies across file pairs.
+                rank = (i + side) % 2
+                value = (i * 0xd6e8feb86659fd93 + args.seed * 3571) & mask
+                key = f"e{value:0{digits}x}".encode()
+                person = f"{'early' if rank == 0 else 'later'}{i // 16:07x}".encode()
+                # Odd keys have one valid copy and one just outside the window.
+                # Swapping equal-width timestamps leaves all other bytes fixed.
+                bad_rank = 1 if case == "winner-valid" else 0
+                millis = BASE + i % 1_200_000
+                if i % 2 and rank == bad_rank:
+                    millis -= 86_400_000
+                head = key + b"," + person + b","
+                tail = b"," + ingests[rank] + b",view,p1,\n"
+                line = head + str(millis).encode() + tail
+                stream.write(line)
+                all_rows.update(line)
+                fixed_fields.update(head + tail)
+                length += len(line)
+                longest = max(longest, len(line) - 1)
+    return {"event_rows": args.events, "unique_event_keys": distinct, "duplicate_rows": distinct,
+            "event_key_bytes": args.key_bytes, "click_rows": args.clicks, "event_files": args.files,
+            "event_payload_bytes": length, "max_event_line_bytes": longest,
+            "invalid_input_rows": distinct // 2, "swapped_pairs": distinct // 2,
+            "expected_winning_events": distinct if case == "winner-valid" else (distinct + 1) // 2,
+            "event_rows_sha256": all_rows.hexdigest(), "event_rows_without_ts_sha256": fixed_fields.hexdigest()}
 
 
 def generate_case(root, case, args):
@@ -57,6 +98,8 @@ def generate_case(root, case, args):
             who = person(i * 313 + args.seed)
             clicks.write(f"k{i:032x},{who},c_{1+i%8},{BASE + i * 113 % 86_400_000}\n".encode())
 
+    if case in WINNER_CASES:
+        return generate_winner_events(output, case, args)
     n = args.events
     high_distinct = max(1, n // 20)
     distinct = high_distinct if case == "high-dup" else n - n // 100
@@ -107,18 +150,25 @@ def generate(args):
         raise ValueError("use >=3 events, >=0 clicks and key width in [2,257]")
     if args.events > 1 << (4*(args.key_bytes - 1)):
         raise ValueError("requested event IDs do not fit in the fixed width")
-    if not 1 <= args.files < args.small_files or args.long_bytes <= 4 << 20:
+    if args.winner_validity and (args.events % 2 or args.files % 2 or not 2 <= args.files <= args.events):
+        raise ValueError("winner validity needs even events and an even file count between 2 and events")
+    if not args.winner_validity and (not 1 <= args.files < args.small_files or args.long_bytes <= 4 << 20):
         raise ValueError("require 1 <= files < small-files and long-bytes > 4 MiB")
     args.root.parent.mkdir(parents=True, exist_ok=True)
     if args.root.exists():
         raise FileExistsError(args.root)
     with tempfile.TemporaryDirectory(dir=args.root.parent) as staging:
         data = Path(staging) / "bundle"
-        stats = {case: generate_case(data, case, args) for case in CASES}
-        a, b, small = (stats[k] for k in CASES[:3])
-        assert a["event_rows_without_id_sha256"] == b["event_rows_without_id_sha256"]
+        cases = WINNER_CASES if args.winner_validity else CASES
+        stats = {case: generate_case(data, case, args) for case in cases}
+        a, b = (stats[k] for k in cases[:2])
+        if args.winner_validity:
+            assert a["event_rows_without_ts_sha256"] == b["event_rows_without_ts_sha256"]
+            assert a["event_rows_sha256"] != b["event_rows_sha256"]
+        else:
+            assert a["event_rows_without_id_sha256"] == b["event_rows_without_id_sha256"]
+            assert a["event_rows_sha256"] == stats["small-files"]["event_rows_sha256"]
         assert a["event_payload_bytes"] == b["event_payload_bytes"]
-        assert a["event_rows_sha256"] == small["event_rows_sha256"]
         meta = {k: getattr(args, k) for k in ("seed","events","clicks","key_bytes","files","small_files","long_bytes")}
         report(data / "datasets.json", {"parameters": meta, "cases": stats})
         with (data / "SHA256SUMS").open("w", encoding="ascii", newline="\n") as digests:
@@ -163,6 +213,24 @@ test ! -e "$stage"
     print(f"Installed {args.volume}/{args.name} with SHA256SUMS {digest}")
 
 
+def write_winner_answer(root, case, distinct):
+    # Each block of at most 16 keys has its own earliest user. Its surviving
+    # views all fit inside one 20-minute interval. Clicks/link endpoints use
+    # a disjoint namespace, so every session is organic.
+    root.mkdir()
+    day = START.date().isoformat()
+    with (root / "user_daily.csv").open("w", encoding="ascii", newline="\n") as out:
+        print("user_id,day,sessions,events,revenue_cents,top_category", file=out)
+        for start in range(0, distinct, 16):
+            count = min(16, distinct - start)
+            if case == "winner-invalid":
+                count = (count + 1) // 2
+            print(f"early{start // 16:07x},{day},1,{count},0,", file=out)
+    (root / "campaign_daily.csv").write_text(
+        "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n"
+        f"organic,organic,{day},{(distinct + 15) // 16},0,0,0\n", encoding="ascii", newline="\n")
+
+
 def race(args):
     args.work.mkdir(parents=True)
     inputs = command("docker", "run", "--rm", "--pull=never", "--network", "none",
@@ -171,8 +239,14 @@ def race(args):
                      "sha256sum -c --status SHA256SUMS && sha256sum SHA256SUMS && cat datasets.json",
                      text=True, capture_output=True).stdout
     checksum, datasets = inputs.split("\n", 1)
+    installed = json.loads(datasets)
+    if args.cases is None:
+        args.cases = [case for case in (*CASES, *WINNER_CASES) if case in installed["cases"]]
+    unavailable = set(args.cases) - installed["cases"].keys()
+    if unavailable:
+        raise ValueError(f"requested cases absent from bundle: {sorted(unavailable)}")
     report(args.work / "inputs.json", {"volume":args.volume, "subdirectory":args.name,
-           "sha256sums_digest":checksum.split()[0], "datasets":json.loads(datasets)})
+           "sha256sums_digest":checksum.split()[0], "datasets":installed})
     variants = {}
     for side, tag, env in (("A", args.a, args.a_setting), ("B", args.b, args.b_setting)):
         digest = command("docker", "image", "inspect", "--format", "{{.Id}}", tag,
@@ -182,9 +256,10 @@ def race(args):
     report(conf, variants)
     order = list("AB" if args.quick else "ABBAAB")
     summary = {}
-    def compare(left, right, log):
+    def compare(left, right, log, expected=False):
         with log.open("w", encoding="utf-8") as out:
             command(sys.executable, ROOT / "scripts/check_event_key_tables.py", left, right,
+                    *(["--expected-csv"] if expected else []),
                     stdout=out, stderr=subprocess.STDOUT)
     for case in args.cases:
         directory = args.work / case
@@ -209,6 +284,11 @@ def race(args):
                     "--mount", f"type=bind,source={dest},target=/export",
                     HELPER, "sh", "-ec", 'cp -R -- "$1"/. /export/', "export", row["output"])
         compare(directory / "A", directory / "B", directory / "compare.sql.log")
+        if case in WINNER_CASES:
+            expected = directory / "expected"
+            write_winner_answer(expected, case, installed["parameters"]["events"] // 2)
+            for side in variants:
+                compare(directory / side, expected, directory / f"{side}-answer.sql.log", expected=True)
         times = {side: [r["seconds"] for r in rows if r["image"] == side] for side in variants}
         summary[case] = {**times, "median_A":median(times["A"]), "median_B":median(times["B"]),
                          "gain":1-median(times["B"])/median(times["A"])}
@@ -226,6 +306,8 @@ if __name__ == "__main__":
     g.add_argument("root", type=Path, help="new local input bundle")
     g.add_argument("--seed", type=int, default=83)
     g.add_argument("--events", type=int, default=100_000)
+    g.add_argument("--winner-validity", action="store_true",
+                   help="only generate the matched cross-file earliest-validity pair")
     g.add_argument("--clicks", type=int, default=25_000)
     g.add_argument("--key-bytes", type=int, default=33)
     g.add_argument("--files", type=int, default=4)
@@ -242,7 +324,8 @@ if __name__ == "__main__":
     r.add_argument("--b", required=True, help="candidate image tag or digest")
     r.add_argument("--a-setting", type=setting, action="append", default=[], metavar="KEY=VALUE")
     r.add_argument("--b-setting", type=setting, action="append", default=[], metavar="KEY=VALUE")
-    r.add_argument("--cases", nargs="+", choices=CASES, default=CASES)
+    r.add_argument("--cases", nargs="+", choices=(*CASES, *WINNER_CASES),
+                   help="default: all dataset cases in the installed bundle")
     r.add_argument("--quick", action="store_true", help="one hot A/B pair per case, otherwise ABBAAB")
     args = parser.parse_args()
     {"generate":generate,"install":install,"race":race}[args.action](args)

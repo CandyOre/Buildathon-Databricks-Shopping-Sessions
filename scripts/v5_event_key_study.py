@@ -96,10 +96,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,targe
             "-f", "-", work / "b", input=recipe, text=True, stdout=log, stderr=subprocess.STDOUT)
 
 
-def provenance(work, volume):
+def provenance(work, volume, scorer_images=None):
     metadata = {"generator_sha256": GEN, "answer_sha256": ANSWER, "starter_sha256": STARTER}
-    tags = ["rust:1.85-slim-bookworm", "debian:bookworm-slim",
-            *(volume + ":" + tag for tag in ("generator", "a", "b"))]
+    tags = ["rust:1.85-slim-bookworm", "debian:bookworm-slim", volume + ":generator",
+            *(scorer_images if scorer_images is not None else [volume+":a", volume+":b"])]
     metadata["images"] = {
         tag: run("docker", "image", "inspect", "--format", "{{.Id}}", tag,
                  text=True, capture_output=True).stdout.strip() for tag in tags
@@ -173,7 +173,7 @@ def main():
     p.add_argument("dataset", choices=CASES)
     p.add_argument("mode", choices=["count", "timing"])
     sub.add_parser("units")
-    sub.add_parser("provenance")
+    sub.add_parser("provenance").add_argument("--images", nargs="+", help="scorer images used in this study")
     args = parser.parse_args()
     work = args.work.resolve()
     if args.op == "replay":
@@ -195,7 +195,7 @@ def main():
     elif args.op == "units":
         unit_tests(work)
     elif args.op == "provenance":
-        provenance(work, volume)
+        provenance(work, volume, args.images)
     elif args.op == "bench":
         log = f"times-{args.dataset}.jsonl"
         if (work / log).exists():

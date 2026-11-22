@@ -775,6 +775,7 @@ fn keep_earliest<K>(
 pub fn dedup_and_sessionize(
     candidates: Candidates,
     width: usize,
+    names: Option<&Names>,
 ) -> (Vec<crate::aggregate::SessionBatch>, usize) {
     let losses = crate::runtime::stage_map("event_dedup", (0..SHARDS).collect(), |shard| {
         let runs = candidates
@@ -885,6 +886,7 @@ pub fn dedup_and_sessionize(
                         &mut times,
                         &mut sales,
                         ends,
+                        names,
                     ),
                     length,
                 );
@@ -912,7 +914,7 @@ pub fn dedup_and_sessionize(
                 }
             }
             output.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
-            (crate::aggregate::sessionize(output), length)
+            (crate::aggregate::sessionize(output, names), length)
         },
     );
     let event_count = events.iter().map(|(_, count)| *count).sum();
@@ -1572,7 +1574,7 @@ mod shard_slab_tests {
                 start,
                 origin_seconds: 0,
             };
-            dedup_and_sessionize(batch, 65537)
+            dedup_and_sessionize(batch, 65537, None)
         };
         let (dense, n) = run(true);
         let (sorted, m) = run(false);

@@ -865,6 +865,26 @@ impl Names {
                 .collect(),
         }
     }
+
+    pub(crate) fn with_spelling<T>(&self, id: u32, consume: impl FnOnce(&str) -> T) -> T {
+        let mut buffer = [0; 9];
+        let table = self
+            .packed
+            .as_ref()
+            .expect("link graph must be initialized");
+        if let Some(&key) = table.canonical.get(id as usize) {
+            return consume(table.spelling(key, &mut buffer));
+        }
+        // Click readers may still add dynamic names. Consume the spelling
+        // under this shard's lock without borrowing it across a mutation.
+        let shard = self.shards[id as usize % SHARDS].lock().unwrap();
+        let key = shard.keys[id as usize / SHARDS - shard.offset];
+        if key >= EXTERNAL_NAME {
+            consume(&shard.names[key as u32 as usize])
+        } else {
+            consume(unpack_name(key, &mut buffer))
+        }
+    }
 }
 
 pub struct PersonNames {

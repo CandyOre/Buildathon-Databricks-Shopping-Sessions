@@ -16,8 +16,9 @@ $b = "shopping-design:candidate"
 & $py scripts/v5_event_key_study.py $study init .buildathon/generator-v5-official-gmun.zip .buildathon/dev-answer-v5-official-gmun.zip .buildathon/starter-v5-official-gmun.zip
 & $py scripts/v5_event_key_study.py $study generate dev s83-20m s37-20m s83-60m
 $vol = (Get-Content "$study/volume" -Raw).Trim()
-& $py scripts/design_bench.py $work build $a a635381
+& $py scripts/design_bench.py $work build $a bf43e188783adbff8853002efacb8ae5fbfedc04
 & $py scripts/design_bench.py $work build $b $rev
+& $py scripts/v5_event_key_study.py $study provenance --images $a $b
 & $py scripts/design_bench.py $work check --revision $rev
 & $py scripts/verify_performance_design.py --image $b --assets $study --work "$work/verification"
 ```
@@ -27,7 +28,7 @@ $vol = (Get-Content "$study/volume" -Raw).Trim()
 ### 整程 A/B 和大表
 
 ```powershell
-$ref = "$work/reference"
+$ref = "$study/tables"
 foreach ($ds in "s83-20m","s37-20m","s83-60m") {
     & $py scripts/bench_container.py $vol $ds $a --log "$ref/export.jsonl" --verify-cache --export "$ref/$ds/b"
 }
@@ -76,7 +77,9 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 | `PERF_TIME_SORT`、`PERF_MEDIUM_BINS`、`PERF_BIN_MASK` | `TIME_SORT=1` 启用混合排序，至多 16 个时间用插入排序，至少 2048 个可走基数排序。大输入编译版原有半小时分桶路径要求至少 2048 个事件且覆盖不超过 1024 桶。`MEDIUM_BINS=1` 为 64–2047 个事件试探活跃桶；太分散时回到排序。`BIN_MASK=1` 用位图扫描大组非空桶。 |
 | `PERF_PURCHASE_BINS`、`PERF_SINGLE_PURCHASE`、`PERF_CATEGORY_DENSE` | 前两项均需设为 1，分别复用分桶得到的会话编号、直接定位单笔购买。`CATEGORY_DENSE=1` 为前 32 类用窄计数，加满后累计进位，其余类别用映射，按金额及类别字节序决胜。 |
 | `PERF_ASSISTS=interval/mask/unsorted/simd`、`PERF_SMALL_CLICKS=N` | 默认 `interval`，小点击阈值 32，可设 1–64。`mask` 对最多 64 个会话按活动合并位掩码，`simd` 可在 AVX2 上比较至少 4 个会话时刻。`unsorted/simd` 在适用的分组路径上允许小组跳过预排序，包括路由的组内整理。最终会话数超过 64 时恢复时间顺序。 |
+| `PERF_LARGE_ASSISTS=simd` | 对超过 64 个会话、跨度至多 32 个 UTC 日的人员组，AVX2 每次计算八天与同一活动覆盖区间的交集。其余组走精确的逐日累计。工作量诊断记录命中组数。 |
 | `PERF_CAMPAIGNS=map/dense/columns/buffered` | 默认 `map`。活动数乘窗口天数至多 131072 时使用稠密槽；`map` 将结果物化为映射，`dense` 可直接交给 writer。`columns` 分列保存三个 `u16` 计数及 `i64` 收入，进位另存；`buffered` 每 32 个更新批量提交。超出稠密范围使用稀疏映射。 |
+| `PERF_AGGREGATE_NAMES=1` | 在每个人员组产生最后一条日行时记录姓名编码和行程；写出时可直接按行程跨行组切分。`PROFILE_WORK=1` 记录实际覆盖行数、姓名行程数和字典字节。 |
 | `PERF_PREPARE_NAMES=1`、`PERF_MERGE_GROUPS=1`、`PERF_GROUP_ROWS=N` | 提前生成姓名字典及行程、写前合并同一输出分片的列、调整用户行组行数。默认每组上限 65536 行，字符串页另有 8 MiB 目标。 |
 | `PERF_USER_PLAIN=1`、`PERF_CAMPAIGN_PLAIN=1`、`PERF_WRITE_BUFFER=N` | 分别选择用户页及活动页的未压缩 codec，字典、RLE 与位打包仍由 writer 选择。默认使用 Snappy 的适用页面。用户 writer 的缓冲默认 256 KiB，可设 4 KiB–16 MiB。 |
 | `PERF_WRITERS=N`、`PERF_CAMPAIGN_FIRST=1` | 用户文件固定八份，`WRITERS` 控制 1–8 个用户写任务，默认 8。活动表默认用单独任务；开启后由第一个用户写任务先写活动表。 |
@@ -132,13 +135,15 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 & $py scripts/design_bench.py $work build shopping-design:no-pgo $rev --build-arg SCORER_PGO=0
 ```
 
+使用 `generate --winner-validity` 可单独生成两组 50% 重复且等字节的数据。每个键的两条记录跨文件、跨用户；等长时间戳在部分早晚副本间交换，使最早副本的有效性发生变化。脚本分别用独立预期核对两张表。
+
 压力脚本发布到全新卷子目录并校验 SHA-256。低/高重复组行数、键长、其他列及总字节相同；多小文件组保留原始行流；超长行组只扩展两条 view 的商品字段。各组做 A/B 双向全列比较，等价布局再跨组比较。`--quick` 只跑一对。
 
 运行时 `PERF_ISA=portable/v3/wide/cascade` 在镜像已构建且 CPU 特征满足时选对应程序。默认按 CPU 和事件 CSV 总字节调度，`PERF_LARGE_BYTES` 为 3 GiB。`SCORER_STATIC=1` 配合 `RUNTIME_IMAGE=scratch`，镜像自带 Rust 调度器。正式比较保持 mimalloc 和镜像的 `MIMALLOC_PURGE_DELAY=10000` 一致。默认 LTO 为 thin，已有 PGO 配置用于 v4 大输入程序。重训时用独立种子，并记录训练提交和参数。`PERF_WIDE_SCAN=1` 在提供 AVX-512F/BW 的大输入入口上，对 65–128 B 事件行实际使用两个 64 B 载荷。`SCORER_CASCADE_PKU=0` 在编译 Cascade Lake 入口时禁用 PKU 指令，用于虚拟机未暴露内存保护键的机器，其他 ISA 检查仍执行。
 
 ```powershell
-docker run --rm --network none --cpuset-cpus 0,2,4,6,8,10,12,14 --cpus 8 --memory 24g --memory-swap 24g --mount "type=volume,source=$vol,target=/data" "${vol}:generator" --seed 91 --events 8000000 --clicks 2000000 --threads 8 --output /data/design-s91-8m
-& $py scripts/train_wide_profile.py $vol design-s91-8m rust/design-training.profdata --revision $rev --lto thin
+docker run --rm --network none --cpuset-cpus 0,2,4,6,8,10,12,14 --cpus 8 --memory 24g --memory-swap 24g --mount "type=volume,source=$vol,target=/data" "${vol}:generator" --seed 91 --events 60000000 --clicks 15000000 --threads 8 --output /data/design-s91-60m
+& $py scripts/train_wide_profile.py $vol design-s91-60m rust/design-training.profdata --revision $rev --lto thin
 docker buildx build --platform linux/amd64 --load -t shopping-design:trained --build-arg SCORER_PROFILE=design-training.profdata .
 ```
 
