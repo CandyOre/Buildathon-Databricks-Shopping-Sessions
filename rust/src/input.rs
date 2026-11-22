@@ -628,8 +628,47 @@ pub struct Aliases {
 // A short ASCII spelling needs 57 bits, including the U/u discriminator.
 // The lookup word is reversibly mixed. The bucket address supplies its low
 // bits, so the stored quotient and the returned dense ID share one u64.
-#[repr(align(64))]
-struct Line([AtomicU64; 8]);
+// One aligned cache line holds the seven one-byte fingerprints and all
+// seven complete quotient/ID words. A byte of zero means unpublished.
+#[repr(C, align(64))]
+struct Line {
+    tags: AtomicU64,
+    cells: [AtomicU64; 7],
+}
+
+impl Line {
+    // Zero is an unpublished slot. Encoded tags are immutable after publication.
+    #[inline]
+    fn fingerprint(tag: u64) -> u64 {
+        (tag >> 56) | 1
+    }
+
+    #[inline]
+    fn publish(&self, index: usize, tag: u64) {
+        self.tags
+            .fetch_or(Self::fingerprint(tag) << (8 * index), Ordering::Release);
+    }
+
+    #[inline]
+    fn cached(&self, tag: u64, limit: u64, tags: u64) -> Option<u32> {
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x0080_8080_8080_8080;
+        let diff = tags ^ (Self::fingerprint(tag) * ONES);
+        // Borrow propagation may mark a neighbouring byte; the full stored
+        // quotient is checked for every candidate and rejects such false hits.
+        let mut hits = diff.wrapping_sub(ONES) & !diff & HIGH;
+        while hits != 0 {
+            let lane = (hits.trailing_zeros() / 8) as usize;
+            let id = self.cells[lane].load(Ordering::Relaxed) ^ tag;
+            if id < limit {
+                return Some(id as u32);
+            }
+            hits &= hits - 1;
+        }
+        None
+    }
+}
+
 struct Directory {
     lines: Vec<Line>,
     address_bits: u32,
@@ -667,7 +706,10 @@ impl Directory {
         let address_bits = buckets.trailing_zeros();
         let lines = (0..buckets)
             .into_par_iter()
-            .map(|_| Line(std::array::from_fn(|_| AtomicU64::new(EMPTY_KEY))))
+            .map(|_| Line {
+                tags: AtomicU64::new(0),
+                cells: std::array::from_fn(|_| AtomicU64::new(EMPTY_KEY)),
+            })
             .collect();
         Self {
             lines,
@@ -699,7 +741,7 @@ impl Directory {
 
     fn fill(&self, mixed: u64, id: u32) -> bool {
         for (index, tag) in self.locations(mixed) {
-            for cell in &self.lines[index].0 {
+            for (lane, cell) in self.lines[index].cells.iter().enumerate() {
                 if cell.load(Ordering::Relaxed) == EMPTY_KEY
                     && cell
                         .compare_exchange(
@@ -710,6 +752,7 @@ impl Directory {
                         )
                         .is_ok()
                 {
+                    self.lines[index].publish(lane, tag);
                     return true;
                 }
             }
@@ -731,7 +774,17 @@ impl Directory {
         // field. XOR therefore checks both the complete quotient and the
         // sentinel exclusion with a single unsigned comparison.
         let limit = self.id_mask - 2;
-        for cell in &line.0 {
+        let tags = line.tags.load(Ordering::Acquire);
+        if let Some(id) = line.cached(tag, limit, tags) {
+            return Some(id);
+        }
+        // All seven nonzero tags certify that every slot completed publication.
+        // A miss in a partially published line must still take the normal path.
+        let filled = tags | 0xff00_0000_0000_0000;
+        if (filled.wrapping_sub(0x0101_0101_0101_0101) & !filled & 0x8080_8080_8080_8080) == 0 {
+            return None;
+        }
+        for (lane, cell) in line.cells.iter().enumerate() {
             loop {
                 let word = cell.load(Ordering::Acquire);
                 let id = word ^ tag;
@@ -753,9 +806,11 @@ impl Directory {
                 }
                 if let Some(id) = users.register_bounded(key, mixed as usize, limit) {
                     cell.store(tag | u64::from(id), Ordering::Release);
+                    line.publish(lane, tag);
                     return Some(id);
                 }
                 cell.store(CLOSED, Ordering::Release);
+                line.publish(lane, tag);
                 return Some(users.intern(text(bytes)));
             }
         }
@@ -1479,5 +1534,64 @@ mod dimension_key_regression {
         assert!(dims.products.lookup(b"p2").is_none());
         assert!(dims.campaign_ids.lookup(b"c_0").is_none());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tagged_line_regression {
+    use super::*;
+
+    #[test]
+    fn equal_fingerprints_never_alias_distinct_quotients() {
+        let directory = Directory::new(1024);
+        let home = 19_u64;
+        let mut mixed = Vec::new();
+        // These distinct keys share the home bucket and top tag byte.
+        for q in 1..=11u64 {
+            let key = (q << directory.address_bits) | home;
+            assert!(directory.fill(key, q as u32));
+            mixed.push(key);
+        }
+        let users = Names::default();
+        let spill = AHashMap::default();
+        for (i, &key) in mixed.iter().enumerate() {
+            assert_eq!(
+                directory.lookup(key, key, b"u_unused", &spill, &users),
+                i as u32 + 1
+            );
+        }
+        assert_eq!(
+            directory.lines[home as usize].tags.load(Ordering::Acquire) & 0x00ff_ffff_ffff_ffff,
+            0x0001_0101_0101_0101
+        );
+    }
+
+    #[test]
+    fn live_partial_and_fully_published_lines_return_one_person_per_spelling() {
+        let directory = Directory::new(1024);
+        let users = Names::default();
+        let spill = AHashMap::default();
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut found = [0u32; 11];
+                        for (i, slot) in found.iter_mut().enumerate() {
+                            let key = ((i as u64 + 1) << directory.address_bits) | 13;
+                            let name = format!("u{i}");
+                            *slot = directory.lookup(key, key, name.as_bytes(), &spill, &users);
+                        }
+                        found
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(results.windows(2).all(|p| p[0] == p[1]));
+        let unique: std::collections::HashSet<_> = results[0].into_iter().collect();
+        assert_eq!(unique.len(), 11);
     }
 }

@@ -116,11 +116,15 @@ fn sorted_time_offsets(values: &mut [u32], scratch: &mut Vec<u32>) {
     // buckets of close timestamps independently in the reusable scratch space.
     let first = values[0];
     let changed = values.iter().fold(0, |bits, &t| bits | (t ^ first));
-    if changed == 0 { return; }
+    if changed == 0 {
+        return;
+    }
     let shift = (31 - changed.leading_zeros()) & !7;
     let mut ends = [0usize; 256];
     let bucket = |t: u32| ((t >> shift) & 255) as usize;
-    for &time in values.iter() { ends[bucket(time)] += 1; }
+    for &time in values.iter() {
+        ends[bucket(time)] += 1;
+    }
     let mut at = 0;
     for count in &mut ends {
         let len = *count;
@@ -135,7 +139,9 @@ fn sorted_time_offsets(values: &mut [u32], scratch: &mut Vec<u32>) {
     }
     let mut begin = 0;
     for end in ends {
-        if end - begin > 1 { scratch[begin..end].sort_unstable(); }
+        if end - begin > 1 {
+            scratch[begin..end].sort_unstable();
+        }
         begin = end;
     }
     values.copy_from_slice(scratch);
@@ -150,7 +156,9 @@ fn starts(times: &[u32], positions: &mut Vec<usize>) {
         next = unsafe { vector_starts(times, positions) };
     }
     for index in next..times.len() {
-        if times[index] - times[index - 1] > SESSION_GAP { positions.push(index); }
+        if times[index] - times[index - 1] > SESSION_GAP {
+            positions.push(index);
+        }
     }
     positions.push(times.len());
 }
@@ -159,15 +167,21 @@ fn starts(times: &[u32], positions: &mut Vec<usize>) {
 #[target_feature(enable = "avx2")]
 unsafe fn vector_starts(times: &[u32], positions: &mut Vec<usize>) -> usize {
     use std::arch::x86_64::*;
-    let sign = _mm256_set1_epi32(i32::MIN);
-    let bound = _mm256_set1_epi32(i32::MIN ^ SESSION_GAP as i32);
+    // The caller checks AVX2 once before entering the vector loop.
+    let (sign, bound) = unsafe {
+        (_mm256_set1_epi32(i32::MIN), _mm256_set1_epi32(i32::MIN ^ SESSION_GAP as i32))
+    };
     let mut index = 1;
     while index + 8 <= times.len() {
-        let current = unsafe { _mm256_loadu_si256(times.as_ptr().add(index).cast()) };
-        let previous = unsafe { _mm256_loadu_si256(times.as_ptr().add(index - 1).cast()) };
-        let delta = _mm256_xor_si256(_mm256_sub_epi32(current, previous), sign);
-        let above = _mm256_cmpgt_epi32(delta, bound);
-        let mut mask = _mm256_movemask_ps(_mm256_castsi256_ps(above)) as u32;
+        // Both loads cover eight elements. The loop guard bounds the last
+        // element and index starts at one, so the prior load is also in range.
+        let mut mask = unsafe {
+            let current = _mm256_loadu_si256(times.as_ptr().add(index).cast());
+            let previous = _mm256_loadu_si256(times.as_ptr().add(index - 1).cast());
+            let delta = _mm256_xor_si256(_mm256_sub_epi32(current, previous), sign);
+            let above = _mm256_cmpgt_epi32(delta, bound);
+            _mm256_movemask_ps(_mm256_castsi256_ps(above)) as u32
+        };
         while mask != 0 {
             positions.push(index + mask.trailing_zeros() as usize);
             mask &= mask - 1;
@@ -198,7 +212,11 @@ impl DayPurchases {
     fn top(&mut self) -> Option<u32> {
         let first = self.first.take()?;
         let best = self.others.drain().fold(first, |best, value| {
-            if value.1 > best.1 || (value.1 == best.1 && value.0 < best.0) { value } else { best }
+            if value.1 > best.1 || (value.1 == best.1 && value.0 < best.0) {
+                value
+            } else {
+                best
+            }
         });
         Some(best.0)
     }
@@ -223,7 +241,9 @@ pub fn compact_sessions(
         let local = &mut times[prev.0 as usize..last as usize];
         let purchases = &sales[prev.1 as usize..sold as usize];
         prev = (last, sold);
-        if local.is_empty() { continue; }
+        if local.is_empty() {
+            continue;
+        }
         sorted_time_offsets(local, &mut radix);
         starts(local, &mut starts_at);
         let count = starts_at.len() - 1;
@@ -239,21 +259,29 @@ pub fn compact_sessions(
             }
         }
         let person = (index * crate::input::SHARDS + shard) as u32;
-        let mut row = UserDay { person, ..UserDay::default() };
+        let mut row = UserDay {
+            person,
+            ..UserDay::default()
+        };
         for (i, interval) in starts_at.windows(2).enumerate() {
             let time = start + i64::from(local[interval[0]]);
             let session_day = day(time);
             if row.sessions > 0 && session_day != row.day {
                 row.top_category = category.top();
                 daily.push(row);
-                row = UserDay { person, ..UserDay::default() };
+                row = UserDay {
+                    person,
+                    ..UserDay::default()
+                };
             }
             row.day = session_day;
             row.sessions += 1;
             row.events += (interval[1] - interval[0]) as i64;
             let mut revenue = 0;
             if count == 1 {
-                for &(_, p) in purchases { category.add(p, &mut revenue); }
+                for &(_, p) in purchases {
+                    category.add(p, &mut revenue);
+                }
             } else if !heads.is_empty() {
                 let mut cursor = heads[i];
                 while cursor != 0 {
@@ -263,7 +291,11 @@ pub fn compact_sessions(
                 }
             }
             row.revenue += revenue;
-            sessions.push(Session { person, time, revenue });
+            sessions.push(Session {
+                person,
+                time,
+                revenue,
+            });
         }
         row.top_category = category.top();
         daily.push(row);
@@ -527,22 +559,40 @@ mod compact_session_tests {
         let mut expanded: Batch<Event> = Batch::default();
         for group in 0..4 {
             let person = (group * crate::input::SHARDS + shard) as u32;
-            let mut offsets: Vec<u32> = (0..108).map(|i| match group {
-                0 => (i % 3) * SESSION_GAP,
-                1 => (i * 31 % 12) * (SESSION_GAP + 1) + (i % 7),
-                2 => u32::MAX - ((i * 71 % 85) * (SESSION_GAP + 1) + i),
-                _ => (i * (SESSION_GAP + 1) + i) / 7,
-            }).collect();
-            offsets.extend([0, 111, SESSION_GAP, (SESSION_GAP + 1), u32::MAX, u32::MAX - SESSION_GAP]);
+            let mut offsets: Vec<u32> = (0..108)
+                .map(|i| match group {
+                    0 => (i % 3) * SESSION_GAP,
+                    1 => (i * 31 % 12) * (SESSION_GAP + 1) + (i % 7),
+                    2 => u32::MAX - ((i * 71 % 85) * (SESSION_GAP + 1) + i),
+                    _ => (i * (SESSION_GAP + 1) + i) / 7,
+                })
+                .collect();
+            offsets.extend([
+                0,
+                111,
+                SESSION_GAP,
+                (SESSION_GAP + 1),
+                u32::MAX,
+                u32::MAX - SESSION_GAP,
+            ]);
             for (n, t) in offsets.into_iter().rev().enumerate() {
                 let purchase = if n % 3 == 0 {
-                    let p = Purchase { category: (n % 4) as u32, cents: (9 + n % 7) as u32 };
+                    let p = Purchase {
+                        category: (n % 4) as u32,
+                        cents: (9 + n % 7) as u32,
+                    };
                     sales.push((t, p));
                     expanded.purchases.push(p);
                     expanded.purchases.len() as u32
-                } else { 0 };
+                } else {
+                    0
+                };
                 times.push(t);
-                expanded.rows.push(Event { person, time: start + i64::from(t), purchase });
+                expanded.rows.push(Event {
+                    person,
+                    time: start + i64::from(t),
+                    purchase,
+                });
             }
             ends.push((times.len() as u32, sales.len() as u32));
         }
@@ -558,18 +608,19 @@ mod compact_session_tests {
         let mut scratch = Vec::new();
         let mut positions = Vec::new();
         for count in [1, 8, 9, 31, 256, 2048, 6000, 131_073] {
-            let mut values: Vec<_> = (0..count as u32).map(|i|
-                i.wrapping_mul(0x350c_619f).rotate_left(12) % 3_000_000_000
-            ).collect();
+            let mut values: Vec<_> = (0..count as u32)
+                .map(|i| i.wrapping_mul(0x350c_619f).rotate_left(12) % 3_000_000_000)
+                .collect();
             values.extend([0, SESSION_GAP, SESSION_GAP * 2 + 1, u32::MAX]);
             let mut expected = values.clone();
             expected.sort_unstable();
             sorted_time_offsets(&mut values, &mut scratch);
             assert_eq!(values, expected);
             starts(&values, &mut positions);
-            let expected: Vec<_> = std::iter::once(0).chain((1..values.len()).filter(|&i|
-                values[i] - values[i - 1] > SESSION_GAP
-            )).chain(std::iter::once(values.len())).collect();
+            let expected: Vec<_> = std::iter::once(0)
+                .chain((1..values.len()).filter(|&i| values[i] - values[i - 1] > SESSION_GAP))
+                .chain(std::iter::once(values.len()))
+                .collect();
             assert_eq!(positions, expected);
         }
     }
