@@ -62,35 +62,53 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 | --- | --- |
 | `EVENT_BUCKETS`、`USER_BUCKETS`、`CHUNKS` | 桶数默认按事件字节量选择，事件 8–2048 桶，人员 8–512 桶。手动桶数取不超过 8192 的二次幂。`CHUNKS` 建议每任务读 1–128 个块，默认 1，实际还受并行度、元数据预算和页写入模式影响。 |
 | `PACK=1` | 通常事件候选 24 B，原始点击 32 B，符合编码范围可分别缩至 16 B。短后缀用保留前导零的 36 进制编码，宽键用全 128 位侧表加槽号。事件的 21 位时间码容纳常规整秒、无效标志或侧表引用。紧凑点击可容纳 31 位相对毫秒、15 位活动 ID。键、时间或侧表位置超出范围时走宽记录；侧表内存另计。 |
-| `WRITES=direct/buffered/stream`、`SLAB=1`、`INPUT_PAGES=1` | 默认 `buffered`。普通 Vec、固定前缀 slab 和原生 4 KiB 页是三个写入位置。单测 Vec 写法时固定 `PACK=0, SLAB=0, INPUT_PAGES=0`。slab 的前缀和单独的 16 B Vec 通道直接写，满前缀的普通记录才经过所选 writer。原生页优先于 slab，完整和紧凑记录都可走对应页写法。满批且满足对齐条件时 `stream` 使用非临时写。 |
+| `WRITES=direct/buffered/stream`、`SLAB=1`、`INPUT_PAGES=1` | 默认 `buffered`。测普通 Vec 写法时固定 `PACK=0, SLAB=0, INPUT_PAGES=0`。slab 前缀与单独的 16 B Vec 通道直接写，满前缀的普通记录再交给所选 writer。`INPUT_PAGES=1` 优先于 slab，事件和点击均由读取线程直接写入所属桶的 4 KiB 页，覆盖完整与紧凑通道。`direct` 逐条写，`buffered` 每桶暂存 8 条再连续复制，收尾写余数。`stream` 使用同一暂存策略，在 x86-64 上对目标地址和字节数均按 16 B 对齐的片段使用非临时写，其他片段普通复制，发布页前完成写屏障。 |
 | `ARENA=1`、`REUSE=0/1` | 默认 `ARENA=0, REUSE=1`。arena 用 2 MiB 对齐区提供 4 KiB 页。`ARENA=1` 将 Vec 数据转入页供后续扫描，`INPUT_PAGES=1` 已直接产出页，会跳过这次搬运。`REUSE` 控制空页共享回收，同时影响去重临时空间复用。 |
 | `WINNER=bitmap/map`、`BITMAP_FACTOR`、`EXACT=hash/linear` | 默认位图先筛，目标每行 8 槽，因子须为不超过 8192 的二次幂。`map` 让所有行进入精确表，此时位图因子不参与筛选。精确表默认哈希表，`linear` 为可复用的开放寻址表，碰撞仍比较完整键。 |
 | `LINKS=overlap/serial`、`CLICKS=late/early` | 默认链接与输入处理重叠，事件选胜之后读点击。`early` 可与事件同时读取点击；合流前等待链接图就绪。 |
-| `P1=0/1`、`GROUPS=map/flat`、`FORWARD=rows/blocks` | 默认 `P1=1, GROUPS=map, FORWARD=rows`。`P1=0` 把所有组转给 P2。开启后只有确认无链接别名的组才在 P1 完成。`flat` 使用分区内的密集索引；`blocks` 每组增加 16 B 描述符，转发事件 8 B/条、点击 20 B/条，替代逐行转发的 12 B/24 B。 |
+| `P1=0/1`、`GROUPS=map/flat`、`FORWARD=rows/blocks` | 默认 `P1=1, GROUPS=map, FORWARD=rows`。`P1=0` 把所有组转给 P2。开启后，确认无链接别名的组可在 P1 完成。`PERF_ROUTE_FORWARD=blocks` 在每个 P1 来源内按最终人员分组，每人向目标分区发一份 16 B 描述符，保存人员、事件/点击的末端位置及购买数。转发事件占 8 B/条，点击分列占 20 B/条，逐行模式对应 12 B/24 B。P2 读取描述符计算写入范围，同一人来自不同 P1 的块会合并。`flat` 允许 P2 用人员商直接索引，`map` 用哈希索引。 |
 | `FUSED=1` | 完整人员组在 P1 或 P2 内完成归因，工人局部计数最后合并。默认先形成会话和点击数组，再批量归因。 |
 
 ## 会话、归因、写出
 
 | 开关 | 默认与回退 |
 | --- | --- |
-| `PERF_TIME_SORT`、`PERF_MEDIUM_BINS`、`PERF_BIN_MASK` | `TIME_SORT=1` 为默认，至多 16 个时间用插入排序，至少 2048 个可走基数排序。大输入编译版原有半小时分桶路径要求至少 2048 个事件且覆盖不超过 1024 桶。`MEDIUM_BINS=1` 为 64–2047 个事件试探活跃桶；太分散时回到排序。`BIN_MASK=1` 用位图扫描大组非空桶。 |
-| `PERF_PURCHASE_BINS`、`PERF_SINGLE_PURCHASE`、`PERF_CATEGORY_DENSE` | 前两项默认开，分别复用分桶得到的会话编号、直接定位单笔购买。`CATEGORY_DENSE=1` 为前 32 类用窄计数，加满后累计进位，其余类别用映射，按金额及类别字节序决胜。 |
-| `PERF_ASSISTS=interval/mask/unsorted/simd`、`PERF_SMALL_CLICKS=N` | 默认 `unsorted`，小点击阈值 32，可设 1–64。`mask` 对最多 64 个会话按活动合并位掩码；`simd` 可在 AVX2 上比较至少 4 个会话时刻。`unsorted/simd` 允许小组跳过预排序，适用范围外恢复按时间处理。路由的分组整理本身会排序，收益须分别测量。 |
-| `PERF_CAMPAIGNS=map/dense/columns/buffered` | 默认 `dense`。活动数乘窗口天数至多 131072 时使用稠密槽；`map` 将结果物化为映射，`dense` 可直接交给 writer。`columns` 分列保存三个 `u16` 计数及 `i64` 收入，进位另存；`buffered` 每 32 个更新批量提交。超出稠密范围使用稀疏映射。 |
+| `PERF_TIME_SORT`、`PERF_MEDIUM_BINS`、`PERF_BIN_MASK` | `TIME_SORT=1` 启用混合排序，至多 16 个时间用插入排序，至少 2048 个可走基数排序。大输入编译版原有半小时分桶路径要求至少 2048 个事件且覆盖不超过 1024 桶。`MEDIUM_BINS=1` 为 64–2047 个事件试探活跃桶；太分散时回到排序。`BIN_MASK=1` 用位图扫描大组非空桶。 |
+| `PERF_PURCHASE_BINS`、`PERF_SINGLE_PURCHASE`、`PERF_CATEGORY_DENSE` | 前两项均需设为 1，分别复用分桶得到的会话编号、直接定位单笔购买。`CATEGORY_DENSE=1` 为前 32 类用窄计数，加满后累计进位，其余类别用映射，按金额及类别字节序决胜。 |
+| `PERF_ASSISTS=interval/mask/unsorted/simd`、`PERF_SMALL_CLICKS=N` | 默认 `interval`，小点击阈值 32，可设 1–64。`mask` 对最多 64 个会话按活动合并位掩码，`simd` 可在 AVX2 上比较至少 4 个会话时刻。`unsorted/simd` 在适用的分组路径上允许小组跳过预排序，包括路由的组内整理。最终会话数超过 64 时恢复时间顺序。 |
+| `PERF_CAMPAIGNS=map/dense/columns/buffered` | 默认 `map`。活动数乘窗口天数至多 131072 时使用稠密槽；`map` 将结果物化为映射，`dense` 可直接交给 writer。`columns` 分列保存三个 `u16` 计数及 `i64` 收入，进位另存；`buffered` 每 32 个更新批量提交。超出稠密范围使用稀疏映射。 |
 | `PERF_PREPARE_NAMES=1`、`PERF_MERGE_GROUPS=1`、`PERF_GROUP_ROWS=N` | 提前生成姓名字典及行程、写前合并同一输出分片的列、调整用户行组行数。默认每组上限 65536 行，字符串页另有 8 MiB 目标。 |
 | `PERF_USER_PLAIN=1`、`PERF_CAMPAIGN_PLAIN=1`、`PERF_WRITE_BUFFER=N` | 分别选择用户页及活动页的未压缩 codec，字典、RLE 与位打包仍由 writer 选择。默认使用 Snappy 的适用页面。用户 writer 的缓冲默认 256 KiB，可设 4 KiB–16 MiB。 |
 | `PERF_WRITERS=N`、`PERF_CAMPAIGN_FIRST=1` | 用户文件固定八份，`WRITERS` 控制 1–8 个用户写任务，默认 8。活动表默认用单独任务；开启后由第一个用户写任务先写活动表。 |
-| `PERF_POOL=spin`、`PERF_SPIN=N`、`PERF_GRAIN=N` | 默认 Rayon。`spin` 给并行 setup 和 writer 建常驻队列，空闲时自旋后等待。`SPIN` 只对该队列有效，默认 0，最多 100000 次。`GRAIN` 默认 1，影响这两阶段任务分组；摄入、去重等阶段仍使用 Rayon。 |
+| `PERF_POOL=spin/stages`、`PERF_SPIN=N`、`PERF_GRAIN=N` | 默认 Rayon。`spin` 用常驻队列处理并行 setup 与 writer。`stages` 还调度标准路径的事件解析、去重、人员会话、点击解析及排序分区，以及路由的事件/点击解析、去重、P1/P2。队列工人数取 Rayon 线程数，两池共享容器 CPU 配额。`SPIN` 对常驻队列有效，默认 0，最多 100000 次。setup/writer 默认每组一项，`stages` 的解析和分区阶段按每工人约四组、各阶段最小粒度计算默认组长，`GRAIN` 可覆盖它。 |
 | `PERF_THP=1`、`PERF_RELEASE_AFTER_CLOSE=1`、`PERF_EXIT_AFTER_CLOSE=1` | 分别为合格内存区建议透明大页、将当前 writer 的日列保留至 close 后集中释放、在所有 writer 完成并输出诊断后退出。透明大页是否实际使用由内核决定。 |
 
 ## 整程计时与阶段诊断
 
 `design_matrix.py` 可对同一镜像切换环境，`sweep` 对每项与其直接前驱跑 `ABBAAB`。矩阵的 `control` 显式选择旧排序、购买及归因设置；`defaults` 使用程序默认值。`profile --lean` 记录阶段时间；省略 `--lean` 同时打开 `PROFILE_WORK=1` 和 `PROFILE_LOCKS=1`。诊断会重新分类输入、采样内存及计时锁获取，正式耗时另跑。
 
+阶段线程池把连续工作项组成一组，组内顺序处理并复用临时空间。常驻工人或协助执行的线程在组内再次提交阶段任务时就地运行。组内并行排序仍可借用 Rayon；等待子任务的 Rayon 工人会让出执行机会，长时间无进展时可协助自己的任务组。`PROFILE=1` 的 `stage_workers` 给出工作项数、实际组长、参与的常驻工人数和阶段时间。
+
 ```powershell
 & $py scripts/design_matrix.py "$work/sweep" sweep $b mmap batch --study $study --cases s83-20m
 & $py scripts/design_matrix.py "$work/phases" profile $b defaults --study $study --cases s83-20m --lean
 & $py scripts/design_matrix.py "$work/counters" profile $b defaults --study $study --cases s83-20m
+```
+
+比较页写法时固定 `PERF_ROUTE_CHUNKS=16`。原生页会把目标组长至少提高到 16，再按工作量和元数据预算调整，同时改变组长会混入调度成本。用新提交构建的同一镜像、独立结果目录和下列配置，分别测三种写法、描述符和阶段线程池。`PROFILE=1` 的 `native_stream_store_bytes` 可确认实际经过非临时写的字节数；`forwarded_descriptor_bytes`、`forwarded_event_bytes`、`forwarded_click_bytes` 可核对转发量。矩阵复用已存在的结果文件，更换镜像或设置时另取目录名。
+
+```powershell
+@'
+{
+  "layout":["flat-groups",{"PERF_ROUTE_CHUNKS":"16","PERF_ROUTE_INPUT_PAGES":"0","PERF_ROUTE_WRITES":"direct"}],
+  "page-direct":["layout",{"PERF_ROUTE_INPUT_PAGES":"1"}],
+  "page-buffered":["page-direct",{"PERF_ROUTE_WRITES":"buffered"}],
+  "page-stream":["page-buffered",{"PERF_ROUTE_WRITES":"stream"}],
+  "forward-blocks":["layout",{"PERF_ROUTE_FORWARD":"blocks"}],
+  "stage-pool":["layout",{"PERF_POOL":"stages"}]
+}
+'@ | Set-Content -Encoding ascii "$work/layout-trials.json"
+& $py scripts/design_matrix.py "$work/layout-race" sweep $b page-direct page-buffered page-stream forward-blocks stage-pool --settings "$work/layout-trials.json" --study $study --cases s83-20m
 ```
 
 `PROFILE=1` 记录各阶段 wall time、RSS、进程 I/O、缺页、线程 CPU ticks 与可用的硬件计数。内核拒绝 perf 事件时记录 errno。`PROFILE_LOCKS` 也可写作 `PERF_LOCKS`，累计的是各分片互斥锁获取区间。`PROFILE_WORK` 区分真实 read 返回字节、映射逻辑遍历字节、坏时间、引号及长行。路由重叠阶段的 elapsed、任务时长总和以及整程 wall time 各自统计。矩阵 `--cold` 单独进行页驱逐与驻留核验。
@@ -119,7 +137,8 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 运行时 `PERF_ISA=portable/v3/wide/cascade` 在镜像已构建且 CPU 特征满足时选对应程序。默认按 CPU 和事件 CSV 总字节调度，`PERF_LARGE_BYTES` 为 3 GiB。`SCORER_STATIC=1` 配合 `RUNTIME_IMAGE=scratch`，镜像自带 Rust 调度器。正式比较保持 mimalloc 和镜像的 `MIMALLOC_PURGE_DELAY=10000` 一致。默认 LTO 为 thin，已有 PGO 配置用于 v4 大输入程序。重训时用独立种子，并记录训练提交和参数。
 
 ```powershell
-& $py scripts/train_wide_profile.py $vol s37-20m rust/design-training.profdata --revision $rev --lto thin
+docker run --rm --network none --cpuset-cpus 0,2,4,6,8,10,12,14 --cpus 8 --memory 24g --memory-swap 24g --mount "type=volume,source=$vol,target=/data" "${vol}:generator" --seed 91 --events 8000000 --clicks 2000000 --threads 8 --output /data/design-s91-8m
+& $py scripts/train_wide_profile.py $vol design-s91-8m rust/design-training.profdata --revision $rev --lto thin
 docker buildx build --platform linux/amd64 --load -t shopping-design:trained --build-arg SCORER_PROFILE=design-training.profdata .
 ```
 

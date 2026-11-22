@@ -26,8 +26,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY rust/dispatch.rs /tmp/dispatch.rs
 RUN set -eu; flags=""; if [ "$SCORER_STATIC" = 1 ]; then flags=-Ctarget-feature=+crt-static; fi; \
     SCORER_CASCADE="$SCORER_CASCADE" rustc --edition=2024 -O $flags /tmp/dispatch.rs -o /shopping-sessions; \
-    if [ "$SCORER_STATIC" = 1 ]; then for bin in /shopping-sessions /portable /optimized /large /cascade; do \
-      if readelf -l "$bin" | grep -q INTERP; then echo "dynamic interpreter in $bin"; exit 1; fi; done; fi; \
+    if [ "$SCORER_STATIC" = 1 ]; then command -v readelf >/dev/null; \
+      for bin in /shopping-sessions /portable /optimized /large /cascade; do \
+        readelf -l -d "$bin" >/tmp/scorer-elf; \
+        if grep -Eq 'INTERP|\(NEEDED\)' /tmp/scorer-elf; then echo "dynamic runtime dependency in $bin"; exit 1; fi; \
+      done; fi; \
     mkdir /scorers; cp /shopping-sessions /portable /optimized /large /scorers; \
     if [ "$SCORER_CASCADE" = 1 ]; then cp /cascade /scorers; fi
 

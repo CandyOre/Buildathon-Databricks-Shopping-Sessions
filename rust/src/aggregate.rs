@@ -121,12 +121,12 @@ const SESSION_GAP: u32 = 1_800_000;
 
 fn purchase_bins() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PERF_PURCHASE_BINS").is_none_or(|v| v != "0"))
+    *ENABLED.get_or_init(|| crate::runtime::flag("PERF_PURCHASE_BINS"))
 }
 
 fn use_radix_time_sort() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PERF_TIME_SORT").is_none_or(|v| v != "0"))
+    *ENABLED.get_or_init(|| crate::runtime::flag("PERF_TIME_SORT"))
 }
 
 #[derive(Clone, Copy)]
@@ -458,7 +458,7 @@ fn compact_for_people(
     let medium_bins = std::env::var_os("PERF_MEDIUM_BINS").is_some_and(|v| v == "1");
     let occupied_bins = std::env::var_os("PERF_BIN_MASK").is_some_and(|v| v == "1");
     let direct_purchase = purchase_bins();
-    let single_purchase = std::env::var_os("PERF_SINGLE_PURCHASE").is_none_or(|v| v != "0");
+    let single_purchase = crate::runtime::flag("PERF_SINGLE_PURCHASE");
     let mut radix = Vec::new();
     let mut heads = Vec::new();
     let mut next_purchase = Vec::new();
@@ -607,10 +607,10 @@ enum CampaignMode { Map, Dense, Columns, Buffered }
 fn campaign_mode() -> CampaignMode {
     static MODE: std::sync::OnceLock<CampaignMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("PERF_CAMPAIGNS").as_deref() {
-        Ok("map") => CampaignMode::Map,
+        Ok("dense") => CampaignMode::Dense,
         Ok("columns") => CampaignMode::Columns,
         Ok("buffered") => CampaignMode::Buffered,
-        _ => CampaignMode::Dense,
+        _ => CampaignMode::Map,
     })
 }
 
@@ -625,10 +625,10 @@ enum AssistMode {
 fn assist_mode() -> AssistMode {
     static MODE: std::sync::OnceLock<AssistMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("PERF_ASSISTS").as_deref() {
-        Ok("interval") => AssistMode::Intervals,
+        Ok("unsorted") => AssistMode::Unsorted,
         Ok("mask") => AssistMode::Masks,
         Ok("simd") => AssistMode::Simd,
-        _ => AssistMode::Unsorted,
+        _ => AssistMode::Intervals,
     })
 }
 
@@ -987,6 +987,15 @@ pub(crate) struct FusedCampaigns {
     campaigns:usize,
     window:crate::input::Window,
     work:bool,
+    timing:Option<FusedTiming>,
+}
+
+#[derive(Default)]
+struct FusedTiming {
+    batches:std::sync::atomic::AtomicU64,
+    sessions:std::sync::atomic::AtomicU64,
+    clicks:std::sync::atomic::AtomicU64,
+    nanoseconds:std::sync::atomic::AtomicU64,
 }
 
 impl FusedCampaigns {
@@ -994,12 +1003,20 @@ impl FusedCampaigns {
         Self {
             workers:(0..crate::runtime::worker_slots()).map(|_|std::sync::Mutex::new(None)).collect(),
             campaigns,window,work:crate::records::work_enabled(),
+            timing:crate::runtime::flag("PROFILE").then(FusedTiming::default),
         }
     }
     pub fn consume(&self,batch:&mut SessionBatch,clicks:&mut Vec<Click>,ids:&ClickIds) {
         let sessions=std::mem::take(&mut batch.sessions);
         let mut clicks=std::mem::take(clicks);
         if sessions.is_empty(){return;}
+        let start=self.timing.as_ref().map(|t|{
+            use std::sync::atomic::Ordering::Relaxed;
+            t.batches.fetch_add(1,Relaxed);
+            t.sessions.fetch_add(sessions.len() as u64,Relaxed);
+            t.clicks.fetch_add(clicks.len() as u64,Relaxed);
+            std::time::Instant::now()
+        });
         let index=crate::runtime::worker_slot().unwrap_or(0)%self.workers.len();
         let mut worker=self.workers[index].lock().unwrap();
         let (totals,scratch)=worker.get_or_insert_with(||(
@@ -1007,9 +1024,17 @@ impl FusedCampaigns {
             AssistScratch{work:self.work.then(AttributionWork::default),..AssistScratch::default()}
         ));
         summarize_campaigns(sessions,&mut clicks,ids,totals,scratch);
+        if let (Some(t),Some(start))=(&self.timing,start) {
+            t.nanoseconds.fetch_add(start.elapsed().as_nanos() as u64,std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub fn finish(self,batches:&[SessionBatch])->CampaignDays {
         if self.work {log_session_work(batches);}
+        if let Some(t)=self.timing {
+            eprintln!("profile {}",serde_json::json!({"stage":"fused_attribution","batches":t.batches.into_inner(),
+                "sessions_consumed":t.sessions.into_inner(),"clicks_consumed":t.clicks.into_inner(),
+                "partition_task_sum_s":t.nanoseconds.into_inner() as f64*1e-9}));
+        }
         let merged=self.workers.into_par_iter()
             .filter_map(|s|s.into_inner().unwrap().map(|(counts,scratch)|(counts,scratch.work)))
             .reduce_with(merge_campaign_work);

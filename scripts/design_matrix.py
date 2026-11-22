@@ -17,6 +17,8 @@ TRIALS = {
     "control": (None, CONTROL),
     "intern-clicks": ("control", {"PERF_CLICK_KEYS":"intern"}),
     "defaults": (None, {}),
+    "stages": ("control", {"PERF_POOL":"stages"}),
+    "stages-spin": ("stages", {"PERF_SPIN":"128"}),
     "mmap": ("control", {"PERF_IO":"mmap"}),
     "adaptive": ("mmap", {"PERF_CHUNK":"adaptive"}),
     "release-pages": ("adaptive", {"PERF_PAGE_RELEASE":"1"}),
