@@ -470,6 +470,34 @@ pub struct CampaignDay {
 
 pub type CampaignDays = AHashMap<(u32, i32), CampaignDay>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssistMode {
+    Intervals,
+    Masks,
+    Unsorted,
+    Simd,
+}
+
+fn assist_mode() -> AssistMode {
+    static MODE: std::sync::OnceLock<AssistMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("PERF_ASSISTS").as_deref() {
+        Ok("interval") => AssistMode::Intervals,
+        Ok("mask") => AssistMode::Masks,
+        Ok("simd") => AssistMode::Simd,
+        _ => AssistMode::Unsorted,
+    })
+}
+
+pub(crate) fn skip_click_sort(n: usize) -> bool {
+    n <= 32 && matches!(assist_mode(), AssistMode::Unsorted | AssistMode::Simd)
+}
+
+#[derive(Default)]
+struct AssistScratch {
+    intervals: AHashMap<u32, (i64, i64)>,
+    masks: AHashMap<u32, u64>,
+}
+
 // Allocate dense counters only when the manifest and dimension table imply a
 // modest working set. The sparse representation handles longer windows.
 enum Counters {
@@ -574,16 +602,16 @@ pub fn campaign_daily(
         .zip(clicks)
         .with_min_len(min_len)
         .fold(
-            || (Counters::new(campaigns, window), AHashMap::default()),
-            |(mut totals, mut intervals), (batch, clicks)| {
+            || (Counters::new(campaigns, window), AssistScratch::default()),
+            |(mut totals, mut scratch), (batch, mut clicks)| {
                 summarize_campaigns(
                     std::mem::take(&mut batch.sessions),
-                    &clicks,
+                    &mut clicks,
                     &ids,
                     &mut totals,
-                    &mut intervals,
+                    &mut scratch,
                 );
-                (totals, intervals)
+                (totals, scratch)
             },
         )
         .map(|(totals, _)| totals)
@@ -593,22 +621,28 @@ pub fn campaign_daily(
 
 fn summarize_campaigns(
     sessions: Vec<Session>,
-    mut clicks: &[Click],
+    clicks: &mut [Click],
     ids: &ClickIds,
     totals: &mut Counters,
-    intervals: &mut AHashMap<u32, (i64, i64)>,
+    scratch: &mut AssistScratch,
 ) {
+    let mut cursor = 0;
+    let mode = assist_mode();
     for sessions in sessions.chunk_by(|a, b| a.person == b.person) {
         let person = sessions[0].person;
-        while clicks.first().is_some_and(|click| click.person < person) {
-            clicks = &clicks[1..];
+        while cursor < clicks.len() && clicks[cursor].person < person { cursor += 1; }
+        let first = cursor;
+        while cursor < clicks.len() && clicks[cursor].person == person { cursor += 1; }
+        let person_clicks = &mut clicks[first..cursor];
+        if person_clicks.len() > 1 && skip_click_sort(person_clicks.len()) {
+            if sessions.len() <= 64 {
+                small_attribution(sessions, person_clicks, ids, totals, &mut scratch.masks, true, mode);
+                continue;
+            }
+            // The click reader cannot know the final session count. Restore
+            // chronological order before this unusually large session group.
+            person_clicks.sort_unstable_by_key(|c| c.time);
         }
-        let end = clicks
-            .iter()
-            .take_while(|click| click.person == person)
-            .count();
-        let person_clicks = &clicks[..end];
-        clicks = &clicks[end..];
 
         let start_time = sessions[0].time;
         let end_time = sessions.last().unwrap().time;
@@ -653,6 +687,11 @@ fn summarize_campaigns(
             continue;
         }
         credit(sessions, person_clicks, ids, totals);
+        if mode != AssistMode::Intervals && sessions.len() <= 64 {
+            small_attribution(sessions, person_clicks, ids, totals, &mut scratch.masks, false, mode);
+            continue;
+        }
+        let intervals = &mut scratch.intervals;
         for click in person_clicks {
             let interval = intervals
                 .entry(click.campaign)
@@ -665,6 +704,102 @@ fn summarize_campaigns(
         }
         for (campaign, interval) in intervals.drain() {
             assist(sessions, campaign, interval, totals);
+        }
+    }
+}
+
+fn low_bits(count: usize) -> u64 {
+    !u64::MAX.checked_shl(count as u32).unwrap_or(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_window(times: &[i64], first: i64, last: i64) -> u64 {
+    use std::arch::x86_64::*;
+    let mut result = 0;
+    let mut i = 0;
+    unsafe {
+        let first = _mm256_set1_epi64x(first);
+        let last = _mm256_set1_epi64x(last);
+        while i + 4 <= times.len() {
+            let t = _mm256_loadu_si256(times.as_ptr().add(i).cast());
+            let outside = _mm256_or_si256(_mm256_cmpgt_epi64(first, t), _mm256_cmpgt_epi64(t, last));
+            result |= ((!_mm256_movemask_pd(_mm256_castsi256_pd(outside)) & 15) as u64) << i;
+            i += 4;
+        }
+    }
+    for (offset, &t) in times[i..].iter().enumerate() {
+        result |= u64::from(first <= t && t <= last) << (i + offset);
+    }
+    result
+}
+
+fn small_attribution(
+    sessions: &[Session],
+    clicks: &[Click],
+    ids: &ClickIds,
+    totals: &mut Counters,
+    masks: &mut AHashMap<u32, u64>,
+    find_winners: bool,
+    mode: AssistMode,
+) {
+    debug_assert!(sessions.len() <= 64);
+    let mut best = [None::<&Click>; 64];
+    #[cfg(target_arch = "x86_64")]
+    let mut times = [0i64; 64];
+    #[cfg(target_arch = "x86_64")]
+    let vector = mode == AssistMode::Simd && sessions.len() >= 4 && std::is_x86_feature_detected!("avx2");
+    #[cfg(target_arch = "x86_64")]
+    if vector {
+        for (dest, session) in times.iter_mut().zip(sessions) { *dest = session.time; }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = mode;
+    for click in clicks {
+        let first = click.time;
+        let last = first.saturating_add(LOOKBACK);
+        let scalar = || {
+            let begin = sessions.partition_point(|s| s.time < first);
+            let end = sessions.partition_point(|s| s.time <= last);
+            low_bits(end) & !low_bits(begin)
+        };
+        #[cfg(target_arch = "x86_64")]
+        let mask = if vector {
+            unsafe { simd_window(&times[..sessions.len()], first, last) }
+        } else { scalar() };
+        #[cfg(not(target_arch = "x86_64"))]
+        let mask = scalar();
+        if mask == 0 { continue; }
+        *masks.entry(click.campaign).or_default() |= mask;
+        if find_winners {
+            let mut bits = mask;
+            while bits != 0 {
+                let slot = &mut best[bits.trailing_zeros() as usize];
+                if slot.is_none_or(|old| click.time > old.time ||
+                    (click.time == old.time && ids.compare(click.id, old.id).is_lt())) {
+                    *slot = Some(click);
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
+    if find_winners {
+        for (session, winner) in sessions.iter().zip(best) {
+            let row = totals.row(winner.map_or(0, |c| c.campaign), day(session.time));
+            row.sessions += 1;
+            row.purchasing_sessions += i64::from(session.revenue > 0);
+            row.revenue += session.revenue;
+        }
+    }
+    for (campaign, mut bits) in masks.drain() {
+        while bits != 0 {
+            let i = bits.trailing_zeros() as usize;
+            let d = day(sessions[i].time);
+            let midnight = (i64::from(d) + 1) * DAY;
+            let end = i + sessions[i..].partition_point(|s| s.time < midnight);
+            let through_day = low_bits(end);
+            totals.row(campaign, d).assisted_sessions += i64::from((bits & through_day).count_ones());
+            bits &= !through_day;
         }
     }
 }
@@ -705,6 +840,51 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
         let count = covered.partition_point(|session| session.time < next_day);
         totals.row(campaign, current_day).assisted_sessions += count as i64;
         covered = &covered[count..];
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use crate::input::Names;
+
+    #[test]
+    fn masks_match_brute_force_for_unsorted_clicks_and_full_64th_bit() {
+        let ids = ClickIds::new(Names::default(), vec![]);
+        let sessions: Vec<_> = (0..64).map(|i| Session {
+            person: 1,
+            time: i * DAY,
+            revenue: i % 3,
+        }).collect();
+        let clicks: Vec<_> = [(-LOOKBACK, 21, 1), (-LOOKBACK - 1, 20, 2),
+            (0, 14, 4), (0, 9, 3), (0, 9, 3), (1, 8, 2), (63 * DAY, 2, 1)]
+            .into_iter().rev().map(|(time, id, campaign)| Click { time, id, person: 1, campaign }).collect();
+        let snapshot = |totals: Counters| {
+            let mut values: Vec<_> = totals.into_rows().into_iter().map(|(key, c)|
+                (key, c.sessions, c.purchasing_sessions, c.revenue, c.assisted_sessions)).collect();
+            values.sort_unstable();
+            values
+        };
+        let mut reference = Counters::Sparse(Default::default());
+        for session in &sessions {
+            let valid: Vec<_> = clicks.iter().filter(|c|
+                c.time <= session.time && c.time >= session.time - LOOKBACK).collect();
+            let best = valid.iter().min_by_key(|c| (std::cmp::Reverse(c.time), c.id));
+            let row = reference.row(best.map_or(0, |c| c.campaign), day(session.time));
+            row.sessions += 1;
+            row.revenue += session.revenue;
+            row.purchasing_sessions += i64::from(session.revenue > 0);
+            let mut campaigns: Vec<_> = valid.iter().map(|c| c.campaign).collect();
+            campaigns.sort_unstable();
+            campaigns.dedup();
+            for c in campaigns { reference.row(c, day(session.time)).assisted_sessions += 1; }
+        }
+        let expected = snapshot(reference);
+        for mode in [AssistMode::Masks, AssistMode::Unsorted, AssistMode::Simd] {
+            let mut result = Counters::Sparse(Default::default());
+            small_attribution(&sessions, &clicks, &ids, &mut result, &mut AHashMap::default(), true, mode);
+            assert_eq!(snapshot(result), expected);
+        }
     }
 }
 

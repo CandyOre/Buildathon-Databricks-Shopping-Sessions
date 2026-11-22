@@ -914,7 +914,7 @@ fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, 
         let end = end as usize;
         if end - start > 32768 {
             rows[start..end].par_sort_unstable_by_key(&time);
-        } else if end - start > 1 {
+        } else if end - start > 1 && !crate::aggregate::skip_click_sort(end - start) {
             rows[start..end].sort_unstable_by_key(&time);
         }
         start = end;
