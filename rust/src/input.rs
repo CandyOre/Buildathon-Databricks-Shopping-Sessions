@@ -1834,6 +1834,7 @@ mod person_tests {
         users.packed = Some(Arc::clone(&table));
         let aliases = Aliases {
             wide: None,
+            wide_cache: None,
             table,
             external: (0..SHARDS).map(|_| AHashMap::default()).collect(),
         };
