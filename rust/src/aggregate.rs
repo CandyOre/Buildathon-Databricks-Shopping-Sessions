@@ -169,7 +169,10 @@ unsafe fn vector_starts(times: &[u32], positions: &mut Vec<usize>) -> usize {
     use std::arch::x86_64::*;
     // The caller checks AVX2 once before entering the vector loop.
     let (sign, bound) = unsafe {
-        (_mm256_set1_epi32(i32::MIN), _mm256_set1_epi32(i32::MIN ^ SESSION_GAP as i32))
+        (
+            _mm256_set1_epi32(i32::MIN),
+            _mm256_set1_epi32(i32::MIN ^ SESSION_GAP as i32),
+        )
     };
     let mut index = 1;
     while index + 8 <= times.len() {
@@ -468,6 +471,42 @@ fn summarize_campaigns(
         let end = person_clicks.partition_point(|click| click.time <= end_time);
         let person_clicks = &person_clicks[start..end];
 
+        if person_clicks.len() <= 1 {
+            let click = person_clicks.first();
+            for session in sessions {
+                let campaign = click
+                    .filter(|c| c.time <= session.time && c.time >= session.time - LOOKBACK)
+                    .map_or(0, |c| c.campaign);
+                let row = totals.row(campaign, day(session.time));
+                row.sessions += 1;
+                row.purchasing_sessions += i64::from(session.revenue > 0);
+                row.revenue += session.revenue;
+                row.assisted_sessions += i64::from(campaign != 0);
+            }
+            continue;
+        }
+        if sessions.len() == 1 && person_clicks.len() <= 8 {
+            let session = &sessions[0];
+            let current_day = day(session.time);
+            let mut unique = [0u32; 8];
+            let mut used = 0;
+            let mut best = person_clicks.last().unwrap();
+            for click in person_clicks {
+                if !unique[..used].contains(&click.campaign) {
+                    unique[used] = click.campaign;
+                    used += 1;
+                    totals.row(click.campaign, current_day).assisted_sessions += 1;
+                }
+                if click.time == best.time && ids.compare(click.id, best.id).is_lt() {
+                    best = click;
+                }
+            }
+            let row = totals.row(best.campaign, current_day);
+            row.sessions += 1;
+            row.purchasing_sessions += i64::from(session.revenue > 0);
+            row.revenue += session.revenue;
+            continue;
+        }
         credit(sessions, person_clicks, ids, totals);
         for click in person_clicks {
             let interval = intervals

@@ -74,12 +74,36 @@ pub struct Event {
 
 const EXTENDED: u32 = 1 << 31;
 
+// The shard owns seven low ID bits. The remaining 57-bit quotient and a
+// 39-bit location/ingestion code fit in three naturally aligned u32 words.
+const ID_SHARD_BITS: u32 = SHARDS.trailing_zeros();
+const QUOTIENT_HIGH_BITS: u32 = 32 - ID_SHARD_BITS;
+const QUOTIENT_HIGH_MASK: u32 = (1 << QUOTIENT_HIGH_BITS) - 1;
+const POSITION_BITS: u32 = 18;
+const POSITION_MASK: u32 = (1 << POSITION_BITS) - 1;
+const EXCEPTIONAL: u64 = (1 << (32 + ID_SHARD_BITS)) - (1 << 22);
+const _: () = assert!(SHARDS == 128);
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct EntryId {
-    id: u64,
-    ingested: u32,
-    position: u32,
+    low: u32,
+    high_code: u32,
+    code: u32,
 }
+
+impl EntryId {
+    #[inline]
+    fn quotient(&self) -> u64 {
+        (u64::from(self.high_code & QUOTIENT_HIGH_MASK) << 32) | u64::from(self.low)
+    }
+
+    #[inline]
+    fn code(&self) -> u64 {
+        (u64::from(self.high_code >> QUOTIENT_HIGH_BITS) << 32) | u64::from(self.code)
+    }
+}
+const _: () = assert!(std::mem::size_of::<EntryId>() == 12);
 
 // A chunk owns one backing allocation for the common prefixes of all shards.
 // Only a shard that outgrows its prefix allocates a separate continuation.
@@ -150,25 +174,32 @@ impl<T: Copy> ShardSlab<T> {
 
 struct ChunkIds {
     rows: ShardSlab<EntryId>,
-    far_ingests: Vec<i64>,
+    exceptional: Vec<(i64, u32)>,
 }
 
 impl ChunkIds {
     fn push(&mut self, id: u64, ingested: i64, position: u32, origin_seconds: i64) {
-        let offset = (ingested.div_euclid(1000) - origin_seconds) as u64;
-        let ingested = if offset < u64::from(EXTENDED) {
-            offset as u32
+        let seconds = (ingested.div_euclid(1000) - origin_seconds) as u64;
+        let code = if seconds < (EXCEPTIONAL >> POSITION_BITS)
+            && (position < POSITION_MASK || position == u32::MAX)
+        {
+            (seconds << POSITION_BITS) | u64::from(position & POSITION_MASK)
         } else {
-            let index = self.far_ingests.len() as u32;
-            self.far_ingests.push(ingested);
-            EXTENDED | index
+            // A chunk owns only lines starting within its 4 MiB byte range.
+            // This leaves room for every row to require a full-width entry.
+            let index = self.exceptional.len();
+            assert!(index < 1 << 22);
+            self.exceptional.push((ingested, position));
+            EXCEPTIONAL + index as u64
         };
+        let quotient = id >> ID_SHARD_BITS;
+        let high_code = (quotient >> 32) as u32 | ((code >> 32) as u32) << QUOTIENT_HIGH_BITS;
         self.rows.push(
             id as usize % SHARDS,
             EntryId {
-                id,
-                ingested,
-                position,
+                low: quotient as u32,
+                high_code,
+                code: code as u32,
             },
         );
     }
@@ -178,7 +209,7 @@ impl ChunkIds {
         IdRun {
             prefix,
             overflow,
-            far_ingests: &self.far_ingests,
+            exceptional: &self.exceptional,
         }
     }
 }
@@ -186,7 +217,7 @@ impl ChunkIds {
 struct IdRun<'a> {
     prefix: &'a [EntryId],
     overflow: &'a [EntryId],
-    far_ingests: &'a [i64],
+    exceptional: &'a [(i64, u32)],
 }
 
 impl IdRun<'_> {
@@ -194,12 +225,24 @@ impl IdRun<'_> {
         self.prefix.iter().chain(self.overflow)
     }
 
-    fn ingest_time(&self, value: u32, origin_seconds: i64) -> i64 {
-        if value < EXTENDED {
-            (origin_seconds + i64::from(value)) * 1000
+    #[inline]
+    fn winner(&self, row: &EntryId, origin_seconds: i64, chunk: usize) -> (i64, usize, u32) {
+        let code = row.code();
+        let (ingest, position) = if code < EXCEPTIONAL {
+            let seconds = (code >> POSITION_BITS) as i64;
+            let short = code as u32 & POSITION_MASK;
+            (
+                (origin_seconds + seconds) * 1000,
+                if short == POSITION_MASK {
+                    u32::MAX
+                } else {
+                    short
+                },
+            )
         } else {
-            self.far_ingests[(value ^ EXTENDED) as usize]
-        }
+            self.exceptional[(code - EXCEPTIONAL) as usize]
+        };
+        (ingest, chunk, position)
     }
 }
 
@@ -317,7 +360,7 @@ pub fn read_events(
             let stride = chunk.byte_len().div_ceil(70 * SHARDS) + 8;
             let mut id_rows = ChunkIds {
                 rows: ShardSlab::new(stride),
-                far_ingests: Vec::new(),
+                exceptional: Vec::new(),
             };
             let mut people_rows = ChunkPeople {
                 rows: ShardSlab::new(stride),
@@ -398,10 +441,10 @@ fn losing_positions(fragments: Vec<IdRun<'_>>, origin_seconds: i64) -> Vec<(usiz
     let buckets = (8 * rows).next_power_of_two().max(64);
     let mut occupied = vec![0_u64; buckets / 64];
     let mut repeated = vec![0_u64; buckets / 64];
-    let bucket = |id: u64| (id as usize / SHARDS) & (buckets - 1);
+    let bucket = |row: &EntryId| row.low as usize & (buckets - 1);
     for batch in &fragments {
         for row in batch.rows() {
-            let slot = bucket(row.id);
+            let slot = bucket(row);
             let bit = 1_u64 << (slot % 64);
             let seen = &mut occupied[slot / 64];
             repeated[slot / 64] |= *seen & bit;
@@ -414,14 +457,10 @@ fn losing_positions(fragments: Vec<IdRun<'_>>, origin_seconds: i64) -> Vec<(usiz
     let mut winners = AHashMap::<u64, (i64, usize, u32)>::new();
     for (chunk, batch) in fragments.iter().enumerate() {
         for row in batch.rows() {
-            let slot = bucket(row.id);
+            let slot = bucket(row);
             if repeated[slot / 64] & (1_u64 << (slot % 64)) != 0 {
-                let current = (
-                    batch.ingest_time(row.ingested, origin_seconds),
-                    chunk,
-                    row.position,
-                );
-                let (_, old_chunk, old_row) = match winners.entry(row.id) {
+                let current = batch.winner(row, origin_seconds, chunk);
+                let (_, old_chunk, old_row) = match winners.entry(row.quotient()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(current);
                         continue;
@@ -841,7 +880,7 @@ mod shard_slab_tests {
         let mut blocks: Vec<_> = (0..2)
             .map(|_| ChunkIds {
                 rows: ShardSlab::new(1),
-                far_ingests: Vec::new(),
+                exceptional: Vec::new(),
             })
             .collect();
         let shard = 7;
@@ -855,5 +894,104 @@ mod shard_slab_tests {
         let mut losers = losing_positions(blocks.iter().map(|c| c.run(shard)).collect(), 0);
         losers.sort_unstable();
         assert_eq!(losers, vec![(0, 21), (0, 22), (0, 23)]);
+    }
+}
+
+#[cfg(test)]
+mod packed_id_tests {
+    use super::*;
+
+    #[test]
+    fn quotient_and_location_round_trip_across_all_encoding_boundaries() {
+        let origin = -86_400i64;
+        let inline_limit = (EXCEPTIONAL >> POSITION_BITS) as i64;
+        let keys = [0, 1, 127, 128, (1u64 << 39) - 1, 1 << 39, 1 << 63, u64::MAX];
+        for id in keys {
+            let mut block = ChunkIds {
+                rows: ShardSlab::new(1),
+                exceptional: Vec::new(),
+            };
+            let mut expected = Vec::new();
+            for offset in [
+                -1,
+                0,
+                1,
+                1 << 14,
+                inline_limit - 1,
+                inline_limit,
+                3_000_000_000,
+            ] {
+                for pos in [
+                    0,
+                    POSITION_MASK - 1,
+                    POSITION_MASK,
+                    POSITION_MASK + 1,
+                    u32::MAX - 1,
+                    u32::MAX,
+                ] {
+                    let time = (origin + offset) * 1000;
+                    block.push(id, time, pos, origin);
+                    expected.push((time, 19, pos));
+                }
+            }
+            let shard = id as usize % SHARDS;
+            let run = block.run(shard);
+            for (packed, &original) in run.rows().zip(&expected) {
+                assert_eq!((packed.quotient() << ID_SHARD_BITS) | shard as u64, id);
+                assert_eq!(run.winner(packed, origin, 19), original);
+            }
+            assert_eq!(run.rows().count(), expected.len());
+        }
+    }
+
+    #[test]
+    fn equal_low_words_distinct_quotients_ties_and_invalid_winners_match_full_ids() {
+        let shard = 101usize;
+        let mut blocks: Vec<_> = (0..5)
+            .map(|_| ChunkIds {
+                rows: ShardSlab::new(2),
+                exceptional: Vec::new(),
+            })
+            .collect();
+        let mut flat: Vec<Vec<(u64, i64, u32)>> = (0..blocks.len()).map(|_| Vec::new()).collect();
+        for i in 0..1900usize {
+            let chunk = i % blocks.len();
+            let high = (i * 193 % 103) as u64;
+            let quotient = (high << 32) | ((i / 3 % 4) as u64);
+            let id = (quotient << ID_SHARD_BITS) | shard as u64;
+            let time = match i % 13 {
+                0 => -9_000,
+                1 => 3_000_000_000_000,
+                _ => ((i * 11 % 3) * 1000) as i64,
+            };
+            let position = match i % 17 {
+                0 => u32::MAX,
+                1 => POSITION_MASK + i as u32,
+                _ => i as u32,
+            };
+            blocks[chunk].push(id, time, position, 0);
+            flat[chunk].push((id, time, position));
+        }
+        let mut exact = AHashMap::<u64, (i64, usize, u32)>::default();
+        let mut expected = Vec::new();
+        for (chunk, rows) in flat.iter().enumerate() {
+            for &(id, time, pos) in rows {
+                let row = (time, chunk, pos);
+                if let Some(winner) = exact.get_mut(&id) {
+                    let lost = if time < winner.0 {
+                        std::mem::replace(winner, row)
+                    } else {
+                        row
+                    };
+                    if lost.2 != u32::MAX {
+                        expected.push((lost.1, lost.2));
+                    }
+                } else {
+                    exact.insert(id, row);
+                }
+            }
+        }
+        let actual = losing_positions(blocks.iter().map(|b| b.run(shard)).collect(), 0);
+        assert_eq!(actual, expected);
     }
 }
