@@ -633,6 +633,7 @@ struct NameShard {
     offset: usize,
     keys: Vec<u64>,
     ids: AHashMap<Arc<str>, u32>,
+    wide: Option<AHashMap<[u64;2], u32>>,
     names: Vec<Arc<str>>,
 }
 
@@ -652,6 +653,7 @@ impl NameShard {
 
 pub struct Names {
     packed: Option<Arc<NameTable>>,
+    wide_users: bool,
     hash: RandomState,
     shards: Vec<Mutex<NameShard>>,
 }
@@ -660,6 +662,7 @@ impl Default for Names {
     fn default() -> Self {
         Self {
             packed: None,
+            wide_users: false,
             hash: RandomState::new(),
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
         }
@@ -668,12 +671,33 @@ impl Default for Names {
 
 impl Names {
     pub fn intern(&self, name: &str) -> u32 {
+        if self.wide_users {
+            if let Some(key) = hex_id(name.as_bytes(), b'u') {
+                let shard = self.hash.hash_one(key) as usize % SHARDS;
+                return self.intern_wide(shard, key, name);
+            }
+        }
         let shard = self.hash.hash_one(name.as_bytes()) as usize % SHARDS;
         self.intern_in(shard, name)
     }
 
     fn intern_in(&self, shard: usize, name: &str) -> u32 {
         self.shards[shard].lock().unwrap().intern(shard, name)
+    }
+
+    fn intern_wide(&self, shard: usize, key: [u64;2], name: &str) -> u32 {
+        let mut state = self.shards[shard].lock().unwrap();
+        if let Some(&id) = state.wide.as_ref().and_then(|map| map.get(&key)) { return id; }
+        let id = id_for(shard, state.offset + state.keys.len());
+        let spelling = EXTERNAL_NAME | state.names.len() as u64;
+        state.keys.push(spelling);
+        let name: Arc<str> = name.into();
+        // Graph construction still needs the spelling both for its lexical
+        // representative and for remapping all external endpoints at finish.
+        if self.packed.is_none() { state.ids.insert(name.clone(), id); }
+        state.names.push(name);
+        state.wide.get_or_insert_with(AHashMap::default).insert(key, id);
+        id
     }
 
     fn register_bounded(&self, key: u64, hash: usize, limit: u64) -> Option<u32> {
@@ -792,9 +816,24 @@ fn linked_spelling<'a>(names: &'a [Vec<Arc<str>>], key: u64, buffer: &'a mut [u8
 pub struct Aliases {
     table: Arc<NameTable>,
     external: Vec<AHashMap<Arc<str>, u32>>,
+    wide: Option<Vec<AHashMap<[u64;2],u32>>>,
 }
 
 impl Aliases {
+    #[inline]
+    fn resolve_external(&self, users: &Names, bytes: &[u8]) -> u32 {
+        if let Some(wide) = &self.wide {
+            if let Some(key) = hex_id(bytes, b'u') {
+                let shard = users.hash.hash_one(key) as usize % SHARDS;
+                return wide[shard].get(&key).copied()
+                    .unwrap_or_else(|| users.intern_wide(shard,key,text(bytes)));
+            }
+        }
+        let shard = users.hash.hash_one(bytes) as usize % SHARDS;
+        let name = text(bytes);
+        self.external[shard].get(name).copied().unwrap_or_else(|| users.intern_in(shard,name))
+    }
+
     pub(crate) fn is_linked_person(&self, id: u32) -> bool {
         (id as usize) < self.table.canonical.len()
     }
@@ -1330,8 +1369,13 @@ fn unpack_name(key: u64, buffer: &mut [u8; 9]) -> &str {
 }
 
 pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
+    read_aliases_with_wide(data, users, perf_on("PERF_USER_HEX"))
+}
+
+fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> Result<Aliases> {
     let external = Names {
         hash: users.hash.clone(),
+        wide_users,
         ..Names::default()
     };
     let key_for = |bytes: &[u8]| {
@@ -1398,13 +1442,24 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
     }
     drop(batches);
     let table = graph.finish(&mut external, &users.hash);
+    let wide = wide_users.then(|| external.par_iter_mut().map(|names| {
+        let mut packed = AHashMap::default();
+        names.retain(|spelling,id| {
+            if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
+                packed.insert(key,*id);
+                false
+            } else { true }
+        });
+        packed
+    }).collect());
     let dynamic_start = table.canonical.len().div_ceil(SHARDS);
     for shard in &mut users.shards {
         shard.get_mut().unwrap().offset = dynamic_start;
     }
     let table = Arc::new(table);
     users.packed = Some(Arc::clone(&table));
-    Ok(Aliases { table, external })
+    users.wide_users = wide_users;
+    Ok(Aliases { table, external, wide })
 }
 
 #[derive(Clone, Copy)]
@@ -1541,14 +1596,7 @@ impl PersonCache {
                     .get(&key)
                     .copied()
                     .unwrap_or_else(|| users.intern(text(bytes))),
-                Prepared::External => {
-                    let shard = users.hash.hash_one(bytes) as usize % SHARDS;
-                    let name = text(bytes);
-                    aliases.external[shard]
-                        .get(name)
-                        .copied()
-                        .unwrap_or_else(|| users.intern_in(shard, name))
-                }
+                Prepared::External => aliases.resolve_external(users, bytes),
             }
         }
         #[cfg(feature = "large-input")]
@@ -1576,12 +1624,7 @@ impl PersonCache {
                     .copied()
                     .unwrap_or_else(|| users.intern(text(bytes)));
             }
-            let shard = users.hash.hash_one(bytes) as usize % SHARDS;
-            let name = text(bytes);
-            aliases.external[shard]
-                .get(name)
-                .copied()
-                .unwrap_or_else(|| users.intern_in(shard, name))
+            aliases.resolve_external(users, bytes)
         }
     }
 
@@ -1594,6 +1637,65 @@ impl PersonCache {
 #[cfg(test)]
 mod person_tests {
     use super::*;
+
+    #[test]
+    fn wide_people_preserve_linked_dynamic_and_unusual_spellings() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("shopping-wide-user-{}",std::process::id()));
+        let links = dir.join("links");
+        std::fs::create_dir_all(&links)?;
+        let paired = "u0000000000000000000000000000000f";
+        let other = "u0000000000000001000000000000000f";
+        let different_case = "u0000000000000000000000000000000F";
+        let path = links.join("part.csv");
+        std::fs::write(&path,format!("user_id_a,user_id_b\n{paired},U7\nU7,ordinary-alias\n"))?;
+        let mut users = Names::default();
+        let aliases = read_aliases_with_wide(&dir, &mut users, true)?;
+        let mut cache = PersonCache::default();
+        let owner = cache.resolve(&users,&aliases,paired.as_bytes());
+        assert_eq!(owner, cache.resolve(&users,&aliases,b"ordinary-alias"));
+        assert_eq!(owner, cache.resolve(&users,&aliases,b"U7"));
+        let new = cache.resolve(&users,&aliases,other.as_bytes());
+        let mixed = cache.resolve(&users,&aliases,different_case.as_bytes());
+        assert_ne!(new,owner);
+        assert_ne!(new,mixed);
+        assert_ne!(owner,mixed);
+        assert_eq!(new, cache.resolve(&users,&aliases,other.as_bytes()));
+        let names = users.into_people();
+        assert_eq!(names.get(owner,&mut [0;9]),"U7");
+        assert_eq!(names.get(new,&mut [0;9]),other);
+        assert_eq!(names.get(mixed,&mut [0;9]),different_case);
+        std::fs::remove_file(path)?;
+        std::fs::remove_dir(links)?;
+        std::fs::remove_dir(dir)?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hex_vectors_and_batch_dates_match_scalar_even_on_bad_bytes() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        let word = *b"0123456789abcdeffedcba9876543210";
+        for i in 0..32 {
+            for b in 0..=255 {
+                let mut test = word;
+                test[i] = b;
+                assert_eq!(unsafe { hex_avx2(&test) }, hex_scalar(&test));
+            }
+        }
+        let cal = Calendar::new(Window{start:0,end:DAY});
+        let valid: &[u8] = b"2028-02-29T00:00:00Z";
+        let offset = *b"2028-02-29T23:59:59-23:59";
+        for i in 0..offset.len() {
+            for b in 0..=255 {
+                let mut test=offset;
+                test[i]=b;
+                let rows=[[valid],[&test],[b"0000000001234".as_slice()],[b"123".as_slice()],[valid],[&test]];
+                let mut values=[None;6];
+                cal.times(&rows,0,&mut values);
+                assert_eq!(values,rows.map(|row|cal.parse(row[0])));
+            }
+        }
+    }
 
     #[test]
     fn bounded_link_graph_retries_without_losing_components() {
@@ -1678,6 +1780,7 @@ mod person_tests {
         let table = Arc::new(table);
         users.packed = Some(Arc::clone(&table));
         let aliases = Aliases {
+            wide: None,
             table,
             external: (0..SHARDS).map(|_| AHashMap::default()).collect(),
         };
