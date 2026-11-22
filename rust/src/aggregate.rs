@@ -523,6 +523,43 @@ pub(crate) fn skip_click_sort(n: usize) -> bool {
 struct AssistScratch {
     intervals: AHashMap<u32, (i64, i64)>,
     masks: AHashMap<u32, u64>,
+    work: Option<AttributionWork>,
+}
+
+#[derive(Default)]
+struct AttributionWork {
+    groups: [u64; 5],
+    sessions: [u64; 5],
+    clicks: [u64; 5],
+    tie_comparisons: u64,
+    assist_campaigns_in_masks: u64,
+}
+
+impl AttributionWork {
+    fn merge(&mut self, other: Self) {
+        for i in 0..self.groups.len() {
+            self.groups[i] += other.groups[i];
+            self.sessions[i] += other.sessions[i];
+            self.clicks[i] += other.clicks[i];
+        }
+        self.tie_comparisons += other.tie_comparisons;
+        self.assist_campaigns_in_masks += other.assist_campaigns_in_masks;
+    }
+}
+
+impl AssistScratch {
+    fn record(&mut self, branch: usize, sessions: &[Session], clicks: &[Click]) {
+        if let Some(stats) = &mut self.work {
+            stats.groups[branch] += 1;
+            stats.sessions[branch] += sessions.len() as u64;
+            stats.clicks[branch] += clicks.len() as u64;
+        }
+    }
+
+    fn wins_tie(&mut self, ids: &ClickIds, candidate: u64, incumbent: u64) -> bool {
+        if let Some(stats) = &mut self.work { stats.tie_comparisons += 1; }
+        ids.compare(candidate, incumbent).is_lt()
+    }
 }
 
 // Allocate dense counters only when the manifest and dimension table imply a
@@ -747,12 +784,15 @@ pub fn campaign_daily(
     window: crate::input::Window,
 ) -> CampaignDays {
     let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
-    batches
+    let work = crate::records::work_enabled();
+    let result = batches
         .par_iter_mut()
         .zip(clicks)
         .with_min_len(min_len)
         .fold(
-            || (Counters::new(campaigns, window), AssistScratch::default()),
+            || (Counters::new(campaigns, window), AssistScratch {
+                work: work.then(AttributionWork::default), ..Default::default()
+            }),
             |(mut totals, mut scratch), (batch, mut clicks)| {
                 summarize_campaigns(
                     std::mem::take(&mut batch.sessions),
@@ -764,9 +804,21 @@ pub fn campaign_daily(
                 (totals, scratch)
             },
         )
-        .map(|(totals, _)| totals)
-        .reduce_with(Counters::merge)
-        .map_or_else(CampaignDays::default, Counters::into_rows)
+        .map(|(totals, scratch)| (totals, scratch.work))
+        .reduce_with(|(left, mut stats), (right, other)| {
+            if let (Some(s), Some(t)) = (&mut stats, other) { s.merge(t); }
+            (left.merge(right), stats)
+        });
+    let Some((totals, stats)) = result else { return CampaignDays::default() };
+    if let Some(stats) = stats {
+        eprintln!("profile {}",serde_json::json!({
+            "stage":"attribution_work", "branches":["zero_or_one_click","single_session","interval","sorted_mask","unsorted_mask"],
+            "people_by_branch":stats.groups, "sessions_by_branch":stats.sessions,
+            "clicks_considered_by_branch":stats.clicks, "tie_comparisons":stats.tie_comparisons,
+            "mask_user_campaign_pairs":stats.assist_campaigns_in_masks
+        }));
+    }
+    totals.into_rows()
 }
 
 fn summarize_campaigns(
@@ -786,7 +838,8 @@ fn summarize_campaigns(
         let person_clicks = &mut clicks[first..cursor];
         if person_clicks.len() > 1 && skip_click_sort(person_clicks.len()) {
             if sessions.len() <= 64 {
-                small_attribution(sessions, person_clicks, ids, totals, &mut scratch.masks, true, mode);
+                scratch.record(4, sessions, person_clicks);
+                small_attribution(sessions, person_clicks, ids, totals, scratch, true, mode);
                 continue;
             }
             // The click reader cannot know the final session count. Restore
@@ -801,6 +854,7 @@ fn summarize_campaigns(
         let person_clicks = &person_clicks[start..end];
 
         if person_clicks.len() <= 1 {
+            scratch.record(0, sessions, person_clicks);
             let click = person_clicks.first();
             for session in sessions {
                 let campaign = click
@@ -811,6 +865,7 @@ fn summarize_campaigns(
             continue;
         }
         if sessions.len() == 1 && person_clicks.len() <= 8 {
+            scratch.record(1, sessions, person_clicks);
             let session = &sessions[0];
             let current_day = day(session.time);
             let mut unique = [0u32; 8];
@@ -822,18 +877,20 @@ fn summarize_campaigns(
                     used += 1;
                     totals.add(click.campaign, current_day, CampaignDay::assists(1));
                 }
-                if click.time == best.time && ids.compare(click.id, best.id).is_lt() {
+                if click.time == best.time && scratch.wins_tie(ids, click.id, best.id) {
                     best = click;
                 }
             }
             totals.add(best.campaign, current_day, CampaignDay::credit(session, false));
             continue;
         }
-        credit(sessions, person_clicks, ids, totals);
+        credit(sessions, person_clicks, ids, totals, scratch);
         if mode != AssistMode::Intervals && sessions.len() <= 64 {
-            small_attribution(sessions, person_clicks, ids, totals, &mut scratch.masks, false, mode);
+            scratch.record(3, sessions, person_clicks);
+            small_attribution(sessions, person_clicks, ids, totals, scratch, false, mode);
             continue;
         }
+        scratch.record(2, sessions, person_clicks);
         let intervals = &mut scratch.intervals;
         for click in person_clicks {
             let interval = intervals
@@ -882,7 +939,7 @@ fn small_attribution(
     clicks: &[Click],
     ids: &ClickIds,
     totals: &mut Counters,
-    masks: &mut AHashMap<u32, u64>,
+    scratch: &mut AssistScratch,
     find_winners: bool,
     mode: AssistMode,
 ) {
@@ -913,13 +970,13 @@ fn small_attribution(
         #[cfg(not(target_arch = "x86_64"))]
         let mask = scalar();
         if mask == 0 { continue; }
-        *masks.entry(click.campaign).or_default() |= mask;
+        *scratch.masks.entry(click.campaign).or_default() |= mask;
         if find_winners {
             let mut bits = mask;
             while bits != 0 {
                 let slot = &mut best[bits.trailing_zeros() as usize];
                 if slot.is_none_or(|old| click.time > old.time ||
-                    (click.time == old.time && ids.compare(click.id, old.id).is_lt())) {
+                    (click.time == old.time && scratch.wins_tie(ids, click.id, old.id))) {
                     *slot = Some(click);
                 }
                 bits &= bits - 1;
@@ -932,7 +989,8 @@ fn small_attribution(
                        CampaignDay::credit(session, false));
         }
     }
-    for (campaign, mut bits) in masks.drain() {
+    if let Some(stats) = &mut scratch.work { stats.assist_campaigns_in_masks += scratch.masks.len() as u64; }
+    for (campaign, mut bits) in scratch.masks.drain() {
         while bits != 0 {
             let i = bits.trailing_zeros() as usize;
             let d = day(sessions[i].time);
@@ -945,7 +1003,7 @@ fn small_attribution(
     }
 }
 
-fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut Counters) {
+fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut Counters, scratch: &mut AssistScratch) {
     let mut clicks = clicks.iter().peekable();
     let mut latest: Option<&Click> = None;
     for session in sessions {
@@ -955,7 +1013,7 @@ fn credit(sessions: &[Session], clicks: &[Click], ids: &ClickIds, totals: &mut C
         {
             let click = clicks.next().unwrap();
             if latest
-                .is_none_or(|best| click.time > best.time || ids.compare(click.id, best.id).is_lt())
+                .is_none_or(|best| click.time > best.time || scratch.wins_tie(ids, click.id, best.id))
             {
                 latest = Some(click);
             }
@@ -1038,7 +1096,7 @@ mod mask_tests {
         let expected = snapshot(reference);
         for mode in [AssistMode::Masks, AssistMode::Unsorted, AssistMode::Simd] {
             let mut result = Counters::Sparse(Default::default());
-            small_attribution(&sessions, &clicks, &ids, &mut result, &mut AHashMap::default(), true, mode);
+            small_attribution(&sessions, &clicks, &ids, &mut result, &mut AssistScratch::default(), true, mode);
             assert_eq!(snapshot(result), expected);
         }
     }

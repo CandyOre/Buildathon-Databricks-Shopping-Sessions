@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,11 +9,15 @@ use rayon::prelude::*;
 
 use crate::csv::chunks;
 use crate::input::{
-    self, Aliases, DAY, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text, unsigned,
+    self, Aliases, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text,
 };
 
 const EXTERNAL_ID: u64 = 1 << 63;
 const INVALID_PERSON: u16 = u16::MAX;
+
+pub(crate) fn work_enabled() -> bool {
+    std::env::var_os("PROFILE_WORK").is_some_and(|v| v == "1")
+}
 
 // Encode the common prefix plus up to eight following bytes without hashing
 // or base conversion. The high bit is reserved for interned names. Right zero
@@ -69,15 +74,18 @@ const HEX_CLICK: u64 = EXTERNAL_ID | (1 << 62);
 pub(crate) struct ClickKeyChunk {
     index: usize,
     hex: Vec<[u64; 2]>,
+    wide: bool,
 }
 
 impl ClickKeyChunk {
     pub(crate) fn new(index: usize) -> Self {
-        Self { index, hex: Vec::new() }
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wide = *WIDE.get_or_init(|| std::env::var_os("PERF_CLICK_KEYS").is_none_or(|v| v != "intern"));
+        Self { index, hex: Vec::new(), wide }
     }
 
     pub(crate) fn encode(&mut self, id: &[u8], names: &Names) -> u64 {
-        if id.len() == 33 && self.index < 1 << 30 {
+        if self.wide && id.len() == 33 && self.index < 1 << 30 {
             if let Some(words) = input::hex_id(id, b'k') {
                 if let Ok(slot) = u32::try_from(self.hex.len()) {
                     self.hex.push(words);
@@ -260,6 +268,7 @@ struct ChunkIds {
     rows: ShardSlab<EntryId>,
     exceptional: Vec<(i64, u32)>,
     hex: Vec<HexEntry>,
+    identity_work: [u32; 4],
 }
 
 struct HexEntry {
@@ -273,6 +282,7 @@ impl ChunkIds {
             rows: ShardSlab::new(stride),
             exceptional: Vec::new(),
             hex: Vec::new(),
+            identity_work: [0; 4],
         }
     }
 
@@ -507,7 +517,10 @@ pub fn read_events(
     let ids = Names::default();
     let calendar = input::Calendar::new(window);
     let origin_seconds = window.start.div_euclid(1000) - 86_400;
-    let parsed: Vec<_> = chunks(&data.join("events"))?
+    let work = work_enabled();
+    let chunks = chunks(&data.join("events"))?;
+    let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
+    let parsed: Vec<_> = chunks
         .into_par_iter()
         .map_init(PersonCache::default, |people, chunk| {
             // Approximate only the backing capacity. Arbitrary CSV lengths and
@@ -534,6 +547,7 @@ pub fn read_events(
             let mut store = |people: &mut PersonCache, proposal: input::Prepared, id: EventId,
                              user: &[u8], ingested: i64, payload: Option<(i64, Option<Purchase>)>| {
                 let position = if let Some((time, purchase)) = payload {
+                    if work { id_rows.identity_work[proposal.work_class()] += 1; }
                     #[cfg(feature = "large-input")]
                     if proposal.needs_lookup() {
                         let job = WaitingEvent {
@@ -583,6 +597,42 @@ pub fn read_events(
         })
         .collect::<Result<_>>()?;
 
+    if work {
+        let mut bins = [0usize; SHARDS];
+        let mut valid = 0usize;
+        let mut long = 0usize;
+        let mut exceptional = 0usize;
+        let mut extra = 0usize;
+        let mut purchases = 0usize;
+        let mut id_overflow = 0usize;
+        let mut person_overflow = 0usize;
+        let mut identity = [0usize;4];
+        for (ids, people_rows) in &parsed {
+            for (total, count) in bins.iter_mut().zip(ids.rows.used) { *total += count; }
+            for (total, count) in identity.iter_mut().zip(ids.identity_work) { *total += count as usize; }
+            valid += people_rows.rows.used.iter().sum::<usize>();
+            long += ids.hex.len();
+            exceptional += ids.exceptional.len();
+            extra += people_rows.extra.len();
+            purchases += people_rows.extra.iter().filter(|(_, p)| p.is_some()).count();
+            id_overflow += ids.rows.overflow.iter().map(Vec::len).sum::<usize>();
+            person_overflow += people_rows.rows.overflow.iter().map(Vec::len).sum::<usize>();
+        }
+        bins.sort_unstable();
+        let n = bins.iter().sum::<usize>();
+        eprintln!("profile {}", serde_json::json!({
+            "stage":"event_work", "logical_input_bytes":input_bytes, "chunks":parsed.len(),
+            "candidates":n, "valid_before_dedup":valid, "purchases_before_dedup":purchases,
+            "candidate_bytes":n * size_of::<EntryId>(), "person_bytes":valid * size_of::<PersonEvent>(),
+            "hex_keys":long, "hex_side_bytes":long * size_of::<HexEntry>(),
+            "exceptional_location_bytes":exceptional * size_of::<(i64,u32)>(),
+            "person_side_bytes":extra * size_of::<(Event,Option<Purchase>)>(),
+            "id_overflow_rows":id_overflow, "person_overflow_rows":person_overflow,
+            "id_bucket_median":bins[SHARDS/2], "id_bucket_max":bins[SHARDS-1],
+            "identity_ready":identity[0], "identity_directory":identity[1],
+            "identity_spill":identity[2], "identity_external":identity[3]
+        }));
+    }
     Ok(Candidates {
         compact_times: window
             .end
@@ -886,19 +936,30 @@ pub fn read_clicks(
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
     let calendar = input::Calendar::new(window);
-    let pieces = chunks(&data.join("clicks"))?
+    let work = work_enabled();
+    let chunks = chunks(&data.join("clicks"))?;
+    let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
+    let pieces = chunks
         .into_par_iter()
         .enumerate()
         .map_init(PersonCache::default, |people, (index, chunk)| {
             let mut local = shards::<Vec<Click>>();
             let mut keys = ClickKeyChunk::new(index);
+            let mut counts = [0usize; 6];
             let mut store = |people: &mut PersonCache, id: &[u8], user: &[u8],
                              proposal: input::Prepared, time: i64, campaign: u32| {
                 let person = people.prepared(proposal, users, aliases, user);
-                let id = keys.encode(id, &ids);
+                let key = keys.encode(id, &ids);
+                if work {
+                    counts[proposal.work_class()] += 1;
+                    if (EXTERNAL_ID..HEX_CLICK).contains(&key) {
+                        counts[4] += 1;
+                        counts[5] += usize::from(input::hex_id(id, b'k').is_some());
+                    }
+                }
                 local[person as usize % SHARDS].push(Click {
                     time,
-                    id,
+                    id: key,
                     person,
                     campaign,
                 });
@@ -926,12 +987,16 @@ pub fn read_clicks(
                     store(people, id, user, proposal, time, campaign);
                 })?;
             }
-            Ok::<_, anyhow::Error>((local, keys))
+            Ok::<_, anyhow::Error>((local, keys, counts))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut partitions = shards::<Vec<Vec<Click>>>();
     let mut keys = Vec::with_capacity(pieces.len());
-    for (chunk, chunk_keys) in pieces {
+    let mut totals = [0usize;6];
+    for (chunk, chunk_keys, counts) in pieces {
+        if work {
+            for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
+        }
         keys.push(chunk_keys);
         for (partition, rows) in partitions.iter_mut().zip(chunk) {
             if !rows.is_empty() {
@@ -939,11 +1004,44 @@ pub fn read_clicks(
             }
         }
     }
+    if work {
+        let valid = totals[..4].iter().sum::<usize>();
+        let wide = keys.iter().map(|k| k.hex.len()).sum::<usize>();
+        eprintln!("profile {}",serde_json::json!({
+            "stage":"click_work", "logical_input_bytes":input_bytes, "chunks":keys.len(),
+            "valid_clicks":valid, "record_width":size_of::<Click>(),
+            "initial_record_bytes":valid*size_of::<Click>(), "regrouped_record_bytes":valid*size_of::<Click>(),
+            "hex_side_keys":wide, "hex_side_bytes":wide*size_of::<[u64;2]>(),
+            "dictionary_calls":totals[4], "strict_hex_dictionary_calls":totals[5],
+            "identity_ready":totals[0], "identity_directory":totals[1],
+            "identity_spill":totals[2], "identity_external":totals[3]
+        }));
+    }
     let width = users.person_slots_per_shard();
-    let clicks = partitions
+    let clicks: Vec<Vec<Click>> = partitions
         .into_par_iter()
         .map(|p| order_clicks(p, width))
         .collect();
+    if work {
+        let mut scatter_rows = 0usize;
+        let mut skipped_groups = 0usize;
+        let mut skipped_rows = 0usize;
+        for shard in &clicks {
+            if use_counting_sort(shard.len(), width) {
+                scatter_rows += shard.len();
+                for group in shard.chunk_by(|a,b| a.person == b.person) {
+                    if group.len() > 1 && crate::aggregate::skip_click_sort(group.len()) {
+                        skipped_groups += 1;
+                        skipped_rows += group.len();
+                    }
+                }
+            }
+        }
+        eprintln!("profile {}",serde_json::json!({
+            "stage":"click_sort_work", "counting_scatter_rows":scatter_rows,
+            "person_time_sorts_skipped":skipped_groups, "click_rows_skipping_time_sort":skipped_rows
+        }));
+    }
     Ok((clicks, ClickIds::new(ids, keys)))
 }
 
