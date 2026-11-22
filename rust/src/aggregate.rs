@@ -1569,8 +1569,8 @@ impl DayCoverage {
     unsafe fn add(&self, start: i32, end: i32, campaign: u32, totals: &mut Counters) {
         use std::arch::x86_64::*;
         // Intersect [start, end) with eight independent daily index ranges.
-        let first = _mm256_set1_epi32(start);
-        let last = _mm256_set1_epi32(end);
+        // The caller checks AVX2 before constructing the daily coverage index.
+        let (first, last) = unsafe { (_mm256_set1_epi32(start), _mm256_set1_epi32(end)) };
         for i in (0..self.len).step_by(8) {
             let mut counts = [0i32; 8];
             unsafe {

@@ -45,7 +45,7 @@ def collect(work, assets):
         lines=[s for s in path.read_text(encoding="utf8").splitlines() if "test result:" in s]
         if lines:
             data["unit"][path.name]=lines
-    for name in ("compositions.json","stress-inputs/datasets.json","stress-race/summary.json",
+    for name in ("compositions.json","compiler-binaries.json","stress-inputs/datasets.json","stress-race/summary.json",
                  "winner-inputs/datasets.json","winner-race/summary.json","training.json"):
         if (work/name).is_file():
             data["study_files"][name]=json.loads((work/name).read_text(encoding="utf8"))

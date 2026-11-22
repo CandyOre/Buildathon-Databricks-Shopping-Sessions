@@ -90,6 +90,8 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 
 `design_matrix.py` 可对同一镜像切换环境，`sweep` 对每项与其直接前驱跑 `ABBAAB`。矩阵的 `control` 显式选择旧排序、购买及归因设置；`defaults` 使用程序默认值。`profile --lean` 记录阶段时间；省略 `--lean` 同时打开 `PROFILE_WORK=1` 和 `PROFILE_LOCKS=1`。诊断会重新分类输入、采样内存及计时锁获取，正式耗时另跑。
 
+默认 Rayon 下，`PROFILE=1` 的 `rayon_phase` 记录每个并行阶段的 wall time。其中 `event_dedup` 单独计量完整键选胜，是 `dedup_and_sessionize` 的子阶段。
+
 阶段线程池把连续工作项组成一组，组内顺序处理并复用临时空间。常驻工人或协助执行的线程在组内再次提交阶段任务时就地运行。组内并行排序仍可借用 Rayon；等待子任务的 Rayon 工人会让出执行机会，长时间无进展时可协助自己的任务组。`PROFILE=1` 的 `stage_workers` 给出工作项数、实际组长、参与的常驻工人数和阶段时间。
 
 ```powershell

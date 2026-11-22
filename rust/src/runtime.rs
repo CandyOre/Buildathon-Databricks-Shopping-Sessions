@@ -291,11 +291,23 @@ where
     F: Fn(&mut S, I) -> R + Sync + Send,
 {
     if !stages() {
-        return items
+        let count = items.len();
+        let started = flag("PROFILE").then(std::time::Instant::now);
+        let result = items
             .into_par_iter()
             .with_min_len(min_grain)
             .map_init(init, task)
             .collect();
+        if let Some(start) = started {
+            eprintln!(
+                "profile {}",
+                serde_json::json!({
+                    "stage": "rayon_phase", "phase": phase, "items": count,
+                    "min_grain": min_grain, "elapsed_s": start.elapsed().as_secs_f64()
+                })
+            );
+        }
+        return result;
     }
     let balanced = items.len().div_ceil(pool().workers * 4).max(min_grain);
     let grain = number("PERF_GRAIN", balanced).clamp(1, items.len().max(1));
