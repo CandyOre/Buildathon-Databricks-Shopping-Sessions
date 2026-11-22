@@ -20,11 +20,6 @@ fn optimized_cpu() -> bool {
         && std::is_x86_feature_detected!("lzcnt")
         && std::is_x86_feature_detected!("movbe")
         && std::is_x86_feature_detected!("aes")
-        && std::is_x86_feature_detected!("avx512f")
-        && std::is_x86_feature_detected!("avx512bw")
-        && std::is_x86_feature_detected!("avx512cd")
-        && std::is_x86_feature_detected!("avx512dq")
-        && std::is_x86_feature_detected!("avx512vl")
 }
 #[cfg(not(target_arch = "x86_64"))]
 fn optimized_cpu() -> bool {

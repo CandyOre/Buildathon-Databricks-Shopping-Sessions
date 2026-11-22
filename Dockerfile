@@ -6,7 +6,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo clean --release -p shopping-sessions && \
     cargo build --locked --release && cp target/release/shopping-sessions /portable && \
-    if [ "$(uname -m)" = "x86_64" ]; then RUSTFLAGS="-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+aes" cargo build --locked --release && cp target/release/shopping-sessions /optimized; else cp /portable /optimized; fi
+    if [ "$(uname -m)" = "x86_64" ]; then cargo rustc --locked --release -- -Ctarget-cpu=x86-64-v3 -Ctarget-feature=+aes && cp target/release/shopping-sessions /optimized; else cp /portable /optimized; fi
 COPY rust/dispatch.rs /tmp/dispatch.rs
 RUN rustc --edition=2024 -O /tmp/dispatch.rs -o /shopping-sessions
 
