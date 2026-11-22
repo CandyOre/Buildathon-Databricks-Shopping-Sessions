@@ -72,8 +72,9 @@ impl Drop for Region {
 
 #[derive(Clone, Copy)]
 struct Token {
-    region: usize,
-    page: usize,
+    region:u32,
+    page:u16,
+    last_input:u8,
 }
 
 #[derive(Default)]
@@ -91,6 +92,7 @@ pub(super) struct PoolStats {
     pub input_pages:AtomicUsize,
     pub input_bytes:AtomicUsize,
     pub streaming_bytes:AtomicUsize,
+    pub event_pages_used_for_clicks:AtomicUsize,
 }
 
 struct Pool {
@@ -109,21 +111,21 @@ impl Pool {
             t
         } else {
             if state.unused.is_empty() {
-                let region = state.regions.len();
+                let region = u32::try_from(state.regions.len()).expect("too many 2 MiB regions");
                 state.regions.push(Region::new());
                 self.stats.regions.fetch_add(1, Ordering::Relaxed);
                 state
                     .unused
-                    .extend((0..REGION / PAGE).rev().map(|page| Token { region, page }));
+                    .extend((0..REGION / PAGE).rev().map(|page| Token { region, page:page as u16,last_input:0 }));
             }
             state.unused.pop().unwrap()
         };
         let ptr = unsafe {
             NonNull::new_unchecked(
-                state.regions[token.region]
+                state.regions[token.region as usize]
                     .0
                     .as_ptr()
-                    .add(token.page * PAGE),
+                    .add(token.page as usize * PAGE),
             )
         };
         self.stats.pages.fetch_add(1, Ordering::Relaxed);
@@ -237,6 +239,9 @@ impl<T: Copy> Pages<T> {
 // sums for the private record types in the parent module.
 pub(super) unsafe trait PageRecord:Copy {}
 
+#[derive(Copy,Clone,PartialEq)]
+pub(super) enum InputKind { Event=1,Click=2 }
+
 pub(super) struct InputWriter<T:PageRecord> {
     pool: Arc<Pool>,
     rows:Vec<Option<Pages<T>>>,
@@ -247,21 +252,25 @@ pub(super) struct InputWriter<T:PageRecord> {
     streamed:bool,
     nt_bytes:usize,
     allocated:usize,
+    kind:InputKind,
+    event_to_click:usize,
 }
 
 impl<T:PageRecord> InputWriter<T> {
-    pub fn new(arena:&Arena,parts:usize,mode:super::Writes)->Self {
+    pub fn new(arena:&Arena,parts:usize,mode:super::Writes,kind:InputKind)->Self {
         assert!(size_of::<T>()>0 && size_of::<T>()<=PAGE && align_of::<T>()<=PAGE);
         let nb=if mode==super::Writes::Direct {0} else {parts};
         Self{pool:arena.pool(),rows:(0..parts).map(|_|None).collect(),spare:Vec::new(),
-            staging:vec![[MaybeUninit::uninit();8];nb],used:vec![0;nb],mode,streamed:false,nt_bytes:0,allocated:0}
+            staging:vec![[MaybeUninit::uninit();8];nb],used:vec![0;nb],mode,streamed:false,nt_bytes:0,allocated:0,kind,event_to_click:0}
     }
     fn new_page(&mut self,part:usize) {
         if self.spare.is_empty() {
             let mut state=self.pool.state.lock().unwrap();
             for _ in 0..16 {self.spare.push(self.pool.claim_locked(&mut state));}
         }
-        let (key,ptr)=self.spare.pop().unwrap();
+        let (mut key,ptr)=self.spare.pop().unwrap();
+        self.event_to_click+=usize::from(self.kind==InputKind::Click&&key.last_input==InputKind::Event as u8);
+        key.last_input=self.kind as u8;
         self.allocated+=1;
         self.rows[part].get_or_insert_with(||Pages{pool:Arc::clone(&self.pool),pieces:Vec::new(),len:0})
             .pieces.push((key,ptr.cast::<T>(),0));
@@ -326,6 +335,7 @@ impl<T:PageRecord> InputWriter<T> {
         self.pool.stats.input_bytes.fetch_add(bytes,Ordering::Relaxed);
         self.pool.stats.input_pages.fetch_add(self.allocated,Ordering::Relaxed);
         self.pool.stats.streaming_bytes.fetch_add(self.nt_bytes,Ordering::Relaxed);
+        self.pool.stats.event_pages_used_for_clicks.fetch_add(self.event_to_click,Ordering::Relaxed);
         std::mem::take(&mut self.rows)
     }
 }
@@ -359,8 +369,8 @@ mod tests {
     #[test]
     fn native_reader_modes_preserve_all_rows_across_page_and_batch_tails() {
         let arena=Arena::new(true);
-        for mode in [super::super::Writes::Direct,super::super::Writes::Buffered,super::super::Writes::Stream] {
-            let mut writer=InputWriter::new(&arena,3,mode);
+        for (mode,kind) in [(super::super::Writes::Direct,InputKind::Event),(super::super::Writes::Buffered,InputKind::Click),(super::super::Writes::Stream,InputKind::Click)] {
+            let mut writer=InputWriter::new(&arena,3,mode,kind);
             for i in 0..6751u64 {writer.push((i%3) as usize,i);}
             for (bucket,rows) in writer.finish().into_iter().enumerate() {
                 let expected=(bucket as u64..6751).step_by(3);
@@ -373,6 +383,7 @@ mod tests {
         #[cfg(target_arch="x86_64")]
         assert!(arena.stats.streaming_bytes.load(Ordering::Relaxed)>0);
         assert!(arena.stats.reused.load(Ordering::Relaxed)>0);
+        assert!(arena.stats.event_pages_used_for_clicks.load(Ordering::Relaxed)>0);
     }
 
     #[test]

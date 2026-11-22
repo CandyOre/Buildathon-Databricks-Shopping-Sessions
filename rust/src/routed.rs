@@ -528,9 +528,9 @@ struct NativeWriters<T:storage::PageRecord,S:storage::PageRecord> {
 }
 
 impl<T:storage::PageRecord,S:storage::PageRecord> NativeWriters<T,S> {
-    fn new(arena:&storage::Arena,parts:usize,plan:Plan)->Self {
-        Self {full:storage::InputWriter::new(arena,parts,plan.writes),
-              short:plan.packed.then(||storage::InputWriter::new(arena,parts,plan.writes))}
+    fn new(arena:&storage::Arena,parts:usize,plan:Plan,kind:storage::InputKind)->Self {
+        Self {full:storage::InputWriter::new(arena,parts,plan.writes,kind),
+              short:plan.packed.then(||storage::InputWriter::new(arena,parts,plan.writes,kind))}
     }
     fn finish(self)->Vec<NativeBlock<T,S>> {
         let mut short=self.short.map(storage::InputWriter::finish).unwrap_or_default().into_iter();
@@ -607,7 +607,7 @@ fn event_winners(
     let stripe_padding=if plan.slab {8*if plan.packed {size_of::<packed::ShortEvent>()} else {size_of::<EventRow>()} + size_of::<u32>()} else {0};
     let groups=crate::csv::work_groups(&plans,plan.chunks_per_task(plans.len()),plan.event_parts*(bucket_header+stripe_padding));
     let chunks = crate::runtime::stage_map("route_decode_events",groups,|sources| {
-            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.event_parts,plan));
+            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.event_parts,plan,storage::InputKind::Event));
             let mut sink = BucketWriter::new(if plan.input_pages {0} else {plan.event_parts}, plan.writes);
             let mut narrow = if plan.packed && !plan.input_pages {
                 empty_buckets(plan.event_parts)
@@ -870,7 +870,7 @@ fn raw_clicks(
     let groups=crate::csv::work_groups(&sources,plan.chunks_per_task(sources.len()),metadata);
     let groups=groups.into_iter().enumerate().collect();
     let pieces = crate::runtime::stage_map("route_decode_clicks",groups,|(i, sources)| {
-            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.user_parts,plan));
+            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.user_parts,plan,storage::InputKind::Click));
             let mut output: Pieces<RawClick> = if plan.input_pages { Vec::new() } else {empty_buckets(plan.user_parts)};
             let mut narrow = if plan.packed && !plan.input_pages {
                 empty_buckets(plan.user_parts)
@@ -1468,7 +1468,11 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
                 plan,
                 &arena,
             );
-            if let Some(acc)=&fused {acc.consume(&mut result.local.0,&mut result.local.1,&ids);}
+            if let Some(acc)=&fused {
+                let start=Instant::now();
+                acc.consume(&mut result.local.0,&mut result.local.1,&ids);
+                result.elapsed+=start.elapsed();
+            }
             result
         });
     drop(other);
@@ -1513,6 +1517,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor,
             "native_reader_pages":arena.stats.input_pages.load(Relaxed),"native_reader_bytes":arena.stats.input_bytes.load(Relaxed),
             "native_stream_store_bytes":arena.stats.streaming_bytes.load(Relaxed),
+            "event_pages_used_for_clicks":arena.stats.event_pages_used_for_clicks.load(Relaxed),
             "packed_events":work.packed_events,"packed_clicks":packed_clicks,
             "event_scan_s":work.scan_time.as_secs_f64(),"event_exchange_s":work.exchange_time.as_secs_f64(),
             "event_winner_route_s":work.winner_time.as_secs_f64(),"click_scan_route_s":click_time.as_secs_f64(),
