@@ -11,6 +11,7 @@
 //! of the reader's writes.
 mod packed;
 mod storage;
+mod forward;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -361,6 +362,7 @@ struct Plan {
     reuse: bool,
     packed: bool,
     flat: bool,
+    forward_blocks: bool,
     chunk_group: usize,
     slab:bool,
 }
@@ -391,6 +393,7 @@ impl Plan {
             reuse: switch("PERF_ROUTE_REUSE", "1") != "0",
             packed: switch("PERF_ROUTE_PACK", "0") == "1",
             flat: switch("PERF_ROUTE_GROUPS", "map") == "flat",
+            forward_blocks: switch("PERF_ROUTE_FORWARD", "rows") == "blocks",
             chunk_group,
             slab:switch("PERF_ROUTE_SLAB","0")=="1",
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
@@ -1118,7 +1121,7 @@ struct Resolver<'a> {
 
 impl Resolver<'_> {
     #[inline]
-    fn target(&mut self, user: u64, wide: &[[u64; 2]], local: &mut People) -> Target {
+    fn target(&mut self, user: u64, wide: &[[u64; 2]], local: &mut People, outbound: &mut forward::Builder) -> Target {
         macro_rules! resolve {
             ($map:expr, $key:expr) => {
                 *$map.entry($key).or_insert_with(|| {
@@ -1129,7 +1132,7 @@ impl Resolver<'_> {
                     if self.p1 && !self.aliases.is_linked_person(person) {
                         Target::Here(local.group(person))
                     } else {
-                        Target::Forward(person)
+                        Target::Forward(outbound.slot(person))
                     }
                 })
             };
@@ -1153,7 +1156,7 @@ impl Resolver<'_> {
 
 struct P1 {
     local: (SessionBatch, Vec<Click>),
-    forwarded: Vec<(usize, Forward)>,
+    forwarded: Vec<(usize, forward::Packet)>,
     spells: usize,
     direct: usize,
     elapsed: Duration,
@@ -1192,9 +1195,9 @@ fn first_pass(
         bucket_bits:plan.user_parts.trailing_zeros(),
     };
     let mut local = People::default();
-    let mut forwarded = Destinations::new(plan);
+    let mut forwarded = forward::Builder::new(plan);
     for r in events.into_iter().flatten() {
-        let dest = ids.target(r.user, &data[r.chunk as usize].users, &mut local);
+        let dest = ids.target(r.user, &data[r.chunk as usize].users, &mut local, &mut forwarded);
         let person = match dest {
             Target::Here(p) | Target::Forward(p) => p,
         };
@@ -1205,14 +1208,11 @@ fn first_pass(
         };
         match dest {
             Target::Here(_) => local.event(row, data),
-            Target::Forward(_) => forwarded
-                .get(person as usize & (plan.user_parts - 1))
-                .events
-                .push(row),
+            Target::Forward(_) => forwarded.event(row,data),
         }
     }
     let mut accept_click = |c: RawClick| {
-        let dest = ids.target(c.user, &click_users[c.chunk as usize], &mut local);
+        let dest = ids.target(c.user, &click_users[c.chunk as usize], &mut local, &mut forwarded);
         let person = match dest {
             Target::Here(p) | Target::Forward(p) => p,
         };
@@ -1224,10 +1224,7 @@ fn first_pass(
         };
         match dest {
             Target::Here(_) => local.click(row),
-            Target::Forward(_) => forwarded
-                .get(person as usize & (plan.user_parts - 1))
-                .clicks
-                .push(row),
+            Target::Forward(_) => forwarded.click(row),
         }
     };
     let base = window.start.saturating_sub(input::LOOKBACK);
@@ -1255,7 +1252,7 @@ fn first_pass(
     let finish_time=finish_start.elapsed();
     P1 {
         local,
-        forwarded:forwarded.into_blocks(),
+        forwarded:forwarded.finish(),
         spells,
         direct,
         elapsed: start.elapsed(),
@@ -1410,8 +1407,9 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     drop(click_users);
     let mut sessions = Vec::with_capacity(2 * plan.user_parts);
     let mut click_lists = Vec::with_capacity(2 * plan.user_parts);
-    let mut later: Vec<Vec<Forward>> = empty_buckets(plan.user_parts);
-    let (mut spells, mut direct, mut forwarded_events, mut forwarded_clicks) = (0, 0, 0, 0);
+    let mut later: Vec<Vec<forward::Packet>> = empty_buckets(plan.user_parts);
+    let (mut spells, mut direct) = (0, 0);
+    let mut forward_work = forward::Work::default();
     let mut longest_p1 = Duration::ZERO;
     let (mut p1_group_tasks,mut p1_finish_tasks)=(Duration::ZERO,Duration::ZERO);
     for r in results {
@@ -1423,8 +1421,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         sessions.push(r.local.0);
         click_lists.push(r.local.1);
         for (part, rows) in r.forwarded {
-            forwarded_events += rows.events.len();
-            forwarded_clicks += rows.clicks.len();
+            if plan.profile { rows.account(&mut forward_work); }
             later[part].push(rows);
         }
     }
@@ -1433,7 +1430,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         .into_par_iter()
         .filter(|p| !p.is_empty())
         .map(|p| {
-            let (mut batch,mut clicks)=second_pass(p,&payloads,window,plan);
+            let (mut batch,mut clicks)=forward::finish(p,&payloads,window,plan);
             if let Some(acc)=&fused {acc.consume(&mut batch,&mut clicks,&ids);}
             (batch,clicks)
         })
@@ -1470,8 +1467,11 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "wide_event_key_bytes":work.wide_events*16,"wide_raw_user_bytes":(work.wide_users+click_wide)*16,
             "event_payload_side_bytes":work.side_rows*size_of::<(i64,Option<Purchase>)>(),
             "ingest_side_bytes":work.ingest_side*8,"winner_route_bytes":count*size_of::<WinnerRow>(),
-            "click_route_bytes":(click_count-packed_clicks)*size_of::<RawClick>()+packed_clicks*16,"forwarded_events":forwarded_events,
-            "forwarded_clicks":forwarded_clicks,"forwarded_bytes":forwarded_events*size_of::<PersonEvent>()+forwarded_clicks*size_of::<Click>(),
+            "click_route_bytes":(click_count-packed_clicks)*size_of::<RawClick>()+packed_clicks*16,"forwarded_events":forward_work.events,
+            "forwarded_clicks":forward_work.clicks, "forwarded_descriptors":forward_work.groups,
+            "forwarded_descriptor_bytes":forward_work.descriptor_bytes, "forwarded_event_bytes":forward_work.event_bytes,
+            "forwarded_click_bytes":forward_work.click_bytes,
+            "forwarded_bytes":forward_work.descriptor_bytes+forward_work.event_bytes+forward_work.click_bytes,
         });
         eprintln!("profile {v}");
     }
