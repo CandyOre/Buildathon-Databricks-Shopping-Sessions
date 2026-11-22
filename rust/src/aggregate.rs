@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use ahash::AHashMap;
 use rayon::prelude::*;
 
@@ -48,6 +50,20 @@ impl DailyColumns {
 pub struct SessionBatch {
     pub daily: DailyColumns,
     sessions: Vec<Session>,
+    work: Option<Box<SessionWork>>,
+}
+
+#[derive(Default)]
+struct SessionWork {
+    groups: usize,
+    events: usize,
+    purchases: usize,
+    medium_attempts: usize,
+    medium_accepted: usize,
+    binned_groups: usize,
+    binned_events: usize,
+    purchase_bin_lookups: usize,
+    single_purchase_groups: usize,
 }
 
 pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
@@ -98,12 +114,11 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
         }
         finish_day(current, &mut categories, &mut daily);
     }
-    SessionBatch { daily, sessions }
+    SessionBatch { daily, sessions, work: None }
 }
 
 const SESSION_GAP: u32 = 1_800_000;
 
-#[cfg(feature = "large-input")]
 fn purchase_bins() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PERF_PURCHASE_BINS").is_none_or(|v| v != "0"))
@@ -114,7 +129,6 @@ fn use_radix_time_sort() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PERF_TIME_SORT").is_none_or(|v| v != "0"))
 }
 
-#[cfg(feature = "large-input")]
 #[derive(Clone, Copy)]
 struct TimeBin {
     first: u32,
@@ -122,7 +136,6 @@ struct TimeBin {
     count: u32,
 }
 
-#[cfg(feature = "large-input")]
 fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec<usize>) -> bool {
     const MAX_BINS: usize = 1024;
     let last = times.iter().copied().max().unwrap_or(0);
@@ -160,6 +173,52 @@ fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec
         // counter as the exact session index after the prefix pass.
         bin.count = (positions.len() - 1) as u32;
         previous = bin.last;
+    }
+    positions.push(count);
+    true
+}
+
+// Reuse bucket storage across people, initializing only occupied buckets.
+// Medium groups abandon this path once their actual number of occupied
+// buckets exceeds the threshold; times remain untouched on fallback.
+fn active_binned_starts(
+    times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec<usize>, max_active: usize,
+) -> bool {
+    let mut occupied = [0u64; 16];
+    let mut active = 0;
+    let empty = TimeBin { first: u32::MAX, last: 0, count: 0 };
+    for &time in times.iter() {
+        let idx = (time / SESSION_GAP) as usize;
+        if idx >= 1024 { return false; }
+        let word = &mut occupied[idx / 64];
+        let mask = 1u64 << (idx % 64);
+        if *word & mask == 0 {
+            active += 1;
+            if active > max_active { return false; }
+            *word |= mask;
+            if idx >= bins.len() { bins.resize((idx + 1).next_power_of_two(), empty); }
+            bins[idx] = empty;
+        }
+        let bin = &mut bins[idx];
+        bin.first = bin.first.min(time);
+        bin.last = bin.last.max(time);
+        bin.count += 1;
+    }
+    positions.clear();
+    let mut count = 0;
+    let mut previous = 0;
+    for (word, mut mask) in occupied.into_iter().enumerate() {
+        while mask != 0 {
+            let bin = &mut bins[word * 64 + mask.trailing_zeros() as usize];
+            if count == 0 || bin.first - previous > SESSION_GAP {
+                positions.push(count);
+                times[count] = bin.first;
+            }
+            count += bin.count as usize;
+            bin.count = (positions.len() - 1) as u32;
+            previous = bin.last;
+            mask &= mask - 1;
+        }
     }
     positions.push(count);
     true
@@ -307,12 +366,27 @@ unsafe fn vector_starts(times: &[u32], positions: &mut Vec<usize>) -> usize {
 struct DayPurchases {
     first: Option<(u32, i64)>,
     others: AHashMap<u32, i64>,
+    dense: bool,
+    touched: u32,
+    cents: [u32; 32],
 }
 
 impl DayPurchases {
     fn add(&mut self, purchase: crate::records::Purchase, revenue: &mut i64) {
         let amount = i64::from(purchase.cents);
         *revenue += amount;
+        if self.dense {
+            if purchase.category < 32 {
+                let i = purchase.category as usize;
+                self.touched |= 1u32 << i;
+                let (low, carry) = self.cents[i].overflowing_add(purchase.cents);
+                self.cents[i] = low;
+                if carry { *self.others.entry(purchase.category).or_default() += 1i64 << 32; }
+            } else {
+                *self.others.entry(purchase.category).or_default() += amount;
+            }
+            return;
+        }
         let first = self.first.get_or_insert((purchase.category, 0));
         if first.0 == purchase.category {
             first.1 += amount;
@@ -322,6 +396,20 @@ impl DayPurchases {
     }
 
     fn top(&mut self) -> Option<u32> {
+        if self.dense {
+            let mut best: Option<(i64, std::cmp::Reverse<u32>)> = None;
+            while self.touched != 0 {
+                let id = self.touched.trailing_zeros();
+                self.touched &= self.touched - 1;
+                let low = std::mem::take(&mut self.cents[id as usize]);
+                let sum = i64::from(low) + self.others.remove(&id).unwrap_or(0);
+                best = best.max(Some((sum, std::cmp::Reverse(id))));
+            }
+            for (id, sum) in self.others.drain() {
+                best = best.max(Some((sum, std::cmp::Reverse(id))));
+            }
+            return best.map(|(_, id)| id.0);
+        }
         let first = self.first.take()?;
         let best = self.others.drain().fold(first, |best, value| {
             if value.1 > best.1 || (value.1 == best.1 && value.0 < best.0) {
@@ -366,12 +454,19 @@ fn compact_for_people(
     let mut daily = DailyColumns::default();
     let mut sessions = Vec::new();
     let mut starts_at = Vec::new();
-    #[cfg(feature = "large-input")]
     let mut time_bins = Vec::new();
+    let medium_bins = std::env::var_os("PERF_MEDIUM_BINS").is_some_and(|v| v == "1");
+    let occupied_bins = std::env::var_os("PERF_BIN_MASK").is_some_and(|v| v == "1");
+    let direct_purchase = purchase_bins();
+    let single_purchase = std::env::var_os("PERF_SINGLE_PURCHASE").is_none_or(|v| v != "0");
     let mut radix = Vec::new();
     let mut heads = Vec::new();
     let mut next_purchase = Vec::new();
-    let mut category = DayPurchases::default();
+    let mut category = DayPurchases {
+        dense: std::env::var_os("PERF_CATEGORY_DENSE").is_some_and(|v| v == "1"),
+        ..DayPurchases::default()
+    };
+    let mut work = crate::records::work_enabled().then(|| Box::new(SessionWork::default()));
     let mut prev = (0, 0);
     for (index, (last, sold)) in ends.into_iter().enumerate() {
         let local = &mut times[prev.0 as usize..last as usize];
@@ -380,28 +475,48 @@ fn compact_for_people(
         if local.is_empty() {
             continue;
         }
-        #[cfg(feature = "large-input")]
-        let binned = local.len() >= 2048 && binned_starts(local, &mut time_bins, &mut starts_at);
-        #[cfg(not(feature = "large-input"))]
-        let binned = false;
+        let medium = medium_bins && (64..2048).contains(&local.len());
+        let binned = if medium {
+            let threshold = local.len() / 4;
+            active_binned_starts(local, &mut time_bins, &mut starts_at, threshold)
+        } else if cfg!(feature = "large-input") && local.len() >= 2048 {
+            if occupied_bins {
+                active_binned_starts(local, &mut time_bins, &mut starts_at, usize::MAX)
+            } else { binned_starts(local, &mut time_bins, &mut starts_at) }
+        } else { false };
         if !binned {
             sorted_time_offsets(local, &mut radix);
             starts(local, &mut starts_at);
         }
         let count = starts_at.len() - 1;
+        let locate = |time| {
+            if direct_purchase && binned {
+                time_bins[(time / SESSION_GAP) as usize].count as usize
+            } else {
+                starts_at[..count].partition_point(|&pos| local[pos] <= time) - 1
+            }
+        };
+        let single = match purchases {
+            &[(time, purchase)] if single_purchase && count > 1 => Some((locate(time), purchase)),
+            _ => None,
+        };
+        if let Some(w) = &mut work {
+            w.groups += 1;
+            w.events += local.len();
+            w.purchases += purchases.len();
+            w.medium_attempts += usize::from(medium);
+            w.medium_accepted += usize::from(medium && binned);
+            w.binned_groups += usize::from(binned);
+            if binned { w.binned_events += local.len(); }
+            if direct_purchase && binned && count > 1 { w.purchase_bin_lookups += purchases.len(); }
+            w.single_purchase_groups += usize::from(single.is_some());
+        }
         heads.clear();
-        if count > 1 && !purchases.is_empty() {
+        if count > 1 && !purchases.is_empty() && single.is_none() {
             heads.resize(count, 0_u32);
             next_purchase.clear();
             for &(time, _) in purchases {
-                #[cfg(feature = "large-input")]
-                let bin = if binned && purchase_bins() {
-                    Some(time_bins[(time / SESSION_GAP) as usize].count as usize)
-                } else { None };
-                #[cfg(not(feature = "large-input"))]
-                let bin: Option<usize> = None;
-                let s = bin.unwrap_or_else(||
-                    starts_at[..count].partition_point(|&pos| local[pos] <= time) - 1);
+                let s = locate(time);
                 next_purchase.push(heads[s]);
                 heads[s] = next_purchase.len() as u32;
             }
@@ -430,6 +545,8 @@ fn compact_for_people(
                 for &(_, p) in purchases {
                     category.add(p, &mut revenue);
                 }
+            } else if let Some((owner, p)) = single {
+                if owner == i { category.add(p, &mut revenue); }
             } else if !heads.is_empty() {
                 let mut cursor = heads[i];
                 while cursor != 0 {
@@ -448,7 +565,7 @@ fn compact_for_people(
         row.top_category = category.top();
         daily.push(row);
     }
-    SessionBatch { daily, sessions }
+    SessionBatch { daily, sessions, work }
 }
 
 fn finish_day(mut row: UserDay, categories: &mut AHashMap<u32, i64>, daily: &mut DailyColumns) {
@@ -785,6 +902,30 @@ pub fn campaign_daily(
 ) -> CampaignDays {
     let min_len = (batches.len() / (rayon::current_num_threads() * 2)).max(1);
     let work = crate::records::work_enabled();
+    if work {
+        let mut total = SessionWork::default();
+        for w in batches.iter().filter_map(|b| b.work.as_deref()) {
+            total.groups += w.groups;
+            total.events += w.events;
+            total.purchases += w.purchases;
+            total.medium_attempts += w.medium_attempts;
+            total.medium_accepted += w.medium_accepted;
+            total.binned_groups += w.binned_groups;
+            total.binned_events += w.binned_events;
+            total.purchase_bin_lookups += w.purchase_bin_lookups;
+            total.single_purchase_groups += w.single_purchase_groups;
+        }
+        eprintln!("profile {}", serde_json::json!({
+            "stage":"session_work", "compact_groups":total.groups,
+            "compact_events":total.events, "compact_purchases":total.purchases,
+            "regrouped_time_bytes":total.events*size_of::<u32>(),
+            "regrouped_purchase_bytes":total.purchases*size_of::<(u32,crate::records::Purchase)>(),
+            "medium_attempts":total.medium_attempts, "medium_accepted":total.medium_accepted,
+            "binned_groups":total.binned_groups, "binned_events":total.binned_events,
+            "purchase_bin_lookups":total.purchase_bin_lookups,
+            "single_purchase_groups":total.single_purchase_groups
+        }));
+    }
     let result = batches
         .par_iter_mut()
         .zip(clicks)
@@ -1106,6 +1247,36 @@ mod mask_tests {
 mod compact_session_tests {
     use super::*;
     use crate::records::Purchase;
+
+    #[test]
+    fn active_buckets_map_real_purchases_and_leave_sparse_fallback_intact() {
+        let gap = SESSION_GAP;
+        let original = [3*gap+2, 0, gap, gap, 4*gap+2, 3*gap+2];
+        let mut times = original;
+        let mut bins = Vec::new();
+        let mut starts = Vec::new();
+        assert!(!active_binned_starts(&mut times, &mut bins, &mut starts, 1));
+        assert_eq!(times, original);
+        assert!(active_binned_starts(&mut times, &mut bins, &mut starts, 6));
+        assert_eq!(starts, [0,3,6]);
+        for &time in &original {
+            assert_eq!(bins[(time / gap) as usize].count, u32::from(time > gap));
+        }
+    }
+
+    #[test]
+    fn dense_category_amounts_widen_and_ties_preserve_category_byte_order() {
+        let mut sums = DayPurchases { dense: true, ..Default::default() };
+        let mut revenue = 0;
+        for c in [50, 3] {
+            sums.add(Purchase { category:c, cents:u32::MAX }, &mut revenue);
+            sums.add(Purchase { category:c, cents:20 }, &mut revenue);
+        }
+        assert_eq!(sums.top(), Some(3));
+        assert_eq!(sums.top(), None);
+        sums.add(Purchase { category:50, cents:1 }, &mut revenue);
+        assert_eq!(sums.top(), Some(50));
+    }
 
     #[cfg(feature = "large-input")]
     #[test]
