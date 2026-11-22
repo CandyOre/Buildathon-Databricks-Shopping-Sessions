@@ -39,6 +39,7 @@ TRIALS = {
     "category-dense": ("control", {"PERF_CATEGORY_DENSE":"1"}),
     "assist-mask": ("control", {"PERF_ASSISTS":"mask"}),
     "unsorted": ("assist-mask", {"PERF_ASSISTS":"unsorted"}),
+    "tiny16": ("unsorted", {"PERF_SMALL_CLICKS":"16"}),
     "simd-assist": ("unsorted", {"PERF_ASSISTS":"simd"}),
     "dense": ("control", {"PERF_CAMPAIGNS":"dense"}),
     "columns": ("dense", {"PERF_CAMPAIGNS":"columns"}),

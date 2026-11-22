@@ -633,7 +633,9 @@ fn assist_mode() -> AssistMode {
 }
 
 pub(crate) fn skip_click_sort(n: usize) -> bool {
-    n <= 32 && matches!(assist_mode(), AssistMode::Unsorted | AssistMode::Simd)
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| crate::runtime::number("PERF_SMALL_CLICKS",32).clamp(1,64));
+    n <= limit && matches!(assist_mode(), AssistMode::Unsorted | AssistMode::Simd)
 }
 
 #[derive(Default)]
