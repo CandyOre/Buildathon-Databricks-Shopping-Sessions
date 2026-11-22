@@ -103,6 +103,54 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
 
 const SESSION_GAP: u32 = 1_800_000;
 
+#[cfg(feature = "large-input")]
+#[derive(Clone, Copy)]
+struct TimeBin {
+    first: u32,
+    last: u32,
+    count: u32,
+}
+
+#[cfg(feature = "large-input")]
+fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec<usize>) -> bool {
+    const MAX_BINS: usize = 1024;
+    let last = times.iter().copied().max().unwrap_or(0);
+    let length = (last / SESSION_GAP) as usize + 1;
+    if length > MAX_BINS {
+        return false;
+    }
+    bins.clear();
+    bins.resize(
+        length,
+        TimeBin {
+            first: u32::MAX,
+            last: 0,
+            count: 0,
+        },
+    );
+    for &time in times.iter() {
+        let bin = &mut bins[(time / SESSION_GAP) as usize];
+        bin.first = bin.first.min(time);
+        bin.last = bin.last.max(time);
+        bin.count += 1;
+    }
+    // A bin spans strictly less than one session gap. Its extrema suffice
+    // to decide whether it joins the preceding nonempty bin.
+    positions.clear();
+    let mut count = 0usize;
+    let mut previous = 0;
+    for bin in bins.iter().filter(|bin| bin.count != 0) {
+        if count == 0 || bin.first - previous > SESSION_GAP {
+            positions.push(count);
+            times[count] = bin.first;
+        }
+        count += bin.count as usize;
+        previous = bin.last;
+    }
+    positions.push(count);
+    true
+}
+
 fn sorted_time_offsets(values: &mut [u32], scratch: &mut Vec<u32>) {
     if values.len() < 2048 {
         values.sort_unstable();
@@ -235,6 +283,8 @@ pub fn compact_sessions(
     let mut daily = DailyColumns::default();
     let mut sessions = Vec::new();
     let mut starts_at = Vec::new();
+    #[cfg(feature = "large-input")]
+    let mut time_bins = Vec::new();
     let mut radix = Vec::new();
     let mut heads = Vec::new();
     let mut next_purchase = Vec::new();
@@ -247,8 +297,14 @@ pub fn compact_sessions(
         if local.is_empty() {
             continue;
         }
-        sorted_time_offsets(local, &mut radix);
-        starts(local, &mut starts_at);
+        #[cfg(feature = "large-input")]
+        let binned = local.len() >= 2048 && binned_starts(local, &mut time_bins, &mut starts_at);
+        #[cfg(not(feature = "large-input"))]
+        let binned = false;
+        if !binned {
+            sorted_time_offsets(local, &mut radix);
+            starts(local, &mut starts_at);
+        }
         let count = starts_at.len() - 1;
         heads.clear();
         if count > 1 && !purchases.is_empty() {
@@ -567,6 +623,32 @@ fn assist(sessions: &[Session], campaign: u32, (first, last): (i64, i64), totals
 mod compact_session_tests {
     use super::*;
     use crate::records::Purchase;
+
+    #[cfg(feature = "large-input")]
+    #[test]
+    fn bins_match_sorted_session_starts_and_counts() {
+        let gap = SESSION_GAP;
+        let mut times = [6 * gap, gap, 0, 2 * gap + 1, gap, 6 * gap - 1, 3 * gap + 1];
+        let mut sorted = times;
+        sorted.sort_unstable();
+        let mut reference = Vec::new();
+        starts(&sorted, &mut reference);
+        let summary = |times: &[u32], positions: &[usize]| {
+            positions
+                .windows(2)
+                .map(|w| (times[w[0]], w[1] - w[0]))
+                .collect::<Vec<_>>()
+        };
+        let mut bins = Vec::new();
+        let mut positions = Vec::new();
+        assert!(binned_starts(&mut times, &mut bins, &mut positions));
+        assert_eq!(summary(&times, &positions), summary(&sorted, &reference));
+
+        let mut wide = [u32::MAX, 0, gap];
+        assert!(!binned_starts(&mut wide, &mut bins, &mut positions));
+        assert_eq!(wide, [u32::MAX, 0, gap]);
+    }
+
     fn daily(batch: &SessionBatch) -> Vec<(u32, i32, i64, i64, i64, Option<u32>)> {
         (0..batch.daily.person.len())
             .map(|i| {
