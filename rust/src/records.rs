@@ -531,60 +531,10 @@ pub fn read_events(
                 let position = people_rows.push(person, job.time, job.purchase, window.start);
                 id_rows.push_event(job.event_id, job.ingest, position, origin_seconds);
             };
-            chunk.scan_parsed(|[id, user, ts, ingested, kind, product, price]| {
-                if id.is_empty() {
-                    return;
-                }
-                let proposal = people.prepare(users, aliases, user);
-                let ingested = calendar.ingest(ingested);
-                let id = EventId::parse(id, &ids);
-                #[allow(unused_mut)]
-                let mut valid = || {
-                    if user.is_empty() || product.is_empty() {
-                        return None;
-                    }
-                    let time = calendar.parse(ts)?;
-                    if time < window.start || time >= window.end || time < ingested - DAY {
-                        return None;
-                    }
-                    let purchase = match kind {
-                        b"view" | b"cart" => None,
-                        b"purchase" => {
-                            let cents = unsigned(price)?;
-                            if !(1..=10_000_000).contains(&cents) {
-                                return None;
-                            }
-                            let category = dimensions
-                                .products
-                                .lookup(product)
-                                .unwrap_or(dimensions.unknown_category);
-                            Some(Purchase {
-                                category,
-                                cents: cents as u32,
-                            })
-                        }
-                        _ => return None,
-                    };
-                    #[cfg(not(feature = "large-input"))]
-                    {
-                        Some((
-                            time,
-                            people.prepared(proposal, users, aliases, user),
-                            purchase,
-                        ))
-                    }
+            let mut store = |people: &mut PersonCache, proposal: input::Prepared, id: EventId,
+                             user: &[u8], ingested: i64, payload: Option<(i64, Option<Purchase>)>| {
+                let position = if let Some((time, purchase)) = payload {
                     #[cfg(feature = "large-input")]
-                    {
-                        Some((time, purchase))
-                    }
-                };
-                // Invalid candidates still compete in deduplication. The earliest copy wins.
-                #[cfg(not(feature = "large-input"))]
-                let position = valid().map_or(u32::MAX, |(time, person, purchase)| {
-                    people_rows.push(person, time, purchase, window.start)
-                });
-                #[cfg(feature = "large-input")]
-                let position = if let Some((time, purchase)) = valid() {
                     if proposal.needs_lookup() {
                         let job = WaitingEvent {
                             query: proposal,
@@ -602,17 +552,29 @@ pub fn read_events(
                         }
                         return;
                     }
-                    people_rows.push(
-                        people.prepared(proposal, users, aliases, user),
-                        time,
-                        purchase,
-                        window.start,
-                    )
+                    let person = people.prepared(proposal, users, aliases, user);
+                    people_rows.push(person, time, purchase, window.start)
                 } else {
                     u32::MAX
                 };
+                // Invalid candidates still compete for the earliest ingest.
                 id_rows.push_event(id, ingested, position, origin_seconds);
-            })?;
+            };
+            if crate::csv::batch_size() != 0 {
+                chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, payload| {
+                    let proposal = people.prepare(users, aliases, user);
+                    store(people, proposal, EventId::parse(id, &ids), user, ingest, payload);
+                })?;
+            } else {
+                chunk.scan_parsed(|f: [&[u8]; 7]| {
+                    if f[0].is_empty() { return; }
+                    let proposal = people.prepare(users, aliases, f[1]);
+                    let ingest = calendar.ingest(f[3]);
+                    let id = EventId::parse(f[0], &ids);
+                    let payload = crate::csv::event_payload(&f, calendar.parse(f[2]), ingest, window, dimensions);
+                    store(people, proposal, id, f[1], ingest, payload);
+                })?;
+            }
             #[cfg(feature = "large-input")]
             for job in waiting {
                 commit(job, people, &mut people_rows, &mut id_rows)
@@ -930,20 +892,8 @@ pub fn read_clicks(
         .map_init(PersonCache::default, |people, (index, chunk)| {
             let mut local = shards::<Vec<Click>>();
             let mut keys = ClickKeyChunk::new(index);
-            chunk.scan_parsed(|[id, user, campaign, ts]| {
-                if id.is_empty() || user.is_empty() {
-                    return;
-                }
-                let proposal = people.prepare(users, aliases, user);
-                let Some(campaign) = dimensions.campaign_ids.lookup(campaign) else {
-                    return;
-                };
-                let Some(time) = calendar.parse(ts) else {
-                    return;
-                };
-                if time < window.start - LOOKBACK || time >= window.end {
-                    return;
-                }
+            let mut store = |people: &mut PersonCache, id: &[u8], user: &[u8],
+                             proposal: input::Prepared, time: i64, campaign: u32| {
                 let person = people.prepared(proposal, users, aliases, user);
                 let id = keys.encode(id, &ids);
                 local[person as usize % SHARDS].push(Click {
@@ -952,7 +902,30 @@ pub fn read_clicks(
                     person,
                     campaign,
                 });
-            })?;
+            };
+            if crate::csv::batch_size() != 0 {
+                chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
+                    let proposal = people.prepare(users, aliases, user);
+                    store(people, id, user, proposal, time, campaign);
+                })?;
+            } else {
+                chunk.scan_parsed(|[id, user, campaign, ts]| {
+                    if id.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let proposal = people.prepare(users, aliases, user);
+                    let Some(campaign) = dimensions.campaign_ids.lookup(campaign) else {
+                        return;
+                    };
+                    let Some(time) = calendar.parse(ts) else {
+                        return;
+                    };
+                    if time < window.start - LOOKBACK || time >= window.end {
+                        return;
+                    }
+                    store(people, id, user, proposal, time, campaign);
+                })?;
+            }
             Ok::<_, anyhow::Error>((local, keys))
         })
         .collect::<Result<Vec<_>>>()?;

@@ -802,7 +802,7 @@ fn parsed_groups<'a, const N: usize>(
 }
 
 #[inline]
-fn event_payload(
+pub(crate) fn event_payload(
     fields: &[&[u8]; 7], time: Option<i64>, ingested: i64, window: Window, dim: &Dimensions,
 ) -> Option<(i64, Option<Purchase>)> {
     let time = time?;
