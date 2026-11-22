@@ -9,11 +9,73 @@ use chrono::NaiveDate;
 use rayon::prelude::*;
 use serde_json::Value;
 
-use crate::csv::{chunks, fields, scan_file};
+use crate::csv::{chunks, fields, perf_on, scan_file};
 
 pub const DAY: i64 = 86_400_000;
 pub const LOOKBACK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
+
+const HEX: [u8; 256] = {
+    let mut digits = [0x80; 256];
+    let mut n = 0;
+    while n < 16 {
+        let byte = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+        digits[byte as usize] = n;
+        n += 1;
+    }
+    digits
+};
+
+pub fn hex_id(bytes: &[u8], prefix: u8) -> Option<[u64; 2]> {
+    if bytes.len() != 33 || bytes[0] != prefix { return None; }
+    let digits = <&[u8; 32]>::try_from(&bytes[1..]).unwrap();
+    #[cfg(target_arch = "x86_64")]
+    {
+        static SIMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SIMD.get_or_init(|| std::is_x86_feature_detected!("avx2")
+                && std::env::var_os("PERF_HEX").is_some_and(|v| v == "simd")) {
+            return unsafe { hex_avx2(digits) };
+        }
+    }
+    hex_scalar(digits)
+}
+
+fn hex_scalar(digits: &[u8;32]) -> Option<[u64;2]> {
+    let mut bytes = [0; 16];
+    let mut invalid = 0;
+    for (pair, dest) in digits.chunks_exact(2).zip(&mut bytes) {
+        let high = HEX[pair[0] as usize];
+        let low = HEX[pair[1] as usize];
+        invalid |= high | low;
+        *dest = (high << 4) | low;
+    }
+    if invalid & 128 != 0 { return None; }
+    Some([u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+          u64::from_be_bytes(bytes[8..].try_into().unwrap())])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable="avx2")]
+unsafe fn hex_avx2(digits: &[u8; 32]) -> Option<[u64; 2]> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let input = _mm256_loadu_si256(digits.as_ptr().cast());
+        let in_range = |lo: i8, hi: i8| {
+            _mm256_and_si256(_mm256_cmpgt_epi8(input, _mm256_set1_epi8(lo - 1)),
+                             _mm256_cmpgt_epi8(_mm256_set1_epi8(hi + 1), input))
+        };
+        let decimal = in_range(b'0' as i8, b'9' as i8);
+        let letter = in_range(b'a' as i8, b'f' as i8);
+        if _mm256_movemask_epi8(_mm256_or_si256(decimal, letter)) != -1 { return None; }
+        let nibbles = _mm256_add_epi8(_mm256_and_si256(input, _mm256_set1_epi8(15)),
+                                      _mm256_and_si256(letter, _mm256_set1_epi8(9)));
+        let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+        let bytes = _mm_packus_epi16(_mm256_castsi256_si128(pairs), _mm256_extracti128_si256::<1>(pairs));
+        let mut key = [0u64; 2];
+        _mm_storeu_si128(key.as_mut_ptr().cast(), bytes);
+        Some(key.map(u64::from_be))
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Window {
@@ -623,6 +685,12 @@ fn linked_spelling<'a>(names: &'a [Vec<Arc<str>>], key: u64, buffer: &'a mut [u8
 pub struct Aliases {
     table: Arc<NameTable>,
     external: Vec<AHashMap<Arc<str>, u32>>,
+}
+
+impl Aliases {
+    pub(crate) fn is_linked_person(&self, id: u32) -> bool {
+        (id as usize) < self.table.canonical.len()
+    }
 }
 
 // A short ASCII spelling needs 57 bits, including the U/u discriminator.
