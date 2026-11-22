@@ -3,9 +3,11 @@ FROM rust:1.85-slim-bookworm AS build
 ARG SCORER_LTO=thin
 ARG SCORER_STATIC=0
 ARG SCORER_CASCADE=0
+ARG SCORER_PGO=1
+ARG SCORER_PROFILE=large-b53443c7bca298bca2b33506bd4defa81419f2ee3e4cd8341728bfbcb3a7715a.profdata
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
-COPY rust/large-b53443c7bca298bca2b33506bd4defa81419f2ee3e4cd8341728bfbcb3a7715a.profdata /profile/large.profdata
+COPY rust/${SCORER_PROFILE} /profile/large.profdata
 COPY rust/src/ ./src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
@@ -15,7 +17,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo rustc --locked --release -- $static; cp target/release/shopping-sessions /portable; \
     if [ "$(uname -m)" = "x86_64" ]; then \
       cargo rustc --locked --release -- -Ctarget-cpu=x86-64-v3 -Ctarget-feature=+aes $static; cp target/release/shopping-sessions /optimized; \
-      RUSTFLAGS="-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+aes" cargo rustc --release --locked --features large-input --bin shopping-sessions -- -Cprofile-use=/profile/large.profdata $static; cp target/release/shopping-sessions /large; \
+      pgo=""; if [ "$SCORER_PGO" = 1 ]; then pgo=-Cprofile-use=/profile/large.profdata; fi; \
+      RUSTFLAGS="-Ctarget-cpu=x86-64-v4 -Ctarget-feature=+aes" cargo rustc --release --locked --features large-input --bin shopping-sessions -- $pgo $static; cp target/release/shopping-sessions /large; \
       if [ "$SCORER_CASCADE" = 1 ]; then \
         RUSTFLAGS="-Ctarget-cpu=cascadelake" cargo rustc --release --locked --features large-input --bin shopping-sessions -- $static; cp target/release/shopping-sessions /cascade; \
       else ln /large /cascade; fi; \

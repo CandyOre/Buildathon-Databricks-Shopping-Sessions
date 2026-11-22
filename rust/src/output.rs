@@ -88,16 +88,21 @@ pub fn write(
         lanes[part % options().workers].push((part, batches, dictionaries.next()));
     }
     let mut tasks: Vec<crate::runtime::Work<Result<()>>> = Vec::new();
-    for lane in lanes {
+    let mut campaign = Some((campaigns, dimensions.clone()));
+    for (index, lane) in lanes.into_iter().enumerate() {
         let (dir, ids, dims) = (output.clone(), names.clone(), dimensions.clone());
+        let first = if index == 0 && crate::runtime::flag("PERF_CAMPAIGN_FIRST") { campaign.take() } else { None };
         tasks.push(Box::new(move || {
+            if let Some((rows, dims)) = first { write_campaigns(&dir, rows, &dims)?; }
             for (part, batches, dictionary) in lane {
                 direct::users(&dir, part, batches, &ids, &dims, dictionary.as_ref())?;
             }
             Ok(())
         }));
     }
-    tasks.push(Box::new(move || write_campaigns(&output, campaigns, &dimensions)));
+    if let Some((rows, dims)) = campaign {
+        tasks.push(Box::new(move || write_campaigns(&output, rows, &dims)));
+    }
     crate::runtime::run(tasks).into_iter().collect()
 }
 
@@ -128,6 +133,7 @@ fn open(
 }
 
 fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensions) -> Result<()> {
+    let clock = crate::csv::work_enabled().then(std::time::Instant::now);
     let (schema, mut writer) = open(
         output,
         "campaign_daily",
@@ -174,7 +180,11 @@ fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensio
         ];
         writer.write(&RecordBatch::try_new(schema.clone(), columns)?)?;
     }
-    writer.close()?;
+    let meta = writer.close()?;
+    if let Some(clock) = clock {
+        eprintln!("profile {}", serde_json::json!({"stage":"campaign_writer_work",
+            "elapsed_s":clock.elapsed().as_secs_f64(),"row_groups":meta.row_groups.len(),"rows":meta.num_rows}));
+    }
     Ok(())
 }
 
@@ -795,12 +805,20 @@ mod direct {
             append_column!(category);
             columns = vec![merged];
         }
+        let measure = crate::csv::work_enabled();
+        let mut prepare_ns = 0u64;
+        let mut encode_write_ns = 0u64;
         let mut base = 0;
+        let mut held = Vec::new();
+        let hold = crate::runtime::flag("PERF_RELEASE_AFTER_CLOSE");
         for daily in columns {
             crate::runtime::huge_pages(&daily.person);
             let mut start = 0;
             while start < daily.person.len() {
+                let t = measure.then(std::time::Instant::now);
                 let end = group.prepare_rows(&daily, start, names, dimensions, categories.as_ref(), dictionary, base)?;
+                if let Some(t) = t { prepare_ns += t.elapsed().as_nanos() as u64; }
+                let t = measure.then(std::time::Instant::now);
                 writer.group(
                     &daily,
                     start,
@@ -809,11 +827,20 @@ mod direct {
                     &mut numbers,
                     categories.as_ref(),
                 )?;
+                if let Some(t) = t { encode_write_ns += t.elapsed().as_nanos() as u64; }
                 start = end;
             }
             base += daily.person.len();
+            if hold { held.push(daily); }
         }
-        writer.close()
+        let groups = writer.groups.len();
+        writer.close()?;
+        if measure {
+            eprintln!("profile {}", serde_json::json!({"stage":"user_writer_work","part":part,
+                "rows":base,"row_groups":groups,"prepare_ns":prepare_ns,"encode_write_ns":encode_write_ns}));
+        }
+        drop(held);
+        Ok(())
     }
 
     #[cfg(test)]

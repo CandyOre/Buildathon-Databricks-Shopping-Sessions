@@ -36,7 +36,11 @@ def main():
     parser.add_argument("dataset", help="Dataset directory inside the volume, e.g. seed37-20m")
     parser.add_argument("output", type=Path, help="New merged .profdata file")
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
+    parser.add_argument("--setting", action="append", default=[], metavar="PERF_KEY=VALUE")
     args = parser.parse_args()
+    if any(not s.startswith("PERF_") or "=" not in s for s in args.setting):
+        parser.error("--setting expects PERF_KEY=VALUE")
+    settings = [v for s in args.setting for v in ("-e", s)]
     if args.output.exists():
         parser.error("select a new output file")
     with tempfile.TemporaryDirectory(prefix="shopping-pgo-") as temporary:
@@ -57,7 +61,7 @@ def main():
         subprocess.run(["docker", "run", "--rm", "--read-only", "--network", "none",
                         "--cpuset-cpus", args.cpuset, "--cpus", "8", "--memory", "24g",
                         "--memory-swap", "24g", "-e", "NCPU=8", "-e", "MEM_GB=24",
-                        "-e", "LLVM_PROFILE_FILE=/profiles/wide-%m-%p.profraw", "--mount", dataset,
+                        *settings, "-e", "LLVM_PROFILE_FILE=/profiles/wide-%m-%p.profraw", "--mount", dataset,
                         "--mount", mount, "--tmpfs", "/output:rw,uid=1000,gid=1000,mode=755", scorer],
                        check=True)
         merge = ('prof="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"; '

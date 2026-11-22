@@ -2,6 +2,7 @@ mod aggregate;
 mod csv;
 mod input;
 mod output;
+mod probe;
 mod profile;
 mod records;
 mod routed;
@@ -43,8 +44,14 @@ fn main() -> Result<()> {
     } else {
         (input::Window::read(&data)?, input::Dimensions::read(&data)?)
     };
+    if let Ok(mode) = env::var("PERF_PROBE") {
+        probe::run(&data, window, &dimensions, &mode)?;
+        profile.stage("event_prefix");
+        profile.finish();
+        return Ok(());
+    }
     let (mut session_batches, clicks, click_ids, user_names, event_count) =
-        if runtime::flag("PERF_ROUTE") {
+        if probe::use_routing(&data, window)? {
             profile.stage("load_dimensions");
             let rows = routed::run(&data, window, &dimensions)?;
             profile.stage("route_and_sessionize");
@@ -82,6 +89,7 @@ fn main() -> Result<()> {
         dictionaries,
     )?;
     profile.stage("write_parquet");
+    csv::print_work();
     profile.finish();
     eprintln!("Wrote user_daily and campaign_daily from {event_count} valid, deduplicated events");
     if runtime::flag("PERF_EXIT_AFTER_CLOSE") {

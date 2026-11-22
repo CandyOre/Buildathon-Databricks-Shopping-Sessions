@@ -48,16 +48,21 @@ fn pool() -> &'static Queue {
 }
 
 pub fn run<R: Send + 'static>(jobs: Vec<Work<R>>) -> Vec<R> {
+    let grain = number("PERF_GRAIN", 1).clamp(1, jobs.len().max(1));
     if !std::env::var_os("PERF_POOL").is_some_and(|v| v == "spin") {
-        return jobs.into_par_iter().map(|work| work()).collect();
+        return jobs.into_par_iter().with_min_len(grain).map(|work| work()).collect();
     }
     let pool = pool();
     let mut results = Vec::with_capacity(jobs.len());
     let mut tasks = pool.tasks.lock().unwrap();
-    for job in jobs {
+    let mut jobs = jobs.into_iter();
+    while jobs.len() > 0 {
+        let group: Vec<_> = jobs.by_ref().take(grain).collect();
         let (tx, rx) = mpsc::sync_channel(1);
         tasks.push_back(Box::new(move || {
-            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                group.into_iter().map(|job| job()).collect::<Vec<_>>()
+            }));
             let _ = tx.send(value);
         }));
         results.push(rx);
@@ -67,7 +72,7 @@ pub fn run<R: Send + 'static>(jobs: Vec<Work<R>>) -> Vec<R> {
     results.into_iter().map(|rx| match rx.recv().expect("stage worker exited") {
         Ok(result) => result,
         Err(error) => std::panic::resume_unwind(error),
-    }).collect()
+    }).flatten().collect()
 }
 
 pub fn number(name: &str, default: usize) -> usize {

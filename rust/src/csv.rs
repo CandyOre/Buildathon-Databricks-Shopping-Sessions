@@ -557,6 +557,31 @@ impl Chunk {
         (self.end - self.start).min(CHUNK_BYTES) as usize
     }
 
+    /// Diagnostic read prefix. Touch the same offsets on both backends,
+    /// including every input page, without searching for record delimiters.
+    pub(crate) fn probe_read(&self) -> Result<u64> {
+        let sample = |bytes: &[u8]| bytes.iter().step_by(4096).map(|&v| u64::from(v)).sum();
+        #[cfg(target_os = "linux")]
+        if let Some(map) = &self.source.mapping {
+            let bytes = unsafe { std::slice::from_raw_parts(map.data.as_ptr(), map.len) };
+            return Ok(sample(&bytes[self.start as usize..self.end as usize]));
+        }
+        let mut file = File::open(&self.source.path)?;
+        file.seek(SeekFrom::Start(self.start))?;
+        SCAN_BUFFER.with(|cell| {
+            let mut buffer = cell.borrow_mut();
+            let mut remaining = self.byte_len();
+            let mut checksum = 0;
+            while remaining > 0 {
+                let n = remaining.min(buffer.bytes.len());
+                file.read_exact(&mut buffer.bytes[..n])?;
+                checksum += sample(&buffer.bytes[..n]);
+                remaining -= n;
+            }
+            Ok(checksum)
+        })
+    }
+
     pub fn scan(&self, mut row: impl FnMut(&[u8])) -> Result<()> {
         let mut io = IoWork::default();
         if !work_enabled() { return self.scan_inner::<false>(row, &mut io); }
