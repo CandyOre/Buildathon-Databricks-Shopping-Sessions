@@ -410,6 +410,82 @@ impl Calendar {
         }
         timestamp(s)
     }
+
+    pub(crate) fn times<const N: usize>(
+        &self, rows: &[[&[u8]; N]], column: usize, output: &mut [Option<i64>],
+    ) {
+        debug_assert_eq!(rows.len(), output.len());
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            let mut lanes = [0; 4];
+            let mut count = 0;
+            for (i, row) in rows.iter().enumerate() {
+                let s = row[column];
+                if (s.len() == 20 && s[19] == b'Z' || s.len() == 25 && matches!(s[19], b'+' | b'-'))
+                    && s[10] == b'T'
+                {
+                    lanes[count] = i;
+                    count += 1;
+                    if count == 4 {
+                        let words = lanes.map(|j| u64::from_le_bytes(rows[j][column][11..19].try_into().unwrap()));
+                        let seconds = unsafe { four_clocks(words) };
+                        for (j, sec) in lanes.into_iter().zip(seconds) {
+                            let s = rows[j][column];
+                            output[j] = if sec == u64::MAX { None } else {
+                                self.date(s).zip(zone_offset(s)).map(|(day, zone)|
+                                    day + (sec as i64) * 1000 - zone)
+                            };
+                        }
+                        count = 0;
+                    }
+                } else {
+                    output[i] = self.parse(s);
+                }
+            }
+            for &j in &lanes[..count] { output[j] = self.parse(rows[j][column]); }
+            return;
+        }
+        for (value, row) in output.iter_mut().zip(rows) { *value = self.parse(row[column]); }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn zone_offset(s: &[u8]) -> Option<i64> {
+    if s.len() == 20 { return Some(0); }
+    let h = two_digits(s[20], s[21])?;
+    let m = two_digits(s[23], s[24])?;
+    if h > 23 || m > 59 || s[22] != b':' { return None; }
+    Some(i64::from(h * 60 + m) * if s[19] == b'+' { 60_000 } else { -60_000 })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable="avx2")]
+unsafe fn four_clocks(words: [u64;4]) -> [u64;4] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let s = _mm256_loadu_si256(words.as_ptr().cast());
+        let colons = _mm256_set1_epi64x(CLOCK_COLONS as i64);
+        let colon_ok = _mm256_cmpeq_epi64(_mm256_and_si256(s, colons), _mm256_set1_epi64x(0x3a00_003a_0000));
+        let digits = _mm256_blendv_epi8(s, _mm256_set1_epi8(b'0' as i8), colons);
+        let decimal = _mm256_and_si256(_mm256_cmpgt_epi8(digits, _mm256_set1_epi8(b'/' as i8)),
+                                       _mm256_cmpgt_epi8(_mm256_set1_epi8(b':' as i8), digits));
+        let ok = _mm256_and_si256(colon_ok, _mm256_cmpeq_epi64(decimal, _mm256_set1_epi64x(-1)));
+        let values = _mm256_and_si256(s, _mm256_set1_epi64x(0x0f0f_000f_0f00_0f0f));
+        let pairs = _mm256_add_epi64(_mm256_srli_epi64::<8>(values),
+                      _mm256_add_epi64(_mm256_slli_epi64::<3>(values), _mm256_slli_epi64::<1>(values)));
+        let mask = _mm256_set1_epi64x(255);
+        let h = _mm256_and_si256(pairs, mask);
+        let m = _mm256_and_si256(_mm256_srli_epi64::<24>(pairs), mask);
+        let sec = _mm256_and_si256(_mm256_srli_epi64::<48>(pairs), mask);
+        let hm = _mm256_and_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(24), h),
+                                  _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), m));
+        let valid = _mm256_and_si256(ok, _mm256_and_si256(hm, _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), sec)));
+        let result = _mm256_add_epi64(sec, _mm256_add_epi64(_mm256_mul_epu32(h, _mm256_set1_epi64x(3600)),
+                                                           _mm256_mul_epu32(m, _mm256_set1_epi64x(60))));
+        let mut out = [0;4];
+        _mm256_storeu_si256(out.as_mut_ptr().cast(), _mm256_blendv_epi8(_mm256_set1_epi64x(-1), result, valid));
+        out
+    }
 }
 
 pub fn text(bytes: &[u8]) -> &str {

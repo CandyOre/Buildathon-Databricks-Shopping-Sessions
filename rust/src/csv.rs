@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use memchr::{memchr, memchr_iter, memrchr};
+use crate::input::{Calendar, DAY, Dimensions, LOOKBACK, Window, unsigned};
+use crate::records::Purchase;
 
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -764,4 +766,101 @@ pub fn scan_file(path: &Path, row: impl FnMut(&[u8])) -> Result<()> {
     }
     .scan(row)
     .with_context(|| format!("reading {}", path.display()))
+}
+
+const MAX_BATCH: usize = 64;
+
+pub fn batch_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        if !std::env::var_os("PERF_DECODER").is_some_and(|v| v == "batch") { return 0; }
+        std::env::var("PERF_BATCH").ok().and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16).clamp(1, MAX_BATCH)
+    })
+}
+
+fn parsed_groups<'a, const N: usize>(
+    span: &'a [u8], size: usize, visit: &mut impl FnMut(&[[&'a [u8]; N]]),
+) {
+    let mut rows = [[&[][..]; N]; MAX_BATCH];
+    let mut len = 0;
+    each_line(span, &mut |line| {
+        if let Some(parts) = fields::<N>(line) {
+            // A structurally valid event or click with empty ID is discarded
+            // before any validity checks or deduplication.
+            if !parts[0].is_empty() {
+                rows[len] = parts;
+                len += 1;
+                if len == size {
+                    visit(&rows[..len]);
+                    len = 0;
+                }
+            }
+        }
+    });
+    if len != 0 { visit(&rows[..len]); }
+}
+
+#[inline]
+fn event_payload(
+    fields: &[&[u8]; 7], time: Option<i64>, ingested: i64, window: Window, dim: &Dimensions,
+) -> Option<(i64, Option<Purchase>)> {
+    let time = time?;
+    if fields[1].is_empty() || fields[5].is_empty() || time < window.start
+        || time >= window.end || time < ingested - DAY { return None; }
+    let purchase = match fields[4] {
+        b"view" | b"cart" => None,
+        b"purchase" => {
+            let cents = unsigned(fields[6])?;
+            if !(1..=10_000_000).contains(&cents) { return None; }
+            let category = dim.products.lookup(fields[5]).unwrap_or(dim.unknown_category);
+            Some(Purchase { category, cents: cents as u32 })
+        }
+        _ => return None,
+    };
+    Some((time, purchase))
+}
+
+impl Chunk {
+    pub fn scan_events(&self, calendar: &Calendar, window: Window, dim: &Dimensions,
+        mut emit: impl FnMut(&[u8], &[u8], i64, Option<(i64, Option<Purchase>)>),
+    ) -> Result<()> {
+        let size = batch_size();
+        if size == 0 {
+            return self.scan_parsed(|f: [&[u8]; 7]| {
+                if f[0].is_empty() { return; }
+                let ingest = calendar.ingest(f[3]);
+                let payload = event_payload(&f, calendar.parse(f[2]), ingest, window, dim);
+                emit(f[0], f[1], ingest, payload)
+            });
+        }
+        self.spans(|span| parsed_groups::<7>(span, size, &mut |rows| {
+            let mut times = [None; MAX_BATCH];
+            calendar.times(rows, 2, &mut times[..rows.len()]);
+            for (f, time) in rows.iter().zip(times) {
+                let ingest = calendar.ingest(f[3]);
+                let payload = event_payload(f, time, ingest, window, dim);
+                emit(f[0], f[1], ingest, payload);
+            }
+        }))
+    }
+
+    pub fn scan_clicks(&self, calendar: &Calendar, window: Window, dim: &Dimensions,
+        mut emit: impl FnMut(&[u8], &[u8], i64, u32),
+    ) -> Result<()> {
+        let mut valid = |f: &[&[u8];4], time: Option<i64>| {
+            if let Some(time) = time {
+                if !f[0].is_empty() && !f[1].is_empty() && time >= window.start - LOOKBACK && time < window.end {
+                    if let Some(campaign) = dim.campaign_ids.lookup(f[2]) { emit(f[0], f[1], time, campaign); }
+                }
+            }
+        };
+        let size = batch_size();
+        if size == 0 { return self.scan_parsed(|f| valid(&f, calendar.parse(f[3]))); }
+        self.spans(|span| parsed_groups::<4>(span, size, &mut |rows| {
+            let mut times = [None; MAX_BATCH];
+            calendar.times(rows, 3, &mut times[..rows.len()]);
+            for (f, time) in rows.iter().zip(times) { valid(f, time); }
+        }))
+    }
 }
