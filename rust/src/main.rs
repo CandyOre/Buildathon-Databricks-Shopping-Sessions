@@ -55,8 +55,21 @@ fn main() -> Result<()> {
         profile.finish();
         return Ok(());
     }
+    let requested = env::var("PERF_ARCH").unwrap_or_else(|_| "default".into());
+    let direct = match requested.as_str() {
+        "A" => Some(false),
+        "B" => Some(true),
+        "default" => None,
+        _ => anyhow::bail!("PERF_ARCH must be default, A, or B"),
+    };
     let (mut session_batches, campaigns, user_names, event_count) =
-        if probe::use_routing(&data, window)? {
+        if let Some(direct) = direct {
+            eprintln!("architecture={requested}");
+            profile.stage("load_dimensions");
+            let rows = routed::run_arch(&data, window, &dimensions, direct)?;
+            profile.stage("route_and_sessionize");
+            rows
+        } else if probe::use_routing(&data, window)? {
             profile.stage("load_dimensions");
             let rows = routed::run(&data, window, &dimensions)?;
             profile.stage("route_and_sessionize");

@@ -17,6 +17,94 @@ pub(super) fn enabled<const N: usize>() -> bool {
         })
 }
 
+pub(super) fn window_enabled<const N: usize>() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        (N == 4 || N == 7) && *ON.get_or_init(|| {
+            let arch = std::env::var("PERF_ARCH").unwrap_or_default();
+            let requested = std::env::var("PERF_SCANNER")
+                .map_or(matches!(arch.as_str(), "A" | "B"), |mode| mode == "window");
+            requested && std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512f")
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+// The span reader owns complete records. Keep the masks of its current
+// 64-byte block while consuming rows: a separator, quote or newline byte is
+// classified once even when the next row starts halfway through this block.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn window<'a, const N: usize>(span: &'a [u8], emit: &mut impl FnMut([&'a [u8]; N])) {
+    #[inline(always)]
+    unsafe fn load(ptr: *const u8) -> [u64; 3] {
+        let (comma, quote, newline);
+        unsafe {
+            std::arch::asm!(
+                "vmovdqu64 zmm0, [{p}]",
+                "vpbroadcastb zmm1, {c:e}", "vpcmpeqb k1, zmm0, zmm1",
+                "vpbroadcastb zmm1, {q:e}", "vpcmpeqb k2, zmm0, zmm1",
+                "vpbroadcastb zmm1, {n:e}", "vpcmpeqb k3, zmm0, zmm1",
+                "kmovq {cm}, k1", "kmovq {qm}, k2", "kmovq {nm}, k3",
+                p=in(reg) ptr, c=in(reg) 44u32, q=in(reg) 34u32, n=in(reg) 10u32,
+                cm=lateout(reg) comma, qm=lateout(reg) quote, nm=lateout(reg) newline,
+                out("xmm0") _, out("xmm1") _, out("k1") _, out("k2") _, out("k3") _,
+                options(pure, readonly, nostack, preserves_flags)
+            );
+        }
+        [comma, quote, newline]
+    }
+    let mut start = 0;
+    let mut base = 0;
+    let mut saved_commas = 0u128;
+    let mut saved_quotes = 0u128;
+    while base + 64 <= span.len() {
+        // Called only after window_enabled checked AVX-512F and BW. The
+        // complete 64-byte block is inside the span, including near EOF.
+        let [commas, quotes, mut ends] = unsafe { load(span.as_ptr().add(base)) };
+        let mut position = 0;
+        while ends != 0 {
+            let end = ends.trailing_zeros() as usize;
+            let line = &span[start..base + end];
+            let split = if line.len() <= 128 {
+                let prefix = (1u64 << end) - 1;
+                let carried = (base + position) - start;
+                // At an aligned newline just after a 128-byte row the
+                // current block contributes no bits.
+                let shift = carried & 127;
+                let c = saved_commas | (u128::from((commas & prefix) >> position) << shift);
+                let q = saved_quotes | (u128::from((quotes & prefix) >> position) << shift);
+                parsed::<N>(line, c, q)
+            } else {
+                super::fields::<N>(line)
+            };
+            if let Some(fields) = split {
+                emit(fields);
+            }
+            ends &= ends - 1;
+            start = base + end + 1;
+            position = end + 1;
+            saved_commas = 0;
+            saved_quotes = 0;
+        }
+        let carried = base + position - start;
+        if position < 64 && base + 64 - start <= 128 {
+            saved_commas |= u128::from(commas >> position) << carried;
+            saved_quotes |= u128::from(quotes >> position) << carried;
+        }
+        base += 64;
+    }
+    // An arbitrarily long record and a short final block share the same
+    // exact parser. The pending prefix was never published as a row.
+    super::each_line(&span[start..], &mut |line| {
+        if let Some(fields) = super::fields::<N>(line) {
+            emit(fields);
+        }
+    });
+}
+
 #[inline]
 fn parsed<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128) -> Option<[&'a [u8]; N]> {
     if line.len() > 128 {
@@ -208,6 +296,12 @@ mod tests {
         let mut actual = Vec::new();
         scan::<N>(bytes, &mut |parts| actual.push(parts.map(<[u8]>::to_vec)));
         assert_eq!(actual, expected);
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512f") {
+            actual.clear();
+            window::<N>(bytes, &mut |parts| actual.push(parts.map(<[u8]>::to_vec)));
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

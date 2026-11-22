@@ -220,6 +220,63 @@ pub(super) fn finish(
     )
 }
 
+/// Join the already contiguous P1 ranges for each final person. Link their
+/// descriptors, rather than copying their payloads into another P2 buffer.
+pub(super) fn finish_people(
+    packets: Vec<Packet>,
+    data: &[EventData],
+    window: Window,
+    names: Option<&Names>,
+    fused: &crate::aggregate::FusedCampaigns,
+    ids: &crate::records::ClickIds,
+) -> SessionBatch {
+    let mut blocks: Vec<_> = packets.into_iter().map(|p| match p {
+        Packet::Groups(block) => block,
+        Packet::Rows(_) => unreachable!("person fusion requires P1 group descriptors"),
+    }).collect();
+    const END: u32 = u32::MAX;
+    let mut heads = AHashMap::<u32, u32>::default();
+    let mut locations = Vec::with_capacity(blocks.iter().map(|b| b.groups.len()).sum());
+    for (block_idx, block) in blocks.iter_mut().enumerate() {
+        for (i, g) in block.groups.iter_mut().enumerate() {
+            let head = heads.entry(g.person).or_insert(END);
+            g.person = std::mem::replace(head, index(locations.len()));
+            locations.push((index(block_idx), index(i)));
+        }
+    }
+    let locations = locations.as_slice();
+    let blocks = blocks.as_slice();
+    fused.with_people(names, ids, |kernel| {
+        for (person, head) in heads {
+            let fragments = || {
+                let mut next = head;
+                std::iter::from_fn(move || {
+                    if next == END { return None; }
+                    let (block, i) = locations[next as usize];
+                    let block = &blocks[block as usize];
+                    let i = i as usize;
+                    let g = &block.groups[i];
+                    next = g.person;
+                    let prev = i.checked_sub(1).map(|j| &block.groups[j]);
+                    let events = prev.map_or(0, |g| g.event_end) as usize..g.event_end as usize;
+                    let clicks = prev.map_or(0, |g| g.click_end) as usize..g.click_end as usize;
+                    Some((block, events, clicks))
+                })
+            };
+            let events = fragments().flat_map(|(block, range, _)| {
+                block.events[range].iter().map(|&[chunk, stamp]| {
+                    data[chunk as usize].decode(window.start, stamp)
+                })
+            });
+            let clicks = fragments().flat_map(|(block, _, range)| {
+                block.clicks[range.clone()].iter().zip(&block.campaigns[range])
+                    .map(move |(&(time, id), &campaign)| Click { person, time, id, campaign })
+            });
+            kernel.compute(person, events, clicks);
+        }
+    })
+}
+
 fn merge(
     mut blocks: Vec<Block>,
     data: &[EventData],
@@ -312,7 +369,7 @@ mod tests {
     fn representative_ranges_join_across_p1_and_preserve_full_clicks_and_sales() {
         for flat in [false, true] {
             for wide in [false, true] {
-                let mut plan = Plan::new(0).unwrap();
+                let mut plan = Plan::new(0, false).unwrap();
                 plan.forward_blocks = true;
                 plan.flat = flat;
                 plan.user_parts = 8;

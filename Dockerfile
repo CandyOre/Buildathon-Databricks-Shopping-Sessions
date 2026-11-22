@@ -37,8 +37,10 @@ RUN set -eu; flags=""; if [ "$SCORER_STATIC" = 1 ]; then flags=-Ctarget-feature=
     if [ "$SCORER_CASCADE" = 1 ]; then cp /cascade /scorers; fi
 
 FROM ${RUNTIME_IMAGE}
+ARG SCORER_ARCH=default
 COPY --from=build /scorers/ /usr/local/bin/
 ENV MIMALLOC_PURGE_DELAY=10000
 ENV PERF_WIDE_SCAN=1
+ENV PERF_ARCH=${SCORER_ARCH}
 USER 1000:1000
 CMD ["/usr/local/bin/shopping-sessions"]

@@ -12,7 +12,10 @@
 //! With `PERF_ROUTE_INPUT_PAGES=1`, both full and packed lanes write
 //! directly into 4 KiB pages. WRITES selects ordinary, batched, or streaming
 //! stores for these lanes. Native pages take priority over a slab.
+mod direct;
+mod person;
 mod forward;
+mod frontend;
 mod packed;
 mod storage;
 use std::path::Path;
@@ -183,6 +186,20 @@ impl EventKeys {
         if seconds < u64::from(SIDE) {
             return seconds as u32;
         }
+        self.ingest_side(time)
+    }
+
+    #[inline]
+    fn ingest_seconds(&mut self, base: i64, seconds: i64) -> u32 {
+        let relative = (seconds - base) as u64;
+        if relative < u64::from(SIDE) {
+            return relative as u32;
+        }
+        self.ingest_side(seconds * 1000)
+    }
+
+    #[cold]
+    fn ingest_side(&mut self, time: i64) -> u32 {
         let slot = self.ingests.len();
         assert!(slot < SIDE as usize);
         self.ingests.push(time);
@@ -287,6 +304,60 @@ struct WinnerRow {
     chunk: u32,
     stamp: u32,
 }
+// An immediate timestamp needs no source chunk. Small users leave room for
+// all 31 timestamp bits. The other short base36 spellings use 42 bits, with
+// the remaining 21 bits holding exact whole seconds.
+#[derive(Clone, Copy)]
+struct ShortWinner(u64);
+
+impl ShortWinner {
+    #[inline]
+    fn encode(row: WinnerRow) -> Option<Self> {
+        if row.stamp >= SIDE || row.user >= (1 << 42) {
+            return None;
+        }
+        if row.user <= u64::from(u32::MAX) {
+            return Some(Self((1 << 63) | (u64::from(row.stamp) << 32) | row.user));
+        }
+        let seconds = row.stamp / 1000;
+        (row.stamp % 1000 == 0 && seconds < (1 << 21))
+            .then(|| Self((u64::from(seconds) << 42) | row.user))
+    }
+    #[inline]
+    fn decode(self) -> WinnerRow {
+        let (user, stamp) = if self.0 >> 63 != 0 {
+            (u64::from(self.0 as u32), (self.0 >> 32) as u32 & (SIDE - 1))
+        } else {
+            (self.0 & ((1 << 42) - 1), (self.0 >> 42) as u32 * 1000)
+        };
+        WinnerRow { user, stamp, chunk: 0 }
+    }
+}
+
+#[derive(Default)]
+struct RawWinnerBlock {
+    short: Vec<ShortWinner>,
+    // Precise millisecond, purchase, and wide-user exceptions retain the
+    // original chunk. The matching EventData lives through both user passes.
+    full: Vec<WinnerRow>,
+}
+
+impl RawWinnerBlock {
+    #[inline]
+    fn push(&mut self, row: WinnerRow, compact: bool) {
+        if compact {
+            if let Some(short) = ShortWinner::encode(row) {
+                self.short.push(short);
+                return;
+            }
+        }
+        self.full.push(row);
+    }
+    fn len(&self) -> usize { self.short.len() + self.full.len() }
+    fn rows(self) -> impl Iterator<Item = WinnerRow> {
+        self.short.into_iter().map(ShortWinner::decode).chain(self.full)
+    }
+}
 #[derive(Clone, Copy)]
 struct Candidate {
     row: EventRow,
@@ -333,10 +404,13 @@ struct Work {
     winner_time: Duration,
     scan_tasks: usize,
     stripe_rows: usize,
+    returned_bucket_page_bytes: usize,
+    short_winners: usize,
+    winner_capacity: usize,
 }
 
 struct Winners {
-    partitions: Vec<Pieces<WinnerRow>>,
+    partitions: Vec<Vec<RawWinnerBlock>>,
     data: Vec<EventData>,
     count: usize,
     work: Work,
@@ -360,6 +434,7 @@ fn switch(name: &str, default: &str) -> String {
 
 #[derive(Clone, Copy)]
 struct Plan {
+    person_kernel: bool,
     event_parts: usize,
     user_parts: usize,
     writes: Writes,
@@ -389,21 +464,30 @@ impl Plan {
         };
         target.min((n / (rayon::current_num_threads() * 2)).max(1))
     }
-    fn new(bytes: usize) -> Result<Self> {
-        let event_parts = bytes.div_ceil(3 << 20).clamp(8, 2048).next_power_of_two();
-        let user_parts = bytes.div_ceil(10 << 20).clamp(8, 512).next_power_of_two();
+    fn new(bytes: usize, architecture: bool) -> Result<Self> {
+        // The compact front end batches four records per event destination.
+        // Bound its active cache lines and the producer × consumer matrix;
+        // the event-ID bitmap and exact maps remain private to each bucket.
+        let (event_bytes, event_limit, person_bytes, person_limit) = if architecture {
+            (16 << 20, 256, 32 << 20, 128)
+        } else {
+            (3 << 20, 2048, 10 << 20, 512)
+        };
+        let event_parts = bytes.div_ceil(event_bytes).clamp(8, event_limit).next_power_of_two();
+        let user_parts = bytes.div_ceil(person_bytes).clamp(8, person_limit).next_power_of_two();
         let writes = match switch("PERF_ROUTE_WRITES", "buffered").as_str() {
             "direct" => Writes::Direct,
             "buffered" => Writes::Buffered,
             "stream" => Writes::Stream,
             _ => anyhow::bail!("unknown PERF_ROUTE_WRITES"),
         };
-        let chunk_group = switch("PERF_ROUTE_CHUNKS", "1").parse::<usize>()?;
+        let chunk_group = switch("PERF_ROUTE_CHUNKS", if architecture { "12" } else { "1" }).parse::<usize>()?;
         ensure!(
             (1..=128).contains(&chunk_group),
             "PERF_ROUTE_CHUNKS must be 1..128"
         );
         Ok(Self {
+            person_kernel: false,
             event_parts: config_size("PERF_ROUTE_EVENT_BUCKETS", event_parts)?,
             user_parts: config_size("PERF_ROUTE_USER_BUCKETS", user_parts)?,
             writes,
@@ -413,7 +497,7 @@ impl Plan {
             arena: switch("PERF_ROUTE_ARENA", "0") == "1",
             reuse: switch("PERF_ROUTE_REUSE", "1") != "0",
             packed: switch("PERF_ROUTE_PACK", "0") == "1",
-            flat: switch("PERF_ROUTE_GROUPS", "map") == "flat",
+            flat: switch("PERF_ROUTE_GROUPS", if architecture { "flat" } else { "map" }) == "flat",
             forward_blocks: switch("PERF_ROUTE_FORWARD", "rows") == "blocks",
             chunk_group,
             slab: switch("PERF_ROUTE_SLAB", "0") == "1",
@@ -652,14 +736,28 @@ impl Rows {
     }
 }
 
-fn event_winners(
+struct Scanned {
+    pieces: Vec<Vec<Fragment>>,
+    keys: Vec<EventKeys>,
+    payloads: Vec<EventData>,
+    work: Work,
+}
+
+struct Selected<T> {
+    streams: Vec<T>,
+    payloads: Vec<EventData>,
+    count: usize,
+    work: Work,
+}
+
+fn scan_events(
     plans: Vec<Chunk>,
     plan: Plan,
     window: Window,
     dimensions: &Dimensions,
     raw_users: &Names,
     arena: &storage::Arena,
-) -> Result<Winners> {
+) -> Result<Scanned> {
     let other_ids = Names::default();
     let calendar = Calendar::new(window);
     let base = window.start.div_euclid(1000);
@@ -679,7 +777,17 @@ fn event_winners(
         plan.chunks_per_task(plans.len()),
         plan.event_parts * (bucket_header + stripe_padding),
     );
+    let frontend = frontend::mode(plan);
     let chunks = crate::runtime::stage_map("route_decode_events", groups, |sources| {
+        match frontend {
+            frontend::Mode::Batch => return frontend::decode::<true>(
+                sources, plan, &calendar, window, dimensions, &other_ids, raw_users,
+            ),
+            frontend::Mode::Direct => return frontend::decode::<false>(
+                sources, plan, &calendar, window, dimensions, &other_ids, raw_users,
+            ),
+            frontend::Mode::Legacy => {}
+        }
         let mut pages = plan
             .input_pages
             .then(|| NativeWriters::new(arena, plan.event_parts, plan, storage::InputKind::Event));
@@ -829,8 +937,21 @@ fn event_winners(
         work.max_event_bucket = *sizes.last().unwrap_or(&0);
         work.median_event_bucket = sizes[sizes.len() / 2];
     }
+    work.exchange_time = exchange_start.elapsed();
+    Ok(Scanned { pieces, keys, payloads, work })
+}
+
+fn dedup_events<T: Send>(
+    scanned: Scanned,
+    plan: Plan,
+    window: Window,
+    arena: &storage::Arena,
+    init: impl Fn() -> T + Sync,
+    emit: impl Fn(&mut T, Candidate, &[EventData]) + Sync,
+) -> Selected<T> {
+    let Scanned { pieces, keys, payloads, mut work } = scanned;
+    let base = window.start.div_euclid(1000);
     let winner_start = Instant::now();
-    work.exchange_time = winner_start.duration_since(exchange_start);
     let results = crate::runtime::stage_map_init(
         "route_event_dedup",
         pieces,
@@ -850,7 +971,9 @@ fn event_winners(
                 .next_power_of_two();
             let rows = if plan.arena && !plan.input_pages {
                 let all = pieces.iter().flat_map(|p| p.rows(&keys, &payloads));
-                Rows::Pages(arena.pack(all))
+                let pages = arena.pack(all);
+                drop(pieces);
+                Rows::Pages(pages)
             } else {
                 Rows::Fragments(pieces)
             };
@@ -877,17 +1000,12 @@ fn event_winners(
                     seen[i / 64] |= bit;
                 });
             }
-            let mut output: Pieces<WinnerRow> = empty_buckets(plan.user_parts);
+            let mut output = init();
             let mut count = 0;
             let mut disputed = 0;
             let mut route = |c: Candidate| {
                 if c.row.stamp != INVALID {
-                    let p = hash(c.row.user) as usize & (plan.user_parts - 1);
-                    output[p].push(WinnerRow {
-                        user: c.row.user,
-                        chunk: c.chunk,
-                        stamp: c.row.stamp,
-                    });
+                    emit(&mut output, c, &payloads);
                     count += 1;
                 }
             };
@@ -917,6 +1035,15 @@ fn event_winners(
                     *winner = c;
                 }
             });
+            // Candidates in the exact table own their small row; only key and
+            // value sidecars survive. Recycle this bucket's source pages now.
+            let returned = if plan.profile {
+                match &rows {
+                    Rows::Pages(p) => p.capacity_bytes(),
+                    Rows::Fragments(parts) => parts.iter().map(|p| p.pages.capacity_bytes()).sum(),
+                }
+            } else { 0 };
+            drop(rows);
             let duplicate = disputed - compact.len() - wide.len() - linear.entries.len();
             for c in compact
                 .drain()
@@ -926,30 +1053,54 @@ fn event_winners(
             {
                 route(c);
             }
-            (output, count, disputed, duplicate, linear.probes)
+            (output, count, disputed, duplicate, linear.probes, returned)
         },
     );
     drop(keys);
-    let mut partitions: Vec<Pieces<WinnerRow>> = empty_buckets(plan.user_parts);
     let mut count = 0;
-    for (out, n, disputed, duplicates, probes) in results {
+    let mut streams = Vec::with_capacity(results.len());
+    for (stream, n, disputed, duplicates, probes, returned) in results {
         count += n;
         work.repeated_rows += disputed;
         work.real_duplicates += duplicates;
         work.linear_probes += probes;
-        for (dest, bucket) in partitions.iter_mut().zip(out) {
-            if !bucket.is_empty() {
+        work.returned_bucket_page_bytes += returned;
+        streams.push(stream);
+    }
+    work.winner_time = winner_start.elapsed();
+    Selected { streams, payloads, count, work }
+}
+
+fn event_winners(
+    plans: Vec<Chunk>,
+    plan: Plan,
+    window: Window,
+    dimensions: &Dimensions,
+    raw_users: &Names,
+    arena: &storage::Arena,
+) -> Result<Winners> {
+    let scanned = scan_events(plans, plan, window, dimensions, raw_users, arena)?;
+    let compact = plan.person_kernel && switch("PERF_ARCH_WINNERS", "compact") != "full";
+    let mut selected = dedup_events(scanned, plan, window, arena,
+        || (0..plan.user_parts).map(|_| RawWinnerBlock::default()).collect::<Vec<_>>(),
+        |output, c, _| {
+            let bucket = hash(c.row.user) as usize & (plan.user_parts - 1);
+            output[bucket].push(WinnerRow { user: c.row.user, chunk: c.chunk, stamp: c.row.stamp }, compact);
+        });
+    let mut partitions = empty_buckets(plan.user_parts);
+    for stream in selected.streams {
+        for (dest, bucket) in partitions.iter_mut().zip(stream) {
+            if bucket.len() != 0 {
+                if plan.profile {
+                    selected.work.short_winners += bucket.short.len();
+                    selected.work.winner_capacity += bucket.short.capacity() * size_of::<ShortWinner>()
+                        + bucket.full.capacity() * size_of::<WinnerRow>();
+                }
                 dest.push(bucket);
             }
         }
     }
-    work.winner_time = winner_start.elapsed();
-    Ok(Winners {
-        partitions,
-        data: payloads,
-        count,
-        work,
-    })
+    Ok(Winners { partitions, data: selected.payloads, count: selected.count, work: selected.work })
 }
 
 struct ClickBlock {
@@ -1418,7 +1569,7 @@ struct P1 {
 
 #[allow(clippy::too_many_arguments)]
 fn first_pass(
-    events: Pieces<WinnerRow>,
+    events: Vec<RawWinnerBlock>,
     clicks: Vec<ClickBlock>,
     data: &[EventData],
     click_users: &[Vec<[u64; 2]>],
@@ -1428,10 +1579,11 @@ fn first_pass(
     window: Window,
     plan: Plan,
     arena: &storage::Arena,
+    person_kernel: Option<(&aggregate::FusedCampaigns, &ClickIds)>,
 ) -> P1 {
     let start = Instant::now();
     let cap = if plan.flat {
-        let rows = events.iter().map(Vec::len).sum::<usize>()
+        let rows = events.iter().map(RawWinnerBlock::len).sum::<usize>()
             + clicks
                 .iter()
                 .map(|c| c.full.len() + c.short.len() + c.pages.len())
@@ -1454,7 +1606,7 @@ fn first_pass(
     };
     let mut local = People::default();
     let mut forwarded = forward::Builder::new(plan);
-    for r in events.into_iter().flatten() {
+    for r in events.into_iter().flat_map(RawWinnerBlock::rows) {
         let dest = ids.target(
             r.user,
             &data[r.chunk as usize].users,
@@ -1511,7 +1663,12 @@ fn first_pass(
     drop(ids);
     let group_time = start.elapsed();
     let finish_start = Instant::now();
-    let local = local.finish(window, data, crate::output::aggregate_names(users));
+    let names = crate::output::aggregate_names(users);
+    let local = if let Some((acc, ids)) = person_kernel {
+        (person::finish(local, data, window, names, acc, ids), Vec::new())
+    } else {
+        local.finish(window, data, names)
+    };
     let finish_time = finish_start.elapsed();
     P1 {
         local,
@@ -1632,10 +1789,27 @@ pub enum Campaigns {
 pub type Routed = (Vec<SessionBatch>, Campaigns, PersonNames, usize);
 
 pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Routed> {
+    run_impl(data, window, dimensions, None)
+}
+
+pub fn run_arch(data: &Path, window: Window, dimensions: &Dimensions, direct: bool) -> Result<Routed> {
+    run_impl(data, window, dimensions, Some(direct))
+}
+
+fn run_impl(data: &Path, window: Window, dimensions: &Dimensions, direct: Option<bool>) -> Result<Routed> {
     let tasks = chunks(&data.join("events"))?;
     let bytes = tasks.iter().map(Chunk::byte_len).sum();
-    let plan = Plan::new(bytes)?;
-    let fused = crate::runtime::flag("PERF_ROUTE_FUSED")
+    let mut plan = Plan::new(bytes, direct.is_some())?;
+    if let Some(use_direct) = direct {
+        plan.person_kernel = true;
+        plan.packed = true;
+        plan.p1 = true;
+        plan.forward_blocks = true;
+        if use_direct {
+            return direct::run(data, tasks, plan, window, dimensions, bytes);
+        }
+    }
+    let fused = (plan.person_kernel || crate::runtime::flag("PERF_ROUTE_FUSED"))
         .then(|| aggregate::FusedCampaigns::new(dimensions.campaigns.len(), window));
     let arena = storage::Arena::new(plan.reuse);
     let started = Instant::now();
@@ -1706,8 +1880,9 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             window,
             plan,
             &arena,
+            fused.as_ref().filter(|_| plan.person_kernel).map(|f| (f, &ids)),
         );
-        if let Some(acc) = &fused {
+        if let Some(acc) = fused.as_ref().filter(|_| !plan.person_kernel) {
             let start = Instant::now();
             acc.consume(&mut result.local.0, &mut result.local.1, &ids);
             result.elapsed += start.elapsed();
@@ -1742,6 +1917,11 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let p2_start = Instant::now();
     let later = later.into_iter().filter(|p| !p.is_empty()).collect();
     let rest = crate::runtime::stage_map("route_second_pass", later, |p| {
+        if plan.person_kernel {
+            let batch = forward::finish_people(p, &payloads, window,
+                crate::output::aggregate_names(&users), fused.as_ref().unwrap(), &ids);
+            return (batch, Vec::new());
+        }
         let (mut batch, mut clicks) = forward::finish(
             p,
             &payloads,

@@ -956,6 +956,10 @@ impl Chunk {
     }
 
     pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if structural::window_enabled::<N>() {
+            return self.spans(|span| structural::window::<N>(span, &mut row));
+        }
         if structural::enabled::<N>() {
             return self.spans(|span| structural::scan::<N>(span, &mut row));
         }
