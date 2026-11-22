@@ -1,0 +1,1152 @@
+//! Resolve identity once per raw spelling, after event-ID winner selection.
+//! A connected component can have aliases in several raw partitions, so every
+//! member of such a component (including its representative) is forwarded.
+mod storage;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ahash::AHashMap;
+use anyhow::{Result, ensure};
+use rayon::prelude::*;
+
+use crate::aggregate::{self, SessionBatch};
+use crate::csv::{Chunk, chunks};
+use crate::input::{self, Aliases, Calendar, Dimensions, Names, PersonCache, PersonNames, Window};
+use crate::records::{Batch, Click, ClickIds, ClickKeyChunk, Event, Purchase};
+
+const WIDE: u64 = 1 << 63;
+const OTHER: u64 = 3 << 62;
+const SIDE: u32 = 1 << 31;
+const INVALID: u32 = u32::MAX;
+const HASH_MASK: u64 = (1 << 30) - 1;
+
+fn mix(word: u64) -> u32 {
+    let v = (word ^ (word >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    ((v ^ (v >> 32)) & HASH_MASK) as u32
+}
+
+#[inline]
+fn hash(handle: u64) -> u32 {
+    if (WIDE..OTHER).contains(&handle) {
+        ((handle >> 32) & HASH_MASK) as u32
+    } else {
+        mix(handle)
+    }
+}
+
+// Compact handles contain the actual suffix. A wide handle addresses its
+// chunk-local, full 128-bit key; the upper 30 hash bits are only a routing hint.
+#[inline]
+fn encode(bytes: &[u8], prefix: u8, wide: &mut Vec<[u64; 2]>, fallback: &Names) -> u64 {
+    if bytes.first() == Some(&prefix) {
+        let tail = &bytes[1..];
+        if tail.len() <= 8 && tail.first().copied().unwrap_or(0) < 128 && tail.last() != Some(&0) {
+            let word = if let Ok(full) = <&[u8; 8]>::try_from(tail) {
+                u64::from_be_bytes(*full)
+            } else {
+                let mut padded = [0u8; 8];
+                padded[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(padded)
+            };
+            return word;
+        }
+        if let Some(key) = input::hex_id(bytes, prefix) {
+            let slot = u32::try_from(wide.len()).expect("too many keys in one input chunk");
+            wide.push(key);
+            let fingerprint = mix(key[0] ^ key[1].rotate_left(23));
+            return WIDE | (u64::from(fingerprint) << 32) | u64::from(slot);
+        }
+    }
+    OTHER | u64::from(fallback.intern(input::text(bytes)))
+}
+
+fn user_bytes<'a>(
+    handle: u64,
+    wide: &[[u64; 2]],
+    other: &'a [Vec<Arc<str>>],
+    buffer: &'a mut [u8; 33],
+) -> &'a [u8] {
+    if handle >= OTHER {
+        return input::name_for(other, handle as u32).as_bytes();
+    }
+    buffer[0] = b'u';
+    if handle < WIDE {
+        buffer[1..9].copy_from_slice(&handle.to_be_bytes());
+        return &buffer[..9 - (handle.trailing_zeros() / 8) as usize];
+    }
+    let [hi, lo] = wide[handle as u32 as usize];
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (dst, byte) in buffer[1..]
+        .chunks_exact_mut(2)
+        .zip(hi.to_be_bytes().into_iter().chain(lo.to_be_bytes()))
+    {
+        dst[0] = HEX[(byte >> 4) as usize];
+        dst[1] = HEX[(byte & 15) as usize];
+    }
+    buffer
+}
+
+#[derive(Clone, Copy)]
+struct EventRow {
+    id: u64,
+    user: u64,
+    stamp: u32,
+    ingest: u32,
+}
+const _: () = assert!(std::mem::size_of::<EventRow>() == 24);
+
+#[derive(Default)]
+struct EventKeys {
+    wide: Vec<[u64; 2]>,
+    ingests: Vec<i64>,
+}
+
+#[derive(Default)]
+struct EventData {
+    users: Vec<[u64; 2]>,
+    extra: Vec<(i64, Option<Purchase>)>,
+}
+
+impl EventData {
+    fn stamp(&mut self, start: i64, time: i64, sale: Option<Purchase>) -> u32 {
+        let offset = (time - start) as u64;
+        if sale.is_none() && offset < u64::from(SIDE) {
+            return offset as u32;
+        }
+        let slot = self.extra.len();
+        assert!(slot < (SIDE - 1) as usize);
+        self.extra.push((time, sale));
+        SIDE | slot as u32
+    }
+
+    #[inline]
+    fn decode(&self, start: i64, stamp: u32) -> (i64, Option<Purchase>) {
+        if stamp < SIDE {
+            (start + i64::from(stamp), None)
+        } else {
+            self.extra[(stamp ^ SIDE) as usize]
+        }
+    }
+}
+
+impl EventKeys {
+    fn ingest(&mut self, base: i64, time: i64) -> u32 {
+        let seconds = (time.div_euclid(1000) - base) as u64;
+        if seconds < u64::from(SIDE) {
+            return seconds as u32;
+        }
+        let slot = self.ingests.len();
+        assert!(slot < SIDE as usize);
+        self.ingests.push(time);
+        SIDE | slot as u32
+    }
+
+    fn millis(&self, base: i64, ingest: u32) -> i64 {
+        if ingest < SIDE {
+            (base + i64::from(ingest)) * 1000
+        } else {
+            self.ingests[(ingest ^ SIDE) as usize]
+        }
+    }
+}
+
+fn empty_buckets<T>(n: usize) -> Vec<Vec<T>> {
+    (0..n).map(|_| Vec::new()).collect()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Writes {
+    Direct,
+    Buffered,
+    Stream,
+}
+
+struct BucketWriter {
+    output: Vec<Vec<EventRow>>,
+    staging: Vec<[std::mem::MaybeUninit<EventRow>; 8]>,
+    used: Vec<u8>,
+    mode: Writes,
+}
+
+impl BucketWriter {
+    fn new(n: usize, mode: Writes) -> Self {
+        let staging = if mode == Writes::Direct { 0 } else { n };
+        Self {
+            output: empty_buckets(n),
+            staging: vec![[std::mem::MaybeUninit::uninit(); 8]; staging],
+            used: vec![0; staging],
+            mode,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, part: usize, row: EventRow) {
+        if self.mode == Writes::Direct {
+            self.output[part].push(row);
+            return;
+        }
+        let n = self.used[part] as usize;
+        self.staging[part][n].write(row);
+        self.used[part] = (n + 1) as u8;
+        if n == 7 {
+            self.flush(part);
+        }
+    }
+
+    fn flush(&mut self, part: usize) {
+        let n = std::mem::take(&mut self.used[part]) as usize;
+        if n == 0 {
+            return;
+        }
+        let out = &mut self.output[part];
+        let source = self.staging[part].as_ptr().cast::<EventRow>();
+        out.reserve(n);
+        let len = out.len();
+        // Only the initialized staging prefix is copied. reserve supplies the
+        // entire destination and no other worker accesses this private vector.
+        unsafe {
+            let dest = out.as_mut_ptr().add(len);
+            #[cfg(target_arch = "x86_64")]
+            if self.mode == Writes::Stream && n == 8 && dest as usize % 16 == 0 {
+                use std::arch::x86_64::*;
+                for lane in 0..(8 * size_of::<EventRow>() / 16) {
+                    _mm_stream_si128(
+                        dest.cast::<__m128i>().add(lane),
+                        _mm_loadu_si128(source.cast::<__m128i>().add(lane)),
+                    );
+                }
+                // Vec may reallocate (and read the old range) on the next flush.
+                _mm_sfence();
+                out.set_len(len + n);
+                return;
+            }
+            std::ptr::copy_nonoverlapping(source, dest, n);
+            out.set_len(len + n);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Vec<EventRow>> {
+        for part in 0..self.used.len() {
+            self.flush(part);
+        }
+        self.output
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WinnerRow {
+    user: u64,
+    chunk: u32,
+    stamp: u32,
+}
+#[derive(Clone, Copy)]
+struct Candidate {
+    row: EventRow,
+    chunk: u32,
+}
+#[derive(Clone, Copy)]
+struct RawClick {
+    user: u64,
+    time: i64,
+    id: u64,
+    campaign: u32,
+    chunk: u32,
+}
+
+type Pieces<T> = Vec<Vec<T>>;
+
+#[derive(Default)]
+struct Work {
+    parsed: usize,
+    valid: usize,
+    side_rows: usize,
+    wide_events: usize,
+    wide_users: usize,
+    ingest_side: usize,
+    nonempty_event_buckets: usize,
+    max_event_bucket: usize,
+    median_event_bucket: usize,
+    event_capacity: usize,
+    repeated_rows: usize,
+    real_duplicates: usize,
+    linear_probes: usize,
+}
+
+struct Winners {
+    partitions: Vec<Pieces<WinnerRow>>,
+    data: Vec<EventData>,
+    count: usize,
+    work: Work,
+}
+
+fn config_size(name: &str, default: usize) -> Result<usize> {
+    let size = match std::env::var(name) {
+        Ok(s) => s.parse::<usize>()?,
+        Err(_) => default,
+    };
+    ensure!(
+        size.is_power_of_two() && size <= 8192,
+        "{name} must be a power of two up to 8192"
+    );
+    Ok(size)
+}
+
+fn switch(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+#[derive(Clone, Copy)]
+struct Plan {
+    event_parts: usize,
+    user_parts: usize,
+    writes: Writes,
+    bitmap: bool,
+    overlap: bool,
+    p1: bool,
+    early_clicks: bool,
+    profile: bool,
+    linear: bool,
+    factor: usize,
+    arena: bool,
+    reuse: bool,
+}
+
+impl Plan {
+    fn new(bytes: usize) -> Result<Self> {
+        let event_parts = bytes.div_ceil(3 << 20).clamp(8, 2048).next_power_of_two();
+        let user_parts = bytes.div_ceil(10 << 20).clamp(8, 512).next_power_of_two();
+        let writes = match switch("PERF_ROUTE_WRITES", "buffered").as_str() {
+            "direct" => Writes::Direct,
+            "buffered" => Writes::Buffered,
+            "stream" => Writes::Stream,
+            _ => anyhow::bail!("unknown PERF_ROUTE_WRITES"),
+        };
+        Ok(Self {
+            event_parts: config_size("PERF_ROUTE_EVENT_BUCKETS", event_parts)?,
+            user_parts: config_size("PERF_ROUTE_USER_BUCKETS", user_parts)?,
+            writes,
+            bitmap: switch("PERF_ROUTE_WINNER", "bitmap") != "map",
+            linear: switch("PERF_ROUTE_EXACT", "hash") == "linear",
+            factor: config_size("PERF_ROUTE_BITMAP_FACTOR", 8)?,
+            arena: switch("PERF_ROUTE_ARENA", "0") == "1",
+            reuse: switch("PERF_ROUTE_REUSE", "1") != "0",
+            overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
+            p1: switch("PERF_ROUTE_P1", "1") != "0",
+            early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
+            profile: switch("PROFILE", "0") == "1",
+        })
+    }
+}
+
+// Full spelling equality is independent of the bucket fingerprint. In
+// particular an all-zero wide key is distinct from the compact value zero.
+fn equal_key(a: Candidate, b: Candidate, keys: &[EventKeys]) -> bool {
+    if (WIDE..OTHER).contains(&a.row.id) {
+        (WIDE..OTHER).contains(&b.row.id)
+            && keys[a.chunk as usize].wide[a.row.id as u32 as usize]
+                == keys[b.chunk as usize].wide[b.row.id as u32 as usize]
+    } else {
+        a.row.id == b.row.id
+    }
+}
+
+fn exact_hash(c: Candidate, keys: &[EventKeys]) -> usize {
+    let value = if (WIDE..OTHER).contains(&c.row.id) {
+        let [hi, lo] = keys[c.chunk as usize].wide[c.row.id as u32 as usize];
+        hi.wrapping_mul(0xd6e8_feb8_6659_fd93) ^ lo.rotate_right(19)
+    } else {
+        c.row.id
+    };
+    mix(value) as usize
+}
+
+#[derive(Default)]
+struct ExactTable {
+    slots: Vec<u32>,
+    entries: Vec<Candidate>,
+    probes: usize,
+}
+
+impl ExactTable {
+    fn clear(&mut self) {
+        self.slots.fill(0);
+        self.entries.clear();
+        self.probes = 0;
+    }
+    fn slot(&mut self, c: Candidate, keys: &[EventKeys]) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut idx = exact_hash(c, keys) & mask;
+        loop {
+            let n = self.slots[idx];
+            self.probes += 1;
+            if n == 0 || equal_key(c, self.entries[n as usize - 1], keys) {
+                return idx;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+    fn insert(&mut self, c: Candidate, keys: &[EventKeys]) -> &mut Candidate {
+        if (self.entries.len() + 1) * 4 > self.slots.len() * 3 {
+            let capacity = (self.slots.len() * 2).max(64);
+            self.slots.clear();
+            self.slots.resize(capacity, 0);
+            for i in 0..self.entries.len() {
+                let idx = self.slot(self.entries[i], keys);
+                self.slots[idx] = (i + 1) as u32;
+            }
+        }
+        let idx = self.slot(c, keys);
+        if self.slots[idx] == 0 {
+            self.entries.push(c);
+            self.slots[idx] = u32::try_from(self.entries.len()).expect("too many winners");
+        }
+        &mut self.entries[self.slots[idx] as usize - 1]
+    }
+}
+
+#[derive(Default)]
+struct Scratch {
+    seen: Vec<u64>,
+    repeated: Vec<u64>,
+    linear: ExactTable,
+    compact: AHashMap<u64, Candidate>,
+    wide: AHashMap<[u64; 2], Candidate>,
+}
+
+enum Rows {
+    Fragments(Vec<(u32, Vec<EventRow>)>),
+    Pages(storage::Pages<Candidate>),
+}
+
+impl Rows {
+    fn visit(&self, mut emit: impl FnMut(Candidate)) {
+        match self {
+            Self::Fragments(p) => {
+                for (chunk, rows) in p {
+                    for &row in rows {
+                        emit(Candidate { row, chunk: *chunk });
+                    }
+                }
+            }
+            Self::Pages(p) => p.iter().for_each(emit),
+        }
+    }
+}
+
+fn event_winners(
+    plans: Vec<Chunk>,
+    plan: Plan,
+    window: Window,
+    dimensions: &Dimensions,
+    raw_users: &Names,
+    arena: &storage::Arena,
+) -> Result<Winners> {
+    let other_ids = Names::default();
+    let calendar = Calendar::new(window);
+    let base = window.start.div_euclid(1000);
+    let chunks = plans
+        .into_par_iter()
+        .map(|chunk| {
+            let mut sink = BucketWriter::new(plan.event_parts, plan.writes);
+            let (mut keys, mut data) = (EventKeys::default(), EventData::default());
+            let mut valid_count = 0;
+            chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
+                let key = encode(id, b'e', &mut keys.wide, &other_ids);
+                let (user, stamp) = match valid {
+                    Some((time, sale)) => {
+                        valid_count += 1;
+                        (
+                            encode(user, b'u', &mut data.users, raw_users),
+                            data.stamp(window.start, time, sale),
+                        )
+                    }
+                    None => (0, INVALID),
+                };
+                let row = EventRow {
+                    id: key,
+                    user,
+                    stamp,
+                    ingest: keys.ingest(base, ingest),
+                };
+                sink.push(hash(key) as usize & (plan.event_parts - 1), row);
+            })?;
+            Ok::<_, anyhow::Error>((sink.finish(), keys, data, valid_count))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(other_ids);
+
+    let mut pieces: Vec<Vec<(u32, Vec<EventRow>)>> = empty_buckets(plan.event_parts);
+    let mut keys = Vec::with_capacity(chunks.len());
+    let mut payloads = Vec::with_capacity(chunks.len());
+    let mut work = Work::default();
+    for (i, (buckets, k, p, valid)) in chunks.into_iter().enumerate() {
+        let chunk = u32::try_from(i)?;
+        work.valid += valid;
+        work.wide_events += k.wide.len();
+        work.wide_users += p.users.len();
+        work.ingest_side += k.ingests.len();
+        work.side_rows += p.extra.len();
+        keys.push(k);
+        payloads.push(p);
+        for (dest, bucket) in pieces.iter_mut().zip(buckets) {
+            work.parsed += bucket.len();
+            work.event_capacity += bucket.capacity();
+            if !bucket.is_empty() {
+                dest.push((chunk, bucket));
+            }
+        }
+    }
+    if plan.profile {
+        let mut sizes: Vec<usize> = pieces
+            .iter()
+            .map(|p| p.iter().map(|(_, b)| b.len()).sum())
+            .collect();
+        sizes.sort_unstable();
+        work.nonempty_event_buckets = sizes.iter().filter(|&&n| n > 0).count();
+        work.max_event_bucket = *sizes.last().unwrap_or(&0);
+        work.median_event_bucket = sizes[sizes.len() / 2];
+    }
+    let results = pieces
+        .into_par_iter()
+        .with_min_len(4)
+        .map_init(Scratch::default, |scratch, pieces| {
+            if !plan.reuse {
+                *scratch = Scratch::default();
+            }
+            let n: usize = pieces.iter().map(|(_, b)| b.len()).sum();
+            let slots = (n.saturating_mul(plan.factor)).max(64).next_power_of_two();
+            let rows = if plan.arena {
+                let all = pieces.into_iter().flat_map(|(chunk, rows)| {
+                    rows.into_iter().map(move |row| Candidate { row, chunk })
+                });
+                Rows::Pages(arena.pack(all))
+            } else {
+                Rows::Fragments(pieces)
+            };
+            let Scratch {
+                seen,
+                repeated,
+                compact,
+                wide,
+                linear,
+            } = scratch;
+            linear.clear();
+            let slot = |id| (hash(id) as usize >> plan.event_parts.trailing_zeros()) & (slots - 1);
+            if plan.bitmap {
+                seen.clear();
+                seen.resize(slots / 64, 0u64);
+                repeated.clear();
+                repeated.resize(slots / 64, 0u64);
+                crate::runtime::huge_pages(seen);
+                crate::runtime::huge_pages(repeated);
+                rows.visit(|c| {
+                    let i = slot(c.row.id);
+                    let bit = 1u64 << (i % 64);
+                    repeated[i / 64] |= seen[i / 64] & bit;
+                    seen[i / 64] |= bit;
+                });
+            }
+            let mut output: Pieces<WinnerRow> = empty_buckets(plan.user_parts);
+            let mut count = 0;
+            let mut disputed = 0;
+            let mut route = |c: Candidate| {
+                if c.row.stamp != INVALID {
+                    let p = hash(c.row.user) as usize & (plan.user_parts - 1);
+                    output[p].push(WinnerRow {
+                        user: c.row.user,
+                        chunk: c.chunk,
+                        stamp: c.row.stamp,
+                    });
+                    count += 1;
+                }
+            };
+            rows.visit(|c| {
+                let row = c.row;
+                let meta = &keys[c.chunk as usize];
+                let i = slot(row.id);
+                if plan.bitmap && repeated[i / 64] & (1u64 << (i % 64)) == 0 {
+                    route(c);
+                    return;
+                }
+                disputed += 1;
+                let winner = if plan.linear {
+                    linear.insert(c, &keys)
+                } else if (WIDE..OTHER).contains(&row.id) {
+                    wide.entry(meta.wide[row.id as u32 as usize]).or_insert(c)
+                } else {
+                    compact.entry(row.id).or_insert(c)
+                };
+                let earlier = if (row.ingest | winner.row.ingest) < SIDE {
+                    row.ingest < winner.row.ingest
+                } else {
+                    meta.millis(base, row.ingest)
+                        < keys[winner.chunk as usize].millis(base, winner.row.ingest)
+                };
+                if earlier {
+                    *winner = c;
+                }
+            });
+            let duplicate = disputed - compact.len() - wide.len() - linear.entries.len();
+            for c in compact
+                .drain()
+                .map(|(_, v)| v)
+                .chain(wide.drain().map(|(_, v)| v))
+                .chain(linear.entries.iter().copied())
+            {
+                route(c);
+            }
+            (output, count, disputed, duplicate, linear.probes)
+        })
+        .collect::<Vec<_>>();
+    drop(keys);
+    let mut partitions: Vec<Pieces<WinnerRow>> = empty_buckets(plan.user_parts);
+    let mut count = 0;
+    for (out, n, disputed, duplicates, probes) in results {
+        count += n;
+        work.repeated_rows += disputed;
+        work.real_duplicates += duplicates;
+        work.linear_probes += probes;
+        for (dest, bucket) in partitions.iter_mut().zip(out) {
+            if !bucket.is_empty() {
+                dest.push(bucket);
+            }
+        }
+    }
+    Ok(Winners {
+        partitions,
+        data: payloads,
+        count,
+        work,
+    })
+}
+
+struct ClickInput {
+    partitions: Vec<Pieces<RawClick>>,
+    users: Vec<Vec<[u64; 2]>>,
+    ids: ClickIds,
+}
+
+fn raw_clicks(
+    data: &Path,
+    plan: Plan,
+    window: Window,
+    dimensions: &Dimensions,
+    raw_users: &Names,
+) -> Result<ClickInput> {
+    let fallback = Names::default();
+    let calendar = Calendar::new(window);
+    let pieces = chunks(&data.join("clicks"))?
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut output: Pieces<RawClick> = empty_buckets(plan.user_parts);
+            let mut users = Vec::new();
+            let mut ids = ClickKeyChunk::new(i);
+            let chunk_id = u32::try_from(i)?;
+            chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
+                let user = encode(user, b'u', &mut users, raw_users);
+                let id = ids.encode(id, &fallback);
+                output[hash(user) as usize & (plan.user_parts - 1)].push(RawClick {
+                    user,
+                    time,
+                    id,
+                    campaign,
+                    chunk: chunk_id,
+                });
+            })?;
+            Ok::<_, anyhow::Error>((output, users, ids))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut partitions: Vec<Pieces<RawClick>> = empty_buckets(plan.user_parts);
+    let mut users = Vec::with_capacity(pieces.len());
+    let mut ids = Vec::with_capacity(pieces.len());
+    for (out, u, k) in pieces {
+        users.push(u);
+        ids.push(k);
+        for (dest, rows) in partitions.iter_mut().zip(out) {
+            if !rows.is_empty() {
+                dest.push(rows);
+            }
+        }
+    }
+    Ok(ClickInput {
+        partitions,
+        users,
+        ids: ClickIds::new(fallback, ids),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PersonEvent {
+    person: u32,
+    chunk: u32,
+    stamp: u32,
+}
+
+#[derive(Default)]
+struct Forward {
+    events: Vec<PersonEvent>,
+    clicks: Vec<Click>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Counts {
+    events: usize,
+    sales: usize,
+    clicks: usize,
+}
+
+impl Counts {
+    fn add(&mut self, other: Self) {
+        self.events += other.events;
+        self.sales += other.sales;
+        self.clicks += other.clicks;
+    }
+}
+
+#[derive(Default)]
+struct People {
+    groups: Vec<(u32, Counts)>,
+    events: Vec<PersonEvent>,
+    clicks: Vec<Click>,
+}
+
+impl People {
+    fn group(&mut self, person: u32) -> u32 {
+        let slot = u32::try_from(self.groups.len()).expect("too many people");
+        self.groups.push((person, Counts::default()));
+        slot
+    }
+
+    fn event(&mut self, e: PersonEvent, data: &[EventData]) {
+        let counts = &mut self.groups[e.person as usize].1;
+        counts.events += 1;
+        if e.stamp >= SIDE
+            && data[e.chunk as usize].extra[(e.stamp ^ SIDE) as usize]
+                .1
+                .is_some()
+        {
+            counts.sales += 1;
+        }
+        self.events.push(e);
+    }
+
+    fn click(&mut self, c: Click) {
+        self.groups[c.person as usize].1.clicks += 1;
+        self.clicks.push(c);
+    }
+
+    fn finish(self, window: Window, data: &[EventData]) -> (SessionBatch, Vec<Click>) {
+        let Self {
+            groups,
+            events,
+            clicks,
+        } = self;
+        let mut indexes: Vec<_> = (0..groups.len())
+            .filter(|&i| groups[i].1.events > 0)
+            .collect();
+        indexes.sort_unstable_by_key(|&i| groups[i].0);
+        let mut totals = Counts::default();
+        let mut heads = vec![Counts::default(); groups.len()];
+        let mut person_ids = Vec::with_capacity(indexes.len());
+        let mut boundaries = Vec::with_capacity(indexes.len());
+        let mut click_ends = Vec::with_capacity(indexes.len());
+        let compact = window
+            .end
+            .checked_sub(window.start)
+            .and_then(|v| u32::try_from(v).ok())
+            .is_some()
+            && events.len() <= u32::MAX as usize;
+        for i in indexes {
+            let (person, n) = groups[i];
+            heads[i] = totals;
+            totals.add(n);
+            person_ids.push(person);
+            click_ends.push(totals.clicks);
+            if compact {
+                boundaries.push((totals.events as u32, totals.sales as u32));
+            }
+        }
+        let batch = if compact {
+            let mut times = Vec::<u32>::with_capacity(totals.events);
+            let mut sales = Vec::<(u32, Purchase)>::with_capacity(totals.sales);
+            let dst_times = times.spare_capacity_mut();
+            let dst_sales = sales.spare_capacity_mut();
+            for e in events {
+                let pos = &mut heads[e.person as usize];
+                let stamp = if e.stamp < SIDE {
+                    e.stamp
+                } else {
+                    let (time, p) = data[e.chunk as usize].decode(window.start, e.stamp);
+                    let offset = (time - window.start) as u32;
+                    if let Some(p) = p {
+                        dst_sales[pos.sales].write((offset, p));
+                        pos.sales += 1;
+                    }
+                    offset
+                };
+                dst_times[pos.events].write(stamp);
+                pos.events += 1;
+            }
+            // Each group's exclusive counts were derived from these exact
+            // rows. The ranges are disjoint, and every slot has been written.
+            unsafe {
+                times.set_len(totals.events);
+                sales.set_len(totals.sales);
+            }
+            aggregate::compact_named_sessions(
+                window.start,
+                &mut times,
+                &mut sales,
+                boundaries,
+                &person_ids,
+            )
+        } else {
+            let mut batch = Batch::<Event>::default();
+            batch.rows.reserve(totals.events);
+            batch.purchases.reserve(totals.sales);
+            for e in events {
+                let (time, p) = data[e.chunk as usize].decode(window.start, e.stamp);
+                let purchase = if let Some(p) = p {
+                    batch.purchases.push(p);
+                    u32::try_from(batch.purchases.len())
+                        .expect("too many purchases in one partition")
+                } else {
+                    0
+                };
+                batch.rows.push(Event {
+                    time,
+                    person: groups[e.person as usize].0,
+                    purchase,
+                });
+            }
+            batch.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
+            aggregate::sessionize(batch)
+        };
+        let mut ordered = Vec::<Click>::with_capacity(totals.clicks);
+        let dest = ordered.spare_capacity_mut();
+        for mut c in clicks {
+            let slot = c.person as usize;
+            // Click-only people cannot credit or assist any session.
+            if groups[slot].1.events == 0 {
+                continue;
+            }
+            c.person = groups[slot].0;
+            dest[heads[slot].clicks].write(c);
+            heads[slot].clicks += 1;
+        }
+        // Counts and scatter exclude exactly the same click-only groups.
+        unsafe {
+            ordered.set_len(totals.clicks);
+        }
+        let mut begin = 0;
+        for end in click_ends {
+            let section = &mut ordered[begin..end];
+            if section.len() > 32768 {
+                section.par_sort_unstable_by_key(|c| c.time);
+            } else if section.len() > 1 {
+                section.sort_unstable_by_key(|c| c.time);
+            }
+            begin = end;
+        }
+        (batch, ordered)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    Here(u32),
+    Forward(u32),
+}
+
+struct Resolver<'a> {
+    compact: AHashMap<u64, Target>,
+    wide: AHashMap<[u64; 2], Target>,
+    names: &'a [Vec<Arc<str>>],
+    people: &'a Names,
+    aliases: &'a Aliases,
+    cache: PersonCache,
+    p1: bool,
+}
+
+impl Resolver<'_> {
+    #[inline]
+    fn target(&mut self, user: u64, wide: &[[u64; 2]], local: &mut People) -> Target {
+        macro_rules! resolve {
+            ($map:expr, $key:expr) => {
+                *$map.entry($key).or_insert_with(|| {
+                    let mut buf = [0u8; 33];
+                    let s = user_bytes(user, wide, self.names, &mut buf);
+                    let q = self.cache.prepare(self.people, self.aliases, s);
+                    let person = self.cache.prepared(q, self.people, self.aliases, s);
+                    if self.p1 && !self.aliases.is_linked_person(person) {
+                        Target::Here(local.group(person))
+                    } else {
+                        Target::Forward(person)
+                    }
+                })
+            };
+        }
+        if (WIDE..OTHER).contains(&user) {
+            resolve!(self.wide, wide[user as u32 as usize])
+        } else {
+            resolve!(self.compact, user)
+        }
+    }
+}
+
+struct P1 {
+    local: (SessionBatch, Vec<Click>),
+    forwarded: AHashMap<usize, Forward>,
+    spells: usize,
+    direct: usize,
+    elapsed: Duration,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn first_pass(
+    events: Pieces<WinnerRow>,
+    clicks: Pieces<RawClick>,
+    data: &[EventData],
+    click_users: &[Vec<[u64; 2]>],
+    other: &[Vec<Arc<str>>],
+    users: &Names,
+    aliases: &Aliases,
+    window: Window,
+    plan: Plan,
+    arena: &storage::Arena,
+) -> P1 {
+    let start = Instant::now();
+    let mut ids = Resolver {
+        compact: AHashMap::default(),
+        wide: AHashMap::default(),
+        names: other,
+        people: users,
+        aliases,
+        cache: PersonCache::default(),
+        p1: plan.p1,
+    };
+    let mut local = People::default();
+    let mut forwarded = AHashMap::<usize, Forward>::default();
+    for r in events.into_iter().flatten() {
+        let dest = ids.target(r.user, &data[r.chunk as usize].users, &mut local);
+        let person = match dest {
+            Target::Here(p) | Target::Forward(p) => p,
+        };
+        let row = PersonEvent {
+            person,
+            chunk: r.chunk,
+            stamp: r.stamp,
+        };
+        match dest {
+            Target::Here(_) => local.event(row, data),
+            Target::Forward(_) => forwarded
+                .entry(person as usize & (plan.user_parts - 1))
+                .or_default()
+                .events
+                .push(row),
+        }
+    }
+    let mut accept_click = |c: RawClick| {
+        let dest = ids.target(c.user, &click_users[c.chunk as usize], &mut local);
+        let person = match dest {
+            Target::Here(p) | Target::Forward(p) => p,
+        };
+        let row = Click {
+            person,
+            time: c.time,
+            id: c.id,
+            campaign: c.campaign,
+        };
+        match dest {
+            Target::Here(_) => local.click(row),
+            Target::Forward(_) => forwarded
+                .entry(person as usize & (plan.user_parts - 1))
+                .or_default()
+                .clicks
+                .push(row),
+        }
+    };
+    if plan.arena {
+        arena
+            .pack(clicks.into_iter().flatten())
+            .iter()
+            .for_each(accept_click);
+    } else {
+        clicks.into_iter().flatten().for_each(&mut accept_click);
+    }
+    let spells = ids.compact.len() + ids.wide.len();
+    let direct = local.groups.len();
+    drop(ids);
+    P1 {
+        local: local.finish(window, data),
+        forwarded,
+        spells,
+        direct,
+        elapsed: start.elapsed(),
+    }
+}
+
+fn second_pass(
+    pieces: Vec<Forward>,
+    data: &[EventData],
+    window: Window,
+) -> (SessionBatch, Vec<Click>) {
+    let mut groups = AHashMap::<u32, u32>::default();
+    let mut local = People::default();
+    for part in pieces {
+        for mut row in part.events {
+            row.person = *groups
+                .entry(row.person)
+                .or_insert_with(|| local.group(row.person));
+            local.event(row, data);
+        }
+        for mut row in part.clicks {
+            row.person = *groups
+                .entry(row.person)
+                .or_insert_with(|| local.group(row.person));
+            local.click(row);
+        }
+    }
+    drop(groups);
+    local.finish(window, data)
+}
+
+pub type Routed = (
+    Vec<SessionBatch>,
+    Vec<Vec<Click>>,
+    ClickIds,
+    PersonNames,
+    usize,
+);
+
+pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Routed> {
+    let tasks = chunks(&data.join("events"))?;
+    let bytes = tasks.iter().map(Chunk::byte_len).sum();
+    let plan = Plan::new(bytes)?;
+    let arena = storage::Arena::new(plan.reuse);
+    let started = Instant::now();
+    let read_links = || -> Result<_> {
+        let mut users = Names::default();
+        let aliases = input::read_aliases(data, &mut users)?;
+        Ok((users, aliases, Instant::now()))
+    };
+    let read_data = || -> Result<_> {
+        let users = Names::default();
+        let events = || event_winners(tasks, plan, window, dimensions, &users, &arena);
+        let clicks = || raw_clicks(data, plan, window, dimensions, &users);
+        let (winners, clicks) = if plan.early_clicks {
+            let (ev, cl) = rayon::join(events, clicks);
+            (ev?, cl?)
+        } else {
+            (events()?, clicks()?)
+        };
+        Ok((winners, clicks, users.into_names(), Instant::now()))
+    };
+    let ((users, aliases, link_end), (winners, clicks, other, ingest_end)) = if plan.overlap {
+        let (links, rows) = rayon::join(read_links, read_data);
+        (links?, rows?)
+    } else {
+        (read_links()?, read_data()?)
+    };
+    let Winners {
+        partitions: events,
+        data: payloads,
+        count,
+        work,
+    } = winners;
+    let ClickInput {
+        partitions: clicks,
+        users: click_users,
+        ids,
+    } = clicks;
+    let p1_start = Instant::now();
+    let click_count: usize = if plan.profile {
+        clicks.iter().flatten().map(Vec::len).sum()
+    } else {
+        0
+    };
+    let click_wide: usize = if plan.profile {
+        click_users.iter().map(Vec::len).sum()
+    } else {
+        0
+    };
+    let results = events
+        .into_par_iter()
+        .zip(clicks)
+        .map(|(e, c)| {
+            first_pass(
+                e,
+                c,
+                &payloads,
+                &click_users,
+                &other,
+                &users,
+                &aliases,
+                window,
+                plan,
+                &arena,
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(other);
+    drop(aliases);
+    drop(click_users);
+    let mut sessions = Vec::with_capacity(2 * plan.user_parts);
+    let mut click_lists = Vec::with_capacity(2 * plan.user_parts);
+    let mut later: Vec<Vec<Forward>> = empty_buckets(plan.user_parts);
+    let (mut spells, mut direct, mut forwarded_events, mut forwarded_clicks) = (0, 0, 0, 0);
+    let mut longest_p1 = Duration::ZERO;
+    for r in results {
+        spells += r.spells;
+        direct += r.direct;
+        longest_p1 = longest_p1.max(r.elapsed);
+        sessions.push(r.local.0);
+        click_lists.push(r.local.1);
+        for (part, rows) in r.forwarded {
+            forwarded_events += rows.events.len();
+            forwarded_clicks += rows.clicks.len();
+            later[part].push(rows);
+        }
+    }
+    let p2_start = Instant::now();
+    let rest = later
+        .into_par_iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| second_pass(p, &payloads, window))
+        .collect::<Vec<_>>();
+    for (s, c) in rest {
+        sessions.push(s);
+        click_lists.push(c);
+    }
+    if plan.profile {
+        use std::sync::atomic::Ordering::Relaxed;
+        let storage = serde_json::json!({
+            "stage":"route_storage","exact_duplicate_rows":work.real_duplicates,"linear_probes":work.linear_probes,
+            "arena_2mib_regions":arena.stats.regions.load(Relaxed),"arena_pages_claimed":arena.stats.pages.load(Relaxed),
+            "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor
+        });
+        eprintln!("profile {storage}");
+        let v = serde_json::json!({
+            "stage":"raw_user_route", "elapsed_s":started.elapsed().as_secs_f64(),
+            "link_elapsed_s":link_end.duration_since(started).as_secs_f64(),
+            "link_barrier_s":link_end.saturating_duration_since(ingest_end).as_secs_f64(),
+            "p1_s":p2_start.duration_since(p1_start).as_secs_f64(),
+            "p2_s":p2_start.elapsed().as_secs_f64(),"longest_p1_task_s":longest_p1.as_secs_f64(),
+            "input_event_bytes":bytes,"event_partitions":plan.event_parts,"person_partitions":plan.user_parts,
+            "event_buckets_nonempty":work.nonempty_event_buckets,"max_event_bucket":work.max_event_bucket,
+            "median_event_bucket":work.median_event_bucket,"event_candidates":work.parsed,"valid_before_dedup":work.valid,
+            "repeated_bucket_rows":work.repeated_rows,"valid_winners":count,"valid_clicks":click_count,
+            "identity_queries":spells,"p1_complete_raw_groups":direct,"p2_raw_groups":spells-direct,
+            "candidate_bytes":work.parsed*size_of::<EventRow>(),"candidate_capacity_bytes":work.event_capacity*size_of::<EventRow>(),
+            "wide_event_key_bytes":work.wide_events*16,"wide_raw_user_bytes":(work.wide_users+click_wide)*16,
+            "event_payload_side_bytes":work.side_rows*size_of::<(i64,Option<Purchase>)>(),
+            "ingest_side_bytes":work.ingest_side*8,"winner_route_bytes":count*size_of::<WinnerRow>(),
+            "click_route_bytes":click_count*size_of::<RawClick>(),"forwarded_events":forwarded_events,
+            "forwarded_clicks":forwarded_clicks,"forwarded_bytes":forwarded_events*size_of::<PersonEvent>()+forwarded_clicks*size_of::<Click>(),
+        });
+        eprintln!("profile {v}");
+    }
+    Ok((sessions, click_lists, ids, users.into_people(), count))
+}
