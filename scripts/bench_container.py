@@ -20,9 +20,12 @@ def input_residency(data_mount):
         """awk -v p="$pagesize" '{r+=$1; n+=int(($2+p-1)/p)*p} END{printf "%.0f %.0f", r,n}'"""
     )
     output = docker("run", "--rm", "--network", "none", "--mount", data_mount,
-                    "debian:bookworm-slim", "sh", "-ec", check, capture=True)
+                    "debian:bookworm-slim", "bash", "-euo", "pipefail", "-c", check, capture=True)
     resident, total = output.split()
-    return int(resident), int(total)
+    resident, total = int(resident), int(total)
+    if not 0 <= resident <= total or total == 0:
+        raise ValueError(f"Unexpected fincore byte counts: {resident}/{total}")
+    return resident, total
 
 
 def main():
@@ -113,6 +116,11 @@ def main():
                        resident_bytes_after_eviction=resident_bytes if args.cache == "evict" else None,
                        stages=[json.loads(line[8:]) for line in result.stderr.splitlines()
                                if line.startswith("profile ")])
+            architecture = [s.removeprefix("architecture=") for s in result.stderr.splitlines()
+                            if s.startswith("architecture=")]
+            if len(architecture) > 1:
+                raise ValueError(f"Multiple architecture markers from {actual_image}")
+            row["architecture"] = architecture[0] if architecture else None
             if variant:
                 row.update(image_ref=actual_image, environment=variant.get("env", {}))
             if peers is not None:

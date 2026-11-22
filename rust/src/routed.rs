@@ -19,9 +19,11 @@ mod packed;
 mod person;
 mod storage;
 mod targets;
+mod winner_store;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use winner_store::WinnerStore;
 
 use ahash::AHashMap;
 use anyhow::{Result, ensure};
@@ -310,6 +312,7 @@ impl BucketWriter {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct WinnerRow {
     user: u64,
     chunk: u32,
@@ -358,6 +361,7 @@ struct RawWinnerBlock {
 }
 
 impl RawWinnerBlock {
+    #[cfg(test)]
     #[inline]
     fn push(&mut self, row: WinnerRow, compact: bool) {
         if compact {
@@ -371,6 +375,7 @@ impl RawWinnerBlock {
     fn len(&self) -> usize {
         self.short.len() + self.full.len()
     }
+    #[cfg(test)]
     fn rows(self) -> impl Iterator<Item = WinnerRow> {
         self.short
             .into_iter()
@@ -382,6 +387,17 @@ impl RawWinnerBlock {
 struct Candidate {
     row: EventRow,
     chunk: u32,
+}
+
+impl Candidate {
+    #[inline]
+    fn winner(self) -> WinnerRow {
+        WinnerRow {
+            user: self.row.user,
+            stamp: self.row.stamp,
+            chunk: self.chunk,
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct RawClick {
@@ -416,6 +432,7 @@ struct Work {
     median_event_bucket: usize,
     event_capacity: usize,
     repeated_rows: usize,
+    wide_key_checks: usize,
     real_duplicates: usize,
     linear_probes: usize,
     packed_events: usize,
@@ -428,10 +445,11 @@ struct Work {
     returned_bucket_vec_bytes: usize,
     short_winners: usize,
     winner_capacity: usize,
+    winner_overflow: usize,
 }
 
 struct Winners {
-    partitions: Vec<Vec<RawWinnerBlock>>,
+    sources: Vec<WinnerStore>,
     data: Vec<EventData>,
     count: usize,
     work: Work,
@@ -477,6 +495,15 @@ struct Plan {
 }
 
 impl Plan {
+    fn final_parts(self) -> usize {
+        if self.person_kernel {
+            // P1 holds all raw aliases. P2 receives only linked groups, so
+            // fewer destinations keep the descriptor matrix bounded.
+            (self.user_parts / 4).max(8).min(self.user_parts)
+        } else {
+            self.user_parts
+        }
+    }
     fn chunks_per_task(self, n: usize) -> usize {
         let target = if self.input_pages {
             self.chunk_group.max(16)
@@ -490,7 +517,7 @@ impl Plan {
         // Bound its active cache lines and the producer × consumer matrix;
         // the event-ID bitmap and exact maps remain private to each bucket.
         let (event_bytes, event_limit, person_bytes, person_limit) = if architecture {
-            (16 << 20, 256, 32 << 20, 128)
+            (16 << 20, 256, 4 << 20, 1024)
         } else {
             (3 << 20, 2048, 10 << 20, 512)
         };
@@ -776,21 +803,71 @@ impl Rows {
         }
     }
 
-    fn visit<const INDEXED: bool>(
+    fn select<const INDEXED: bool>(
         &self,
         keys: &[EventKeys],
         payloads: &[EventData],
         bits: u32,
-        mut emit: impl FnMut(Candidate),
+        repeated_slot: impl Fn(usize) -> bool,
+        mut unique: impl FnMut(WinnerRow),
+        mut contest: impl FnMut(Candidate),
     ) {
-        match self {
-            Self::Fragments(p) => {
-                for part in p {
-                    part.rows::<INDEXED>(keys, payloads, bits)
-                        .for_each(&mut emit);
+        if let Self::Fragments(pieces) = self {
+            for p in pieces {
+                let chunk = p.chunk;
+                let k = &keys[chunk as usize];
+                let data = &payloads[chunk as usize];
+                let (full, short) = k.prefixes(p.bucket as usize);
+                for row in full
+                    .iter()
+                    .chain(&p.full)
+                    .copied()
+                    .chain(p.pages.full().into_iter().flat_map(|page| page.iter()))
+                {
+                    let c = Candidate { row, chunk };
+                    if repeated_slot(bitmap_fingerprint::<INDEXED>(row.id, bits)) {
+                        contest(c);
+                    } else {
+                        unique(c.winner());
+                    }
+                }
+                for s in short
+                    .iter()
+                    .chain(&p.short)
+                    .copied()
+                    .chain(p.pages.short().into_iter().flat_map(|page| page.iter()))
+                {
+                    if INDEXED {
+                        if repeated_slot(s.bitmap_fingerprint(bits)) {
+                            let id = s.indexed_key(bits, p.bucket);
+                            contest(Candidate {
+                                row: s.unpack_with_id(id, data),
+                                chunk,
+                            });
+                        } else {
+                            // A unique bitmap slot needs only person and payload.
+                            // The stored fingerprint suffices even for a 128-bit ID.
+                            unique(s.winner(chunk, data));
+                        }
+                    } else {
+                        let row = s.unpack(k, data);
+                        let c = Candidate { row, chunk };
+                        if repeated_slot(bitmap_fingerprint::<false>(row.id, bits)) {
+                            contest(c);
+                        } else {
+                            unique(c.winner());
+                        }
+                    }
                 }
             }
-            Self::Pages(p) => p.iter().for_each(emit),
+        } else if let Self::Pages(p) = self {
+            for c in p.iter() {
+                if repeated_slot(bitmap_fingerprint::<INDEXED>(c.row.id, bits)) {
+                    contest(c);
+                } else {
+                    unique(c.winner());
+                }
+            }
         }
     }
 }
@@ -1026,8 +1103,8 @@ fn dedup_events<T: Send, U: Send>(
     plan: Plan,
     window: Window,
     arena: &storage::Arena,
-    init: impl Fn() -> T + Sync,
-    emit: impl Fn(&mut T, Candidate, &[EventData]) + Sync,
+    init: impl Fn(usize) -> T + Sync,
+    emit: impl Fn(&mut T, WinnerRow, &[EventData]) + Sync,
     finish: impl Fn(T, &[EventData]) -> U + Sync,
 ) -> Selected<U> {
     if scanned.indexed {
@@ -1042,8 +1119,8 @@ fn dedup_layout<const INDEXED: bool, T: Send, U: Send>(
     plan: Plan,
     window: Window,
     arena: &storage::Arena,
-    init: impl Fn() -> T + Sync,
-    emit: impl Fn(&mut T, Candidate, &[EventData]) + Sync,
+    init: impl Fn(usize) -> T + Sync,
+    emit: impl Fn(&mut T, WinnerRow, &[EventData]) + Sync,
     finish: impl Fn(T, &[EventData]) -> U + Sync,
 ) -> Selected<U> {
     let Scanned {
@@ -1119,51 +1196,61 @@ fn dedup_layout<const INDEXED: bool, T: Send, U: Send>(
                     seen[i / 64] |= bit;
                 });
             }
-            let mut output = init();
+            let mut output = init(n);
             let mut count = 0;
             let mut disputed = 0;
-            let mut route = |c: Candidate| {
-                if c.row.stamp != INVALID {
-                    emit(&mut output, c, &payloads);
+            let mut wide_key_checks = 0;
+            let mut route = |winner: WinnerRow| {
+                if winner.stamp != INVALID {
+                    emit(&mut output, winner, &payloads);
                     count += 1;
                 }
             };
-            rows.visit::<INDEXED>(&keys, &payloads, bits, |c| {
-                let row = c.row;
-                let meta = &keys[c.chunk as usize];
-                let i = bitmap_fingerprint::<INDEXED>(row.id, bits) & (slots - 1);
-                if plan.bitmap && repeated[i / 64] & (1u64 << (i % 64)) == 0 {
-                    route(c);
-                    return;
-                }
-                disputed += 1;
-                let winner = if plan.linear {
-                    linear.insert(c, &keys)
-                } else if (WIDE..OTHER).contains(&row.id) {
-                    // A contested bitmap bit typically covers several *distinct*
-                    // fingerprints. Access a full key only when the entire
-                    // thirty-bit fingerprint is shared by two records.
-                    let first = wide_by_fingerprint.entry(hash(row.id)).or_insert(c);
-                    if (first.chunk == c.chunk && first.row.id == row.id)
-                        || equal_key(*first, c, &keys)
-                    {
-                        first
+            rows.select::<INDEXED>(
+                &keys,
+                &payloads,
+                bits,
+                |h| {
+                    let i = h & (slots - 1);
+                    !plan.bitmap || repeated[i / 64] & (1u64 << (i % 64)) != 0
+                },
+                &mut route,
+                |c| {
+                    let row = c.row;
+                    let meta = &keys[c.chunk as usize];
+                    disputed += 1;
+                    let winner = if plan.linear {
+                        linear.insert(c, &keys)
+                    } else if (WIDE..OTHER).contains(&row.id) {
+                        // A contested bitmap bit typically covers several *distinct*
+                        // fingerprints. Access a full key only when the entire
+                        // thirty-bit fingerprint is shared by two records.
+                        let first = wide_by_fingerprint.entry(hash(row.id)).or_insert(c);
+                        let same = first.chunk == c.chunk && first.row.id == row.id;
+                        if same || {
+                            if plan.profile {
+                                wide_key_checks += 1;
+                            }
+                            equal_key(*first, c, &keys)
+                        } {
+                            first
+                        } else {
+                            wide.entry(meta.wide[row.id as u32 as usize]).or_insert(c)
+                        }
                     } else {
-                        wide.entry(meta.wide[row.id as u32 as usize]).or_insert(c)
+                        compact.entry(row.id).or_insert(c)
+                    };
+                    let earlier = if (row.ingest | winner.row.ingest) < SIDE {
+                        row.ingest < winner.row.ingest
+                    } else {
+                        meta.millis(base, row.ingest)
+                            < keys[winner.chunk as usize].millis(base, winner.row.ingest)
+                    };
+                    if earlier {
+                        *winner = c;
                     }
-                } else {
-                    compact.entry(row.id).or_insert(c)
-                };
-                let earlier = if (row.ingest | winner.row.ingest) < SIDE {
-                    row.ingest < winner.row.ingest
-                } else {
-                    meta.millis(base, row.ingest)
-                        < keys[winner.chunk as usize].millis(base, winner.row.ingest)
-                };
-                if earlier {
-                    *winner = c;
-                }
-            });
+                },
+            );
             // Candidates in the exact table own their small row; only key and
             // value sidecars survive. Recycle this bucket's source pages now.
             let returned = if plan.profile {
@@ -1187,7 +1274,7 @@ fn dedup_layout<const INDEXED: bool, T: Send, U: Send>(
                 .chain(wide.drain().map(|(_, v)| v))
                 .chain(linear.entries.iter().copied())
             {
-                route(c);
+                route(c.winner());
             }
             (
                 finish(output, &payloads),
@@ -1197,15 +1284,17 @@ fn dedup_layout<const INDEXED: bool, T: Send, U: Send>(
                 linear.probes,
                 returned,
                 returned_vec,
+                wide_key_checks,
             )
         },
     );
     drop(keys);
     let mut count = 0;
     let mut streams = Vec::with_capacity(results.len());
-    for (stream, n, disputed, duplicates, probes, returned, returned_vec) in results {
+    for (stream, n, disputed, duplicates, probes, returned, returned_vec, checks) in results {
         count += n;
         work.repeated_rows += disputed;
+        work.wide_key_checks += checks;
         work.real_duplicates += duplicates;
         work.linear_probes += probes;
         work.returned_bucket_page_bytes += returned;
@@ -1231,45 +1320,29 @@ fn event_winners(
 ) -> Result<Winners> {
     let scanned = scan_events(plans, plan, window, dimensions, raw_users, arena)?;
     let compact = plan.person_kernel && switch("PERF_ARCH_WINNERS", "compact") != "full";
+    let striped = plan.person_kernel && switch("PERF_ARCH_WINNER_STORAGE", "stripes") != "vec";
     let mut selected = dedup_events(
         scanned,
         plan,
         window,
         arena,
-        || {
-            (0..plan.user_parts)
-                .map(|_| RawWinnerBlock::default())
-                .collect::<Vec<_>>()
-        },
-        |output, c, _| {
-            let bucket = hash(c.row.user) as usize & (plan.user_parts - 1);
-            output[bucket].push(
-                WinnerRow {
-                    user: c.row.user,
-                    chunk: c.chunk,
-                    stamp: c.row.stamp,
-                },
-                compact,
-            );
+        |n| WinnerStore::new(n, plan.user_parts, compact, striped),
+        |output, winner, _| {
+            let bucket = hash(winner.user) as usize & (plan.user_parts - 1);
+            output.push(bucket, winner);
         },
         |output, _| output,
     );
-    let mut partitions = empty_buckets(plan.user_parts);
-    for stream in selected.streams {
-        for (dest, bucket) in partitions.iter_mut().zip(stream) {
-            if bucket.len() != 0 {
-                if plan.profile {
-                    selected.work.short_winners += bucket.short.len();
-                    selected.work.winner_capacity += bucket.short.capacity()
-                        * size_of::<ShortWinner>()
-                        + bucket.full.capacity() * size_of::<WinnerRow>();
-                }
-                dest.push(bucket);
-            }
+    if plan.profile {
+        for source in &selected.streams {
+            let (short, capacity, overflow) = source.metrics();
+            selected.work.short_winners += short;
+            selected.work.winner_capacity += capacity;
+            selected.work.winner_overflow += overflow;
         }
     }
     Ok(Winners {
-        partitions,
+        sources: selected.streams,
         data: selected.payloads,
         count: selected.count,
         work: selected.work,
@@ -1340,11 +1413,18 @@ fn raw_clicks(
         let chunk_id = u32::try_from(i)?;
         for chunk in sources {
             chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
-                let user = encode(user, b'u', &mut users, raw_users, plan.packed);
+                let (user, mut encoded) = if plan.person_kernel {
+                    let (click, owner) =
+                        packed::click_owner(id, user, &mut users, raw_users, &mut ids, &fallback);
+                    (owner, Some(click))
+                } else {
+                    (encode(user, b'u', &mut users, raw_users, plan.packed), None)
+                };
                 let part = hash(user) as usize & (plan.user_parts - 1);
-                let mut encoded = None;
                 if plan.packed {
-                    let code = if id.len() == 33 {
+                    let code = if let Some(handle) = encoded {
+                        packed::ShortClick::id_code(handle)
+                    } else if id.len() == 33 {
                         let handle = ids.encode(id, &fallback);
                         encoded = Some(handle);
                         (handle >= crate::records::HEX_CLICK)
@@ -1680,7 +1760,7 @@ struct Resolver<'a> {
     names: &'a [Vec<Arc<str>>],
     people: &'a Names,
     aliases: &'a Aliases,
-    cache: PersonCache,
+    cache: Option<PersonCache>,
     p1: bool,
     numeric: bool,
     narrow: Option<targets::NarrowTargets>,
@@ -1696,7 +1776,7 @@ impl Resolver<'_> {
         &mut self,
         user: u64,
         wide: &[[u64; 2]],
-        local: &mut People,
+        local: &mut person::Local,
         outbound: &mut forward::Builder,
     ) -> Target {
         let resolve = || {
@@ -1725,8 +1805,12 @@ impl Resolver<'_> {
                 return Target::Here(local.group(id));
             }
             let s = user_bytes(user, wide, self.names, &mut buf, self.numeric);
-            let q = self.cache.prepare(self.people, self.aliases, s);
-            let person = self.cache.prepared(q, self.people, self.aliases, s);
+            let cache = self
+                .cache
+                .as_mut()
+                .expect("legacy resolver needs a spelling cache");
+            let q = cache.prepare(self.people, self.aliases, s);
+            let person = cache.prepared(q, self.people, self.aliases, s);
             if self.p1 && !self.aliases.is_linked_person(person) {
                 Target::Here(local.group(person))
             } else {
@@ -1774,7 +1858,8 @@ struct P1 {
 
 #[allow(clippy::too_many_arguments)]
 fn first_pass(
-    events: Vec<RawWinnerBlock>,
+    events: &[WinnerStore],
+    part: usize,
     clicks: Vec<ClickBlock>,
     data: &[EventData],
     click_users: &[Vec<[u64; 2]>],
@@ -1790,7 +1875,7 @@ fn first_pass(
     let start = Instant::now();
     let narrow = plan.person_kernel && plan.flat && switch("PERF_ARCH_TARGETS", "narrow") != "full";
     let cap = if plan.flat && !narrow {
-        let rows = events.iter().map(RawWinnerBlock::len).sum::<usize>()
+        let rows = events.iter().map(|s| s.len(part)).sum::<usize>()
             + clicks
                 .iter()
                 .map(|c| c.full.len() + c.short.len() + c.pages.len())
@@ -1805,7 +1890,7 @@ fn first_pass(
         names: other,
         people: users,
         aliases,
-        cache: PersonCache::default(),
+        cache: numeric_links.is_none().then(PersonCache::default),
         p1: plan.p1,
         numeric: plan.packed,
         narrow: narrow.then(|| targets::NarrowTargets::new(plan.user_parts.trailing_zeros())),
@@ -1814,9 +1899,12 @@ fn first_pass(
         numeric_links,
         local_names: Default::default(),
     };
-    let mut local = People::default();
-    let mut forwarded = forward::Builder::new(plan);
-    for r in events.into_iter().flat_map(RawWinnerBlock::rows) {
+    let mut local = person::Local::new(person_kernel.is_some());
+    let mut forwarded = forward::Builder::new(Plan {
+        user_parts: plan.final_parts(),
+        ..plan
+    });
+    for r in events.iter().flat_map(|s| s.rows(part)) {
         let dest = ids.target(
             r.user,
             &data[r.chunk as usize].users,
@@ -1873,7 +1961,7 @@ fn first_pass(
         .narrow
         .as_ref()
         .map_or([0; 3], |t| [t.len(), t.slots(), t.large_groups()]);
-    let direct = local.groups.len();
+    let direct = local.len();
     let output_names = std::mem::take(&mut ids.local_names);
     drop(ids);
     let group_time = start.elapsed();
@@ -1883,13 +1971,15 @@ fn first_pass(
     } else {
         crate::output::aggregate_names(users)
     };
-    let local = if let Some((acc, ids)) = person_kernel {
-        (
-            person::finish(local, data, window, names, acc, ids),
-            Vec::new(),
-        )
-    } else {
-        local.finish(window, data, names)
+    let local = match local {
+        person::Local::Lists(rows) => {
+            let (acc, ids) = person_kernel.unwrap();
+            (
+                person::finish(rows, data, window, names, acc, ids),
+                Vec::new(),
+            )
+        }
+        person::Local::Counts(rows) => rows.finish(window, data, names),
     };
     let finish_time = finish_start.elapsed();
     P1 {
@@ -2077,7 +2167,7 @@ fn run_impl(
             (read_links()?, read_data()?)
         };
     let Winners {
-        partitions: events,
+        sources: events,
         data: payloads,
         count,
         work,
@@ -2107,32 +2197,46 @@ fn run_impl(
     } else {
         0
     };
-    let partitions = events.into_iter().zip(clicks).collect();
-    let results = crate::runtime::stage_map("route_first_pass", partitions, |(e, c)| {
-        let mut result = first_pass(
-            e,
-            c,
-            &payloads,
-            &click_users,
-            &other,
-            &users,
-            &aliases,
-            window,
-            plan,
-            &arena,
-            fused
-                .as_ref()
-                .filter(|_| plan.person_kernel)
-                .map(|f| (f, &ids)),
-            numeric_links.as_ref(),
-        );
-        if let Some(acc) = fused.as_ref().filter(|_| !plan.person_kernel) {
-            let start = Instant::now();
-            acc.consume(&mut result.local.0, &mut result.local.1, &ids);
-            result.elapsed += start.elapsed();
-        }
-        result
-    });
+    let partitions = clicks.into_iter().enumerate().collect();
+    let results = crate::runtime::person_partitions(
+        "route_first_pass",
+        partitions,
+        plan.person_kernel,
+        |(part, clicks)| {
+            events.iter().map(|s| s.len(*part)).sum::<usize>()
+                + clicks
+                    .iter()
+                    .map(|b| b.full.len() + b.short.len() + b.pages.len())
+                    .sum::<usize>()
+        },
+        |(e, c)| {
+            let mut result = first_pass(
+                &events,
+                e,
+                c,
+                &payloads,
+                &click_users,
+                &other,
+                &users,
+                &aliases,
+                window,
+                plan,
+                &arena,
+                fused
+                    .as_ref()
+                    .filter(|_| plan.person_kernel)
+                    .map(|f| (f, &ids)),
+                numeric_links.as_ref(),
+            );
+            if let Some(acc) = fused.as_ref().filter(|_| !plan.person_kernel) {
+                let start = Instant::now();
+                acc.consume(&mut result.local.0, &mut result.local.1, &ids);
+                result.elapsed += start.elapsed();
+            }
+            result
+        },
+    );
+    drop(events);
     drop(other);
     let mut next_output_id = aliases.linked_person_count();
     drop(aliases);
@@ -2140,7 +2244,7 @@ fn run_impl(
     drop(click_users);
     let mut sessions = Vec::with_capacity(2 * plan.user_parts);
     let mut click_lists = Vec::with_capacity(2 * plan.user_parts);
-    let mut later: Vec<Vec<forward::Packet>> = empty_buckets(plan.user_parts);
+    let mut later: Vec<Vec<forward::Packet>> = empty_buckets(plan.final_parts());
     let (mut spells, mut direct) = (0, 0);
     let mut narrow_stats = [0usize; 3];
     let mut forward_work = forward::Work::default();
@@ -2178,31 +2282,37 @@ fn run_impl(
     }
     let p2_start = Instant::now();
     let later = later.into_iter().filter(|p| !p.is_empty()).collect();
-    let rest = crate::runtime::stage_map("route_second_pass", later, |p| {
-        if plan.person_kernel {
-            let batch = forward::finish_people(
+    let rest = crate::runtime::person_partitions(
+        "route_second_pass",
+        later,
+        plan.person_kernel,
+        |p: &Vec<forward::Packet>| p.iter().map(forward::Packet::row_count).sum(),
+        |p| {
+            if plan.person_kernel {
+                let batch = forward::finish_people(
+                    p,
+                    &payloads,
+                    window,
+                    crate::output::aggregate_names(&users),
+                    fused.as_ref().unwrap(),
+                    &ids,
+                    plan.final_parts().trailing_zeros(),
+                );
+                return (batch, Vec::new());
+            }
+            let (mut batch, mut clicks) = forward::finish(
                 p,
                 &payloads,
                 window,
+                plan,
                 crate::output::aggregate_names(&users),
-                fused.as_ref().unwrap(),
-                &ids,
-                plan.user_parts.trailing_zeros(),
             );
-            return (batch, Vec::new());
-        }
-        let (mut batch, mut clicks) = forward::finish(
-            p,
-            &payloads,
-            window,
-            plan,
-            crate::output::aggregate_names(&users),
-        );
-        if let Some(acc) = &fused {
-            acc.consume(&mut batch, &mut clicks, &ids);
-        }
-        (batch, clicks)
-    });
+            if let Some(acc) = &fused {
+                acc.consume(&mut batch, &mut clicks, &ids);
+            }
+            (batch, clicks)
+        },
+    );
     for (s, c) in rest {
         sessions.push(s);
         click_lists.push(c);
@@ -2211,6 +2321,7 @@ fn run_impl(
         use std::sync::atomic::Ordering::Relaxed;
         let storage = serde_json::json!({
             "stage":"route_storage","exact_duplicate_rows":work.real_duplicates,"linear_probes":work.linear_probes,
+            "wide_key_comparisons":work.wide_key_checks,
             "arena_2mib_regions":arena.stats.regions.load(Relaxed),"arena_pages_claimed":arena.stats.pages.load(Relaxed),
             "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor,
             "native_reader_pages":arena.stats.input_pages.load(Relaxed),"native_reader_bytes":arena.stats.input_bytes.load(Relaxed),
@@ -2229,6 +2340,7 @@ fn run_impl(
         let exchange = serde_json::json!({
             "stage":"raw_winner_exchange", "short_rows":work.short_winners, "full_rows":full_rows,
             "short_bytes":short_bytes, "full_bytes":full_bytes, "capacity_bytes":work.winner_capacity,
+            "overflow_rows":work.winner_overflow,
             "source_bucket_arena_page_bytes_dropped":work.returned_bucket_page_bytes,
             "source_bucket_vec_capacity_bytes_dropped":work.returned_bucket_vec_bytes
         });
@@ -2244,7 +2356,7 @@ fn run_impl(
             "link_barrier_s":link_end.saturating_duration_since(ingest_end).as_secs_f64(),
             "p1_s":p2_start.duration_since(p1_start).as_secs_f64(),
             "p2_s":p2_start.elapsed().as_secs_f64(),"longest_p1_task_s":longest_p1.as_secs_f64(),
-            "input_event_bytes":bytes,"event_partitions":plan.event_parts,"person_partitions":plan.user_parts,
+            "input_event_bytes":bytes,"event_partitions":plan.event_parts,"person_partitions":plan.user_parts,"p2_partitions":plan.final_parts(),
             "event_buckets_nonempty":work.nonempty_event_buckets,"max_event_bucket":work.max_event_bucket,
             "median_event_bucket":work.median_event_bucket,"event_candidates":work.parsed,"valid_before_dedup":work.valid,
             "repeated_bucket_rows":work.repeated_rows,"valid_winners":count,"valid_clicks":click_count,
@@ -2257,6 +2369,9 @@ fn run_impl(
             "forwarded_clicks":forward_work.clicks, "forwarded_descriptors":forward_work.groups,
             "forwarded_descriptor_bytes":forward_work.descriptor_bytes, "forwarded_event_bytes":forward_work.event_bytes,
             "forwarded_click_bytes":forward_work.click_bytes,
+            "forwarded_payload_buffers":forward_work.producer_payload_buffers,
+            "forwarded_payload_capacity":forward_work.producer_payload_capacity,
+            "forwarded_block_view_bytes":forward_work.block_view_bytes,
             "forwarded_bytes":forward_work.descriptor_bytes+forward_work.event_bytes+forward_work.click_bytes,
         });
         eprintln!("profile {v}");
@@ -2454,9 +2569,9 @@ mod tests {
                 end: 100_000,
             },
             &storage::Arena::new(false),
-            Vec::new,
-            |out, c, _| out.push((c.row.user, c.row.stamp)),
-            std::convert::identity,
+            |_| Vec::new(),
+            |out, w, _| out.push((w.user, w.stamp)),
+            |v, _| v,
         );
         let mut rows: Vec<_> = winners.streams.into_iter().flatten().collect();
         rows.sort_unstable();

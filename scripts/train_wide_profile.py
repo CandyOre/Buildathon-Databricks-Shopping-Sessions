@@ -38,11 +38,15 @@ def main():
     parser.add_argument("output", type=Path, help="New merged .profdata file")
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
     parser.add_argument("--setting", action="append", default=[], metavar="PERF_KEY=VALUE")
+    parser.add_argument("--both-routes", action="store_true",
+                        help="merge separate executions of the complete A and B pipelines")
     parser.add_argument("--revision", help="train from this exact local source commit")
     parser.add_argument("--lto", choices=("thin","fat"), default="thin")
     args = parser.parse_args()
     if any(not s.startswith("PERF_") or "=" not in s for s in args.setting):
         parser.error("--setting expects PERF_KEY=VALUE")
+    if args.both_routes and any(s.startswith("PERF_ARCH=") for s in args.setting):
+        parser.error("--both-routes selects PERF_ARCH for each training run")
     settings = [v for s in args.setting for v in ("-e", s)]
     if args.output.exists():
         parser.error("select a new output file")
@@ -70,12 +74,15 @@ def main():
         counts.chmod(0o777)
         mount = f"type=bind,source={counts},target=/profiles"
         dataset = f"type=volume,source={args.volume},volume-subpath={args.dataset},target=/data,readonly"
-        subprocess.run(["docker", "run", "--rm", "--read-only", "--network", "none",
+        command = ["docker", "run", "--rm", "--read-only", "--network", "none",
                         "--cpuset-cpus", args.cpuset, "--cpus", "8", "--memory", "24g",
                         "--memory-swap", "24g", "-e", "NCPU=8", "-e", "MEM_GB=24",
-                        *settings, "-e", "LLVM_PROFILE_FILE=/profiles/wide-%m-%p.profraw", "--mount", dataset,
-                        "--mount", mount, "--tmpfs", "/output:rw,uid=1000,gid=1000,mode=755", scorer],
-                       check=True)
+                        *settings, "--mount", dataset, "--mount", mount,
+                        "--tmpfs", "/output:rw,uid=1000,gid=1000,mode=755"]
+        for route in (["A", "B"] if args.both_routes else [None]):
+            flags = ["-e", f"PERF_ARCH={route}"] if route else []
+            profile = f"LLVM_PROFILE_FILE=/profiles/wide-{route or 'single'}-%m-%p.profraw"
+            subprocess.run([*command, *flags, "-e", profile, scorer], check=True)
         merge = ('prof="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"; '
                  '"$prof" merge -sparse -o /profiles/large.profdata /profiles/wide-*.profraw')
         subprocess.run(["docker", "run", "--rm", "--read-only", "--network", "none", "--mount", mount,

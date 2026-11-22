@@ -8,6 +8,15 @@ const SHORT_LINK: u64 = 1 << 31;
 const CLICK_LINK: u64 = 1 << 39;
 const CACHE: usize = 2048;
 
+#[inline]
+fn destination(owner: u64, mask: usize) -> usize {
+    if owner >= LINKED {
+        owner as u32 as usize & mask
+    } else {
+        hash(owner) as usize & mask
+    }
+}
+
 #[derive(Default)]
 struct Traffic {
     queries: usize,
@@ -191,13 +200,9 @@ impl EventProducer {
     }
 
     #[inline]
-    fn push(&mut self, c: Candidate, data: &[EventData], links: LinkIndex<'_>) {
-        links.prefetch(c.row.user);
-        self.pending.push(WinnerRow {
-            user: c.row.user,
-            stamp: c.row.stamp,
-            chunk: c.chunk,
-        });
+    fn push(&mut self, row: WinnerRow, data: &[EventData], links: LinkIndex<'_>) {
+        links.prefetch(row.user);
+        self.pending.push(row);
         if self.pending.len() == PREFETCH_ROWS {
             self.flush(data, links);
         }
@@ -209,7 +214,7 @@ impl EventProducer {
             row.user = self
                 .cache
                 .resolve(row.user, &data[row.chunk as usize].users, links);
-            self.buckets[hash(row.user) as usize & mask].push(row);
+            self.buckets[destination(row.user, mask)].push(row);
         }
     }
 }
@@ -234,7 +239,7 @@ fn read_clicks(
     dimensions: &Dimensions,
     links: LinkIndex<'_>,
 ) -> Result<(Vec<ClickProducer>, Names)> {
-    use crate::records::{HEX_CLICK, NUMERIC_CLICK};
+    use crate::records::HEX_CLICK;
     let fallback = Names::default();
     let calendar = Calendar::new(window);
     let chunks = chunks(&path.join("clicks"))?;
@@ -257,21 +262,16 @@ fn read_clicks(
         let mut flush = |pending: &mut Vec<RawClick>, wide: &[[u64; 2]]| {
             for mut row in pending.drain(..) {
                 let owner = cache.resolve(row.user, wide, links);
-                let out = &mut buckets[hash(owner) as usize & (plan.user_parts - 1)];
+                let out = &mut buckets[destination(owner, plan.user_parts - 1)];
                 let compact_user = if owner >= LINKED {
                     Some(CLICK_LINK | u64::from(owner as u32))
                 } else {
                     (owner < CLICK_LINK || (WIDE..OTHER).contains(&owner)).then_some(owner)
                 };
-                let click = if row.id >= HEX_CLICK {
+                if row.id >= HEX_CLICK {
                     cache.traffic.click_id_wide += 1;
-                    Some(packed::ShortClick::WIDE_SLOT | u64::from(row.id as u32))
-                } else if row.id >= NUMERIC_CLICK {
-                    let number = row.id ^ NUMERIC_CLICK;
-                    (number < packed::ShortClick::WIDE_SLOT).then_some(number)
-                } else {
-                    None
-                };
+                }
+                let click = packed::ShortClick::id_code(row.id);
                 if let Some(compact) = compact_user.zip(click).and_then(|(u, id)| {
                     packed::ShortClick::pack(u, id, row.time, base, row.campaign)
                 }) {
@@ -288,14 +288,10 @@ fn read_clicks(
                 window,
                 dimensions,
                 |spelling, user, time, campaign| {
-                    let handle = encode(user, b'u', &mut wide, links.raw, true);
+                    let (id, handle) = packed::click_owner(
+                        spelling, user, &mut wide, links.raw, &mut ids, &fallback,
+                    );
                     links.prefetch(handle);
-                    // The exact bijective rank also serves as the full-row click
-                    // ID. Only a lexical tie needs to materialize its characters.
-                    let id = spelling
-                        .strip_prefix(b"k")
-                        .and_then(packed::number)
-                        .map_or_else(|| ids.encode(spelling, &fallback), |n| NUMERIC_CLICK | n);
                     pending.push(RawClick {
                         user: handle,
                         time,
@@ -330,6 +326,7 @@ fn read_clicks(
 }
 
 struct Partition {
+    id: u32,
     events: Vec<EventPacket>,
     clicks: Vec<(u32, ClickPacket)>,
 }
@@ -351,6 +348,7 @@ struct EventBlock {
     next: u32,
 }
 
+#[derive(Clone, Copy)]
 struct PersonRows {
     first: EventValue,
     more: u32,
@@ -359,7 +357,7 @@ struct PersonRows {
 }
 
 impl PersonRows {
-    fn new(first: EventValue) -> Self {
+    const fn new(first: EventValue) -> Self {
         Self {
             first,
             more: 0,
@@ -408,6 +406,9 @@ impl PersonRows {
 
 #[derive(Default)]
 struct Groups {
+    bits: u32,
+    linked: Vec<PersonRows>,
+    linked_active: usize,
     small: AHashMap<u64, PersonRows>,
     wide: AHashMap<[u64; 2], PersonRows>,
     events: Vec<EventBlock>,
@@ -421,6 +422,26 @@ impl Groups {
             chunk: row.chunk,
             stamp: row.stamp,
         };
+        if row.user >= LINKED {
+            let slot = (row.user as u32 >> self.bits) as usize;
+            if self.linked.len() <= slot {
+                // Invalid winners are removed before either exchange. Use
+                // that impossible first stamp to mark unoccupied dense IDs.
+                const EMPTY: PersonRows = PersonRows::new(EventValue {
+                    chunk: 0,
+                    stamp: INVALID,
+                });
+                self.linked.resize(slot + 1, EMPTY);
+            }
+            let group = &mut self.linked[slot];
+            if group.first.stamp == INVALID {
+                *group = PersonRows::new(value);
+                self.linked_active += 1;
+            } else {
+                group.append_event(value, &mut self.events);
+            }
+            return;
+        }
         let insert = |group: &mut PersonRows| group.append_event(value, &mut self.events);
         // Feed each map only its matching exact key type.
         if (WIDE..OTHER).contains(&row.user) {
@@ -438,7 +459,11 @@ impl Groups {
 
     #[inline]
     fn click(&mut self, row: RawClick, wide: &[[u64; 2]]) {
-        let group = if (WIDE..OTHER).contains(&row.user) {
+        let group = if row.user >= LINKED {
+            self.linked
+                .get_mut((row.user as u32 >> self.bits) as usize)
+                .filter(|g| g.first.stamp != INVALID)
+        } else if (WIDE..OTHER).contains(&row.user) {
             self.wide.get_mut(&wide[row.user as u32 as usize])
         } else {
             self.small.get_mut(&row.user)
@@ -459,6 +484,7 @@ impl Groups {
 #[allow(clippy::too_many_arguments)]
 fn consume(
     p: Partition,
+    bits: u32,
     linked_count: usize,
     other: &[Vec<Arc<str>>],
     data: &[EventData],
@@ -468,7 +494,11 @@ fn consume(
     ids: &ClickIds,
 ) -> (SessionBatch, OutputSpellings, usize, Duration) {
     let start = Instant::now();
-    let mut groups = Groups::default();
+    let part = p.id;
+    let mut groups = Groups {
+        bits,
+        ..Groups::default()
+    };
     for source in p.events {
         for row in source.short {
             groups.event(row.decode(), &[]);
@@ -507,8 +537,11 @@ fn consume(
         wide,
         events,
         clicks,
+        linked,
+        linked_active,
+        ..
     } = groups;
-    let person_count = small.len() + wide.len();
+    let person_count = small.len() + wide.len() + linked_active;
     let mut names = OutputSpellings::default();
     let batch = fused.with_people(None, ids, |kernel| {
         let mut compute = |local: u32, rows: PersonRows| {
@@ -532,12 +565,12 @@ fn consume(
             kernel.compute(local, event_rows, click_rows);
         };
         let mut buffer = [0; 33];
-        for (owner, rows) in small {
-            if owner >= LINKED {
-                // The immutable graph already owns this exact UTF-8 spelling.
-                compute(owner as u32, rows);
-                continue;
+        for (slot, rows) in linked.into_iter().enumerate() {
+            if rows.first.stamp != INVALID {
+                compute(((slot as u32) << bits) | part, rows);
             }
+        }
+        for (owner, rows) in small {
             let local = u32::try_from(linked_count + names.len()).expect("too many output people");
             if owner >= OTHER {
                 names.push_shared(input::shared_name_for(other, owner as u32));
@@ -604,7 +637,7 @@ pub(super) fn run(
         plan,
         window,
         &arena,
-        || EventProducer::new(plan.user_parts),
+        |_| EventProducer::new(plan.user_parts),
         |out, c, p| out.push(c, p, index),
         |mut out, p| {
             out.flush(p, index);
@@ -612,7 +645,8 @@ pub(super) fn run(
         },
     );
     let mut partitions: Vec<Partition> = (0..plan.user_parts)
-        .map(|_| Partition {
+        .map(|part| Partition {
+            id: part as u32,
             events: Vec::new(),
             clicks: Vec::new(),
         })
@@ -676,18 +710,34 @@ pub(super) fn run(
     } else {
         0
     };
-    let outputs = crate::runtime::stage_map("arch_b_final_people", partitions, |p| {
-        consume(
-            p,
-            linked_count,
-            &other,
-            &selected.payloads,
-            &click_users,
-            window,
-            &fused,
-            &ids,
-        )
-    });
+    let outputs = crate::runtime::person_partitions(
+        "arch_b_final_people",
+        partitions,
+        true,
+        |p| {
+            p.events
+                .iter()
+                .map(|b| b.short.len() + b.wide.len() + b.full.len())
+                .sum::<usize>()
+                + p.clicks
+                    .iter()
+                    .map(|(_, b)| b.short.len() + b.full.len())
+                    .sum::<usize>()
+        },
+        |p| {
+            consume(
+                p,
+                plan.user_parts.trailing_zeros(),
+                linked_count,
+                &other,
+                &selected.payloads,
+                &click_users,
+                window,
+                &fused,
+                &ids,
+            )
+        },
+    );
     let mut sessions = Vec::with_capacity(outputs.len());
     let mut names = Vec::with_capacity(outputs.len());
     let mut longest = Duration::ZERO;
@@ -753,6 +803,66 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_linked_groups_share_destinations_for_events_and_clicks() {
+        let mask = 7;
+        for (id, part) in [(3, 3), (11, 3), (4, 4), (257, 1)] {
+            assert_eq!(destination(LINKED | id, mask), part);
+        }
+        for owner in [0, 1234, WIDE | (39 << 32) | 9, OTHER | 1] {
+            assert_eq!(destination(owner, mask), hash(owner) as usize & mask);
+        }
+        let mut events = EventPacket::default();
+        let mut clicks = ClickPacket::default();
+        // Linked 3, 19 and 35 arrive at the same partition. 11 is a hole
+        // below an occupied slot; 43 lies beyond the allocated dense range.
+        for (id, stamp) in [(3, 1), (3, 3), (19, 9), (35, 7)] {
+            events.push(WinnerRow {
+                user: LINKED | id,
+                stamp,
+                chunk: 0,
+            });
+        }
+        for id in [3, 11, 19, 43] {
+            clicks.full.push(RawClick {
+                user: LINKED | id,
+                time: 0,
+                id: 1,
+                campaign: 1,
+                chunk: 0,
+            });
+        }
+        let p = Partition {
+            id: 3,
+            events: vec![events],
+            clicks: vec![(0, clicks)],
+        };
+        let window = Window {
+            start: 0,
+            end: 1000,
+        };
+        let fused = aggregate::FusedCampaigns::new(2, window);
+        let ids = ClickIds::new(Names::default(), Vec::new());
+        let (batch, names, people, _) = consume(
+            p,
+            3,
+            44,
+            &[],
+            &[EventData::default()],
+            &[Vec::new()],
+            window,
+            &fused,
+            &ids,
+        );
+        assert_eq!(names.len(), 0);
+        assert_eq!(people, 3);
+        assert_eq!(batch.daily.person, [3, 19, 35]);
+        assert_eq!(batch.daily.events, [2, 1, 1]);
+        let totals: std::collections::BTreeMap<_, _> = fused.finish(&[]).into_iter().collect();
+        assert_eq!(totals[&(1, 0)].assisted_sessions, 2);
+        assert_eq!(totals[&(0, 0)].sessions, 1);
+    }
 
     #[test]
     fn fractional_winners_and_block_boundaries_preserve_every_event() {
@@ -866,7 +976,8 @@ mod tests {
         groups.event(event(later), &first);
         groups.event(event(linked_owner), &first);
         assert_eq!(groups.wide.len(), 1);
-        assert_eq!(groups.small.len(), 1);
+        assert_eq!(groups.linked_active, 1);
+        assert!(groups.small.is_empty());
         assert_eq!(groups.wide.values().next().unwrap().more, 1);
         let mut first_part = OutputSpellings::default();
         first_part.push(input::text(different));

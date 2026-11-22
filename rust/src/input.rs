@@ -34,6 +34,8 @@ pub(crate) fn write_base36(mut n: u64, output: &mut [u8; 8]) -> usize {
 
 #[path = "fastdecode.rs"]
 mod fastdecode;
+#[path = "link_keys.rs"]
+mod link_keys;
 
 const HEX: [u8; 256] = {
     let mut digits = [0x80; 256];
@@ -383,6 +385,29 @@ mod timestamp_tests {
         assert_eq!(unsigned(b"9223372036854775808"), None);
         assert_eq!(unsigned(b"00000000000000:1"), None);
     }
+
+    #[test]
+    fn decimal_clock_keeps_millisecond_digits_and_rejects_each_bad_lane() {
+        let start = timestamp(b"2024-01-01T00:00:00Z").unwrap();
+        let cal = super::Calendar::new(super::Window {
+            start,
+            end: start + DAY,
+        });
+        for i in 0..4096 {
+            let millis = start + ((i * 3_319_837i64) % (2 * DAY));
+            let s = millis.to_string();
+            assert_eq!(cal.decimal_clock(s.as_bytes()).millis(), Some(millis));
+        }
+        let mut s = *b"1704067209876";
+        for i in 0..13 {
+            let old = s[i];
+            for c in 0..=255 {
+                s[i] = c;
+                assert_eq!(cal.decimal_clock(&s).millis(), timestamp(&s));
+            }
+            s[i] = old;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -398,6 +423,27 @@ pub struct Calendar {
     days: [CachedDay; 64],
     epochs: [(u32, i64); 16],
     pub(crate) paired_times: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum EventClock {
+    Whole(i64),
+    // 10 low bits store the three validated decimal millisecond digits.
+    Decimal(u64),
+    Millis(i64),
+    Invalid,
+}
+
+impl EventClock {
+    #[inline(always)]
+    pub(crate) fn millis(self) -> Option<i64> {
+        match self {
+            Self::Whole(s) => Some(s * 1000),
+            Self::Decimal(t) => Some((t >> 10) as i64 * 1000 + (t & 1023) as i64),
+            Self::Millis(t) => Some(t),
+            Self::Invalid => None,
+        }
+    }
 }
 
 impl Calendar {
@@ -431,7 +477,7 @@ impl Calendar {
                     let code = n.to_string();
                     table.epochs[(code.as_bytes()[3] & 15) as usize] = (
                         u32::from_le_bytes(code.as_bytes().try_into().unwrap()),
-                        n * 1_000_000_000,
+                        n * 1_000_000,
                     );
                 }
             }
@@ -491,7 +537,14 @@ impl Calendar {
     /// The official ingest field is valid F1. When its date and hour match
     /// the event spelling, the event can reuse their validation and lookup.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn routed_event_times(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64) {
+        let (clock, seconds) = self.event_clock(event, ingest);
+        (clock.millis(), seconds)
+    }
+
+    #[inline(always)]
+    pub(crate) fn event_clock(&self, event: &[u8], ingest: &[u8]) -> (EventClock, i64) {
         let ingest: &[u8; 20] = ingest.try_into().expect("ingest_ts is valid F1");
         let word = u64::from_le_bytes(ingest[11..19].try_into().unwrap());
         let (h, m, sec) = clock_components(word);
@@ -500,17 +553,50 @@ impl Calendar {
             .expect("ingest_ts has a valid date")
             + i64::from(h) * 3600;
         let ingest_seconds = hour_start + i64::from(m * 60 + sec);
-        let iso = event.len() == 20 && event[19] == b'Z'
-            || event.len() == 25 && matches!(event[19], b'+' | b'-');
-        let timestamp = if iso && event[..13] == ingest[..13] {
+        let timestamp = if event.len() == 13 {
+            self.decimal_clock(event)
+        } else if event.len() == 20 && event[19] == b'Z' && event[..13] == ingest[..13] {
+            // The UTC spellings share the entire date and hour. The field
+            // window and the ordinary candidate both accept whole seconds.
+            let clock = u64::from_le_bytes(event[12..20].try_into().unwrap());
+            minute_seconds(clock).map_or(EventClock::Invalid, |s| EventClock::Whole(hour_start + s))
+        } else if event.len() == 25
+            && matches!(event[19], b'+' | b'-')
+            && event[..13] == ingest[..13]
+        {
             let clock = u64::from_le_bytes(event[12..20].try_into().unwrap());
             minute_seconds(clock)
                 .zip(zone_offset(event))
-                .map(|(seconds, zone)| (hour_start + seconds) * 1000 - zone)
+                .map_or(EventClock::Invalid, |(seconds, zone)| {
+                    EventClock::Millis((hour_start + seconds) * 1000 - zone)
+                })
         } else {
             self.parse_reference(event)
+                .map_or(EventClock::Invalid, EventClock::Millis)
         };
         (timestamp, ingest_seconds)
+    }
+
+    #[inline(always)]
+    fn decimal_clock(&self, s: &[u8]) -> EventClock {
+        let (prefix, base_seconds) = self.epochs[(s[3] & 15) as usize];
+        if prefix == 0 || prefix != u32::from_le_bytes(s[..4].try_into().unwrap()) {
+            return epoch_13(s).map_or(EventClock::Invalid, EventClock::Millis);
+        }
+        let first = s[4].wrapping_sub(b'0');
+        let word = u64::from_le_bytes(s[5..13].try_into().unwrap());
+        if first > 9 || !all_digits(word) {
+            return EventClock::Invalid;
+        }
+        let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
+        let pairs = (digits * 10 + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+        let seconds = base_seconds as u64
+            + u64::from(first) * 100_000
+            + (pairs & 255) * 1000
+            + ((pairs >> 16) & 255) * 10
+            + ((digits >> 32) & 15);
+        let millis = ((digits >> 40) & 15) * 100 + (pairs >> 48);
+        EventClock::Decimal((seconds << 10) | millis)
     }
 
     #[inline]
@@ -523,7 +609,9 @@ impl Calendar {
                 if digit > 9 || !all_digits(tail) {
                     return None;
                 }
-                return Some(base + i64::from(digit) * 100_000_000 + i64::from(eight_digits(tail)));
+                return Some(
+                    base * 1000 + i64::from(digit) * 100_000_000 + i64::from(eight_digits(tail)),
+                );
             }
         }
         if s.len() == 20 && s[19] == b'Z' || s.len() == 25 && matches!(s[19], b'+' | b'-') {
@@ -1037,6 +1125,7 @@ impl OutputSpellings {
 }
 
 impl PersonNames {
+    #[cfg(test)]
     pub(crate) fn from_partitions(parts: Vec<OutputSpellings>) -> Self {
         let mut names = Self {
             table: Arc::new(NameTable {
@@ -1756,6 +1845,7 @@ impl LinkGraph {
     fn finish(
         self,
         external: &mut [AHashMap<Arc<str>, u32>],
+        wide_endpoints: Option<&mut [AHashMap<[u64; 2], u32>]>,
         hash: &RandomState,
         number: Option<fn(&[u8]) -> Option<u64>>,
     ) -> (NameTable, Option<NumericLinks>) {
@@ -1836,14 +1926,19 @@ impl LinkGraph {
                 }
             })
             .collect();
-        external.par_iter_mut().for_each(|names| {
-            for id in names.values_mut() {
-                let key = EXTERNAL_NAME | u64::from(*id);
-                let slot = self.slot_for_link(key, hash.hash_one(key) as usize);
-                let root = self.entries[slot as usize].parent.load(Ordering::Relaxed);
-                *id = dense[root as usize];
-            }
-        });
+        let remap = |id: &mut u32| {
+            let key = EXTERNAL_NAME | u64::from(*id);
+            let slot = self.slot_for_link(key, hash.hash_one(key) as usize);
+            let root = self.entries[slot as usize].parent.load(Ordering::Relaxed);
+            *id = dense[root as usize];
+        };
+        external
+            .par_iter_mut()
+            .for_each(|names| names.values_mut().for_each(remap));
+        if let Some(maps) = wide_endpoints {
+            maps.par_iter_mut()
+                .for_each(|keys| keys.values_mut().for_each(remap));
+        }
         (
             NameTable {
                 directory,
@@ -1914,34 +2009,72 @@ fn read_aliases_index(
         wide_users,
         ..Names::default()
     };
-    let key_for = |bytes: &[u8]| {
-        packed_name(bytes)
-            .unwrap_or_else(|| EXTERNAL_NAME | u64::from(external.intern(text(bytes))))
-    };
-    let batches = chunks(&data.join("links"))?
-        .into_par_iter()
-        .map(|chunk| {
-            let mut edges = Vec::new();
-            chunk.scan(|row| {
-                if let Some([left, right]) = fields(row) {
-                    if !left.is_empty() && !right.is_empty() && left != right {
-                        edges.push((key_for(left), key_for(right)));
+    let inputs = chunks(&data.join("links"))?;
+    let (batches, wide_work) = if number.is_some() {
+        let packets = inputs
+            .into_par_iter()
+            .map(|chunk| link_keys::read(chunk, &external))
+            .collect::<Result<Vec<_>>>()?;
+        let mut total = link_keys::Work::default();
+        let edges = packets
+            .into_iter()
+            .map(|(edges, work)| {
+                total.occurrences += work.occurrences;
+                total.local_unique += work.local_unique;
+                total.locks += work.locks;
+                edges
+            })
+            .collect::<Vec<_>>();
+        (edges, total)
+    } else {
+        let key_for = |bytes: &[u8]| {
+            packed_name(bytes)
+                .unwrap_or_else(|| EXTERNAL_NAME | u64::from(external.intern(text(bytes))))
+        };
+        let edges = inputs
+            .into_par_iter()
+            .map(|chunk| {
+                let mut edges = Vec::new();
+                chunk.scan(|row| {
+                    if let Some([left, right]) = fields(row) {
+                        if !left.is_empty() && !right.is_empty() && left != right {
+                            edges.push((key_for(left), key_for(right)));
+                        }
                     }
-                }
-            })?;
-            Ok(edges)
-        })
-        .collect::<Result<Vec<_>>>()?;
+                })?;
+                Ok(edges)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (edges, link_keys::Work::default())
+    };
 
     let edge_count = batches.iter().map(Vec::len).sum::<usize>();
-    let (mut external, external_names): (Vec<_>, Vec<_>) = external
-        .shards
-        .into_iter()
-        .map(|shard| {
-            let state = shard.into_inner().unwrap();
-            (state.ids, state.names)
-        })
-        .unzip();
+    let mut external_names = Vec::with_capacity(SHARDS);
+    let mut strings = Vec::with_capacity(SHARDS);
+    let mut keyed_wide = number.map(|_| Vec::with_capacity(SHARDS));
+    for shard in external.shards {
+        let state = shard.into_inner().unwrap();
+        external_names.push(state.names);
+        strings.push(state.ids);
+        if let Some(wide) = &mut keyed_wide {
+            wide.push(state.wide.unwrap_or_default());
+        }
+    }
+    let mut external = strings;
+    if number.is_some() && (crate::csv::work_enabled() || perf_on("PROFILE")) {
+        let unique = keyed_wide
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.len())
+            .sum::<usize>();
+        eprintln!(
+            "profile {}",
+            serde_json::json!({"stage":"wide_link_endpoints",
+            "occurrences":wide_work.occurrences, "local_unique":wide_work.local_unique,
+            "wide_batch_locks":wide_work.locks, "materialized_spellings":unique})
+        );
+    }
     let prefetch = perf_on("PERF_LINK_PREFETCH");
     let compact = perf_on("PERF_LINK_COMPACT");
     let prefetched = AtomicU64::new(0);
@@ -1989,23 +2122,30 @@ fn read_aliases_index(
         );
     }
     drop(batches);
-    let (table, numeric) = graph.finish(&mut external, &users.hash, number);
-    let wide: Option<Vec<AHashMap<[u64; 2], u32>>> = wide_users.then(|| {
-        external
-            .par_iter_mut()
-            .map(|names| {
-                let mut packed = AHashMap::default();
-                names.retain(|spelling, id| {
-                    if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
-                        packed.insert(key, *id);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                packed
-            })
-            .collect()
+    let (table, numeric) = graph.finish(
+        &mut external,
+        keyed_wide.as_deref_mut(),
+        &users.hash,
+        number,
+    );
+    let wide: Option<Vec<AHashMap<[u64; 2], u32>>> = keyed_wide.or_else(|| {
+        wide_users.then(|| {
+            external
+                .par_iter_mut()
+                .map(|names| {
+                    let mut packed = AHashMap::default();
+                    names.retain(|spelling, id| {
+                        if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
+                            packed.insert(key, *id);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    packed
+                })
+                .collect()
+        })
     });
     let dynamic_start = table.canonical.len().div_ceil(SHARDS);
     for shard in &mut users.shards {
@@ -2483,7 +2623,7 @@ mod person_tests {
                 table.join(a, b);
             }
         });
-        let (table, _) = table.finish(&mut [], &hash, None);
+        let (table, _) = table.finish(&mut [], None, &hash, None);
         let users = Names::default();
         assert_eq!(table.canonical, [keys[0]]);
         for key in keys {

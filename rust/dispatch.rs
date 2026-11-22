@@ -94,7 +94,10 @@ fn main() {
     let threshold = std::env::var("PERF_LARGE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3 << 30);
+        .unwrap_or_else(|| match std::env::var("PERF_ARCH").as_deref() {
+            Ok("A" | "B") => 64 << 20,
+            _ => 3 << 30,
+        });
     let binary = if requested == "portable" {
         "/usr/local/bin/portable"
     } else if requested == "cascade" && option_env!("SCORER_CASCADE") == Some("1") && cascade_cpu()

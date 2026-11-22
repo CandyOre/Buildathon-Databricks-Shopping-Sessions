@@ -79,9 +79,9 @@ fn suffix_word(id: &[u8], prefix: u8) -> Option<(u64, u64)> {
 /// Validate and decode two short keys simultaneously on optimized binaries.
 #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
 #[inline]
-pub(super) fn event_and_user(event: &[u8], user: &[u8]) -> Option<(u64, u64)> {
+fn key_and_user<const PREFIX: u8>(event: &[u8], user: &[u8]) -> Option<(u64, u64)> {
     use std::arch::x86_64::*;
-    let (event, pad_event) = suffix_word(event, b'e')?;
+    let (event, pad_event) = suffix_word(event, PREFIX)?;
     let (user, pad_user) = suffix_word(user, b'u')?;
     unsafe {
         let ascii = _mm_set_epi64x(user as i64, event as i64);
@@ -114,8 +114,34 @@ pub(super) fn event_and_user(event: &[u8], user: &[u8]) -> Option<(u64, u64)> {
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
 #[inline]
-pub(super) fn event_and_user(_event: &[u8], _user: &[u8]) -> Option<(u64, u64)> {
+fn key_and_user<const PREFIX: u8>(_event: &[u8], _user: &[u8]) -> Option<(u64, u64)> {
     None
+}
+
+#[inline]
+pub(super) fn event_and_user(event: &[u8], user: &[u8]) -> Option<(u64, u64)> {
+    key_and_user::<b'e'>(event, user)
+}
+
+#[inline]
+pub(super) fn click_owner(
+    click: &[u8],
+    user: &[u8],
+    wide_users: &mut Vec<[u64; 2]>,
+    users: &super::Names,
+    ids: &mut super::ClickKeyChunk,
+    fallback: &super::Names,
+) -> (u64, u64) {
+    use crate::records::NUMERIC_CLICK;
+    if let Some((rank, owner)) = key_and_user::<b'k'>(click, user) {
+        return (NUMERIC_CLICK | rank, owner);
+    }
+    let owner = super::encode(user, b'u', wide_users, users, true);
+    let id = click
+        .strip_prefix(b"k")
+        .and_then(number)
+        .map_or_else(|| ids.encode(click, fallback), |rank| NUMERIC_CLICK | rank);
+    (id, owner)
 }
 
 pub(super) use crate::input::write_base36 as write_number;
@@ -167,6 +193,37 @@ pub(super) fn fingerprint(id: u64) -> u32 {
 }
 
 impl ShortEvent {
+    /// A verified, in-window view/cart with two inline spelling ranks. Its
+    /// caller has already decided whether the millisecond offset is integral.
+    #[inline(always)]
+    pub fn ordinary(
+        id: u64,
+        user: u64,
+        seconds: u32,
+        millis: u32,
+        whole: bool,
+        ingest: u32,
+    ) -> Option<Self> {
+        if (id | user) >= MARK {
+            return None;
+        }
+        let first = id | (user << 42);
+        if whole && seconds < (1 << 21) - 65_536 && ingest < 1 << 21 {
+            return Some(Self(
+                first,
+                (user >> 22) | (u64::from(seconds) << 20) | (u64::from(ingest) << 41),
+            ));
+        }
+        let biased = i64::from(ingest) - i64::from(seconds) + 32;
+        if ingest < super::SIDE && (0..4096).contains(&biased) {
+            return Some(Self(
+                first,
+                (1 << 63) | (user >> 22) | (u64::from(millis) << 20) | ((biased as u64) << 51),
+            ));
+        }
+        None
+    }
+
     #[inline]
     pub fn key(self, k: &EventKeys) -> u64 {
         from_code(self.0 & ((1 << 42) - 1), 42, &k.wide)
@@ -261,7 +318,17 @@ impl ShortEvent {
         self.unpack_with_id(self.key(k), p)
     }
 
-    #[inline]
+    #[inline(always)]
+    pub fn winner(self, chunk: u32, p: &EventData) -> super::WinnerRow {
+        let row = self.unpack_with_id(0, p);
+        super::WinnerRow {
+            user: row.user,
+            stamp: row.stamp,
+            chunk,
+        }
+    }
+
+    #[inline(always)]
     pub fn unpack_with_id(self, id: u64, p: &EventData) -> EventRow {
         const NO_TIME: u32 = (1 << 21) - 1;
         const PAYLOAD_REF: u32 = NO_TIME - 65535;
@@ -301,6 +368,16 @@ impl ShortClick {
     // ClickBlock supplies the chunk, so only its slot goes into this record.
     pub const WIDE_SLOT: u64 = 1 << 40;
 
+    #[inline]
+    pub fn id_code(id: u64) -> Option<u64> {
+        use crate::records::{HEX_CLICK, NUMERIC_CLICK};
+        if id >= HEX_CLICK {
+            return Some(Self::WIDE_SLOT | u64::from(id as u32));
+        }
+        let rank = id ^ NUMERIC_CLICK;
+        (rank < Self::WIDE_SLOT).then_some(rank)
+    }
+
     pub fn pack(user: u64, click: u64, time: i64, base: i64, campaign: u32) -> Option<Self> {
         let owner = code(user, 41)?;
         let delta = time.checked_sub(base)? as u64;
@@ -336,6 +413,68 @@ const _: () = assert!(size_of::<ShortEvent>() == 16 && size_of::<ShortClick>() =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_clicks_preserve_owner_and_lexical_ties_across_all_key_forms() {
+        use crate::input::Names;
+        use crate::records::{ClickIds, ClickKeyChunk, HEX_CLICK, NUMERIC_CLICK};
+        let spellings: &[&[u8]] = &[
+            b"k",
+            b"k0",
+            b"k00",
+            b"k01a0d50",
+            b"kz99ry6k4",
+            b"k00000000",
+            b"k00000000000000000000000000000000",
+            b"k00000000000000000000000000000001",
+            b"k10000000000000000000000000000001",
+            b"k0000000000000000000000000000000A",
+            b"kA",
+            b"K01a0d50",
+            b"kabcdefghi",
+        ];
+        let owners: &[&[u8]] = &[
+            b"u003bc9a",
+            b"u09ffg89z",
+            b"u00000000",
+            b"U001",
+            b"u00000000000000000000000000000001",
+        ];
+        let users = Names::default();
+        let fallback = Names::default();
+        let (mut a, mut b) = (ClickKeyChunk::new(0), ClickKeyChunk::new(1));
+        let (mut wa, mut wb) = (Vec::new(), Vec::new());
+        let mut samples = Vec::new();
+        for &spelling in spellings {
+            for &user in owners {
+                let (id, owner) = click_owner(spelling, user, &mut wa, &users, &mut a, &fallback);
+                assert_eq!(
+                    owner,
+                    super::super::encode(user, b'u', &mut wb, &users, true)
+                );
+                let packed = if id >= HEX_CLICK {
+                    Some(ShortClick::WIDE_SLOT | u64::from(id as u32))
+                } else {
+                    spelling
+                        .strip_prefix(b"k")
+                        .and_then(number)
+                        .filter(|&x| x < ShortClick::WIDE_SLOT)
+                };
+                assert_eq!(ShortClick::id_code(id), packed);
+                if let Some(n) = spelling.strip_prefix(b"k").and_then(number) {
+                    assert_eq!(id, NUMERIC_CLICK | n);
+                }
+                samples.push((spelling, id, b.encode(spelling, &fallback)));
+            }
+        }
+        assert_eq!(wa, wb);
+        let ids = ClickIds::new(fallback, vec![a, b]);
+        for &(raw, left, _) in &samples {
+            for &(other, _, right) in &samples {
+                assert_eq!(ids.compare(left, right), raw.cmp(other));
+            }
+        }
+    }
 
     #[test]
     fn indexed_wide_keys_keep_the_hash_and_slot_without_loading_a_sidecar() {

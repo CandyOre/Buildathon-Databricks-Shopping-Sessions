@@ -342,6 +342,36 @@ pub fn stage_map<I: Send, R: Send>(
     stage_map_init(phase, items, 1, || (), |_, item| task(item))
 }
 
+/// Each partition independently produces complete user groups. Start the
+/// partitions with the most rows first, leaving small ones for work stealing
+/// while workers finish heavy users. The result order is immaterial here.
+pub fn person_partitions<I: Send, R: Send>(
+    phase: &str,
+    mut items: Vec<I>,
+    enabled: bool,
+    rows: impl Fn(&I) -> usize,
+    task: impl Fn(I) -> R + Sync + Send,
+) -> Vec<R> {
+    let workers = worker_slots().min(items.len());
+    if !enabled || items.len() <= workers {
+        return stage_map(phase, items, task);
+    }
+    items.sort_by_cached_key(rows);
+    let queue = Mutex::new(items);
+    stage_map(phase, (0..workers).collect(), |_| {
+        let mut ready = Vec::new();
+        loop {
+            let item = queue.lock().unwrap().pop();
+            let Some(item) = item else { break };
+            ready.push(task(item));
+        }
+        ready
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub fn number(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
