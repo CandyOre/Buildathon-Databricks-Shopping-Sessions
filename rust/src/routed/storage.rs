@@ -207,7 +207,7 @@ mod tests {
         assert!(s.push(3,30));
         assert!(s.push(1,11));
         assert!(!s.push(1,12));
-        assert_eq!(s.prefix(0),&[]);
+        assert!(s.prefix(0).is_empty());
         assert_eq!(s.prefix(1),&[10,11]);
         assert_eq!(s.prefix(3),&[30]);
     }

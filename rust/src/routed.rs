@@ -538,8 +538,10 @@ fn event_winners(
     let calendar = Calendar::new(window);
     let base = window.start.div_euclid(1000);
     let scan_start=Instant::now();
-    let chunks = plans
-        .par_chunks(plan.chunks_per_task(plans.len()))
+    let bucket_header=size_of::<Vec<EventRow>>() * if plan.packed {2} else {1};
+    let stripe_padding=if plan.slab {8*if plan.packed {size_of::<packed::ShortEvent>()} else {size_of::<EventRow>()} + size_of::<u32>()} else {0};
+    let groups=crate::csv::work_groups(&plans,plan.chunks_per_task(plans.len()),plan.event_parts*(bucket_header+stripe_padding));
+    let chunks = groups.into_par_iter()
         .map(|sources| {
             let mut sink = BucketWriter::new(plan.event_parts, plan.writes);
             let mut narrow = if plan.packed {
@@ -652,7 +654,10 @@ fn event_winners(
                 *scratch = Scratch::default();
             }
             let n: usize = pieces.iter().map(Fragment::len).sum();
-            let slots = (n.saturating_mul(plan.factor)).max(64).next_power_of_two();
+            // Hash bits already consumed by partitioning cannot discriminate
+            // bitmap slots. Avoid allocating unreachable addresses.
+            let reachable=1usize<<(30-plan.event_parts.trailing_zeros());
+            let slots=n.saturating_mul(plan.factor).clamp(64,reachable).next_power_of_two();
             let rows = if plan.arena {
                 let all = pieces.iter().flat_map(|p| p.rows(&keys, &payloads));
                 Rows::Pages(arena.pack(all))
@@ -781,8 +786,9 @@ fn raw_clicks(
     let calendar = Calendar::new(window);
     let started=Instant::now();
     let sources = chunks(&data.join("clicks"))?;
-    let pieces = sources
-        .par_chunks(plan.chunks_per_task(sources.len()))
+    let metadata=plan.user_parts*size_of::<Vec<RawClick>>() * if plan.packed {2} else {1};
+    let groups=crate::csv::work_groups(&sources,plan.chunks_per_task(sources.len()),metadata);
+    let pieces = groups.into_par_iter()
         .enumerate()
         .map(|(i, sources)| {
             let mut output: Pieces<RawClick> = empty_buckets(plan.user_parts);
