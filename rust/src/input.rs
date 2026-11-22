@@ -862,6 +862,7 @@ pub struct Aliases {
     table: Arc<NameTable>,
     external: Vec<AHashMap<Arc<str>, u32>>,
     wide: Option<Vec<AHashMap<[u64;2],u32>>>,
+    wide_cache: Option<crate::wide_cache::WideCache>,
 }
 
 impl Aliases {
@@ -869,9 +870,14 @@ impl Aliases {
     fn resolve_external(&self, users: &Names, bytes: &[u8]) -> u32 {
         if let Some(wide) = &self.wide {
             if let Some(key) = hex_id(bytes, b'u') {
-                let shard = users.hash.hash_one(key) as usize % SHARDS;
-                return wide[shard].get(&key).copied()
-                    .unwrap_or_else(|| users.intern_wide(shard,key,text(bytes)));
+                let lookup = || {
+                    let shard = users.hash.hash_one(key) as usize % SHARDS;
+                    wide[shard].get(&key).copied().unwrap_or_else(|| users.intern_wide(shard,key,text(bytes)))
+                };
+                return match &self.wide_cache {
+                    Some(cache) => cache.resolve(key, lookup),
+                    None => lookup(),
+                };
             }
         }
         let shard = users.hash.hash_one(bytes) as usize % SHARDS;
@@ -1487,7 +1493,7 @@ fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> R
     }
     drop(batches);
     let table = graph.finish(&mut external, &users.hash);
-    let wide = wide_users.then(|| external.par_iter_mut().map(|names| {
+    let wide: Option<Vec<AHashMap<[u64;2],u32>>> = wide_users.then(|| external.par_iter_mut().map(|names| {
         let mut packed = AHashMap::default();
         names.retain(|spelling,id| {
             if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
@@ -1504,7 +1510,9 @@ fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> R
     let table = Arc::new(table);
     users.packed = Some(Arc::clone(&table));
     users.wide_users = wide_users;
-    Ok(Aliases { table, external, wide })
+    let wide_cache = wide.as_ref().filter(|_| perf_on("PERF_WIDE_CACHE"))
+        .map(|maps| crate::wide_cache::WideCache::new(maps.iter().map(|m| m.len()).sum()));
+    Ok(Aliases { table, external, wide, wide_cache })
 }
 
 #[derive(Clone, Copy)]

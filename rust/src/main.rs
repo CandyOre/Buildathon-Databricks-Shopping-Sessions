@@ -7,6 +7,7 @@ mod profile;
 mod records;
 mod routed;
 mod runtime;
+mod wide_cache;
 
 use std::env;
 use std::path::PathBuf;
@@ -60,14 +61,29 @@ fn main() -> Result<()> {
             let mut users = input::Names::default();
             let aliases = input::read_aliases(&data, &mut users)?;
             profile.stage("load_dimensions_and_links");
-            let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
-            profile.stage("parse_events");
-            let (sessions, count) = records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
-            profile.stage("dedup_and_sessionize");
-            let (clicks, ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
+            let (sessions, count, clicks, ids) = if runtime::flag("PERF_OVERLAP_STREAMS") {
+                let (events, clicks) = rayon::join(
+                    || -> Result<_> {
+                        let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
+                        Ok(records::dedup_and_sessionize(candidates, users.person_slots_per_shard()))
+                    },
+                    || records::read_clicks(&data, window, &dimensions, &users, &aliases),
+                );
+                let (sessions, count) = events?;
+                let (clicks, ids) = clicks?;
+                profile.stage("overlap_events_and_clicks");
+                (sessions, count, clicks, ids)
+            } else {
+                let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
+                profile.stage("parse_events");
+                let (sessions, count) = records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
+                profile.stage("dedup_and_sessionize");
+                let (clicks, ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
+                profile.stage("parse_and_sort_clicks");
+                (sessions, count, clicks, ids)
+            };
             drop(aliases);
             let names = users.into_people();
-            profile.stage("parse_and_sort_clicks");
             (sessions, clicks, ids, names, count)
         };
 
