@@ -291,6 +291,10 @@ struct Work {
     real_duplicates: usize,
     linear_probes: usize,
     packed_events: usize,
+    scan_time: Duration,
+    exchange_time: Duration,
+    winner_time: Duration,
+    scan_tasks: usize,
 }
 
 struct Winners {
@@ -331,9 +335,14 @@ struct Plan {
     arena: bool,
     reuse: bool,
     packed: bool,
+    flat: bool,
+    chunk_group: usize,
 }
 
 impl Plan {
+    fn chunks_per_task(self, n:usize) -> usize {
+        self.chunk_group.min((n/(rayon::current_num_threads()*2)).max(1))
+    }
     fn new(bytes: usize) -> Result<Self> {
         let event_parts = bytes.div_ceil(3 << 20).clamp(8, 2048).next_power_of_two();
         let user_parts = bytes.div_ceil(10 << 20).clamp(8, 512).next_power_of_two();
@@ -343,6 +352,8 @@ impl Plan {
             "stream" => Writes::Stream,
             _ => anyhow::bail!("unknown PERF_ROUTE_WRITES"),
         };
+        let chunk_group = switch("PERF_ROUTE_CHUNKS", "1").parse::<usize>()?;
+        ensure!((1..=128).contains(&chunk_group), "PERF_ROUTE_CHUNKS must be 1..128");
         Ok(Self {
             event_parts: config_size("PERF_ROUTE_EVENT_BUCKETS", event_parts)?,
             user_parts: config_size("PERF_ROUTE_USER_BUCKETS", user_parts)?,
@@ -353,6 +364,8 @@ impl Plan {
             arena: switch("PERF_ROUTE_ARENA", "0") == "1",
             reuse: switch("PERF_ROUTE_REUSE", "1") != "0",
             packed: switch("PERF_ROUTE_PACK", "0") == "1",
+            flat: switch("PERF_ROUTE_GROUPS", "map") == "flat",
+            chunk_group,
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
             p1: switch("PERF_ROUTE_P1", "1") != "0",
             early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
@@ -491,9 +504,10 @@ fn event_winners(
     let other_ids = Names::default();
     let calendar = Calendar::new(window);
     let base = window.start.div_euclid(1000);
+    let scan_start=Instant::now();
     let chunks = plans
-        .into_par_iter()
-        .map(|chunk| {
+        .par_chunks(plan.chunks_per_task(plans.len()))
+        .map(|sources| {
             let mut sink = BucketWriter::new(plan.event_parts, plan.writes);
             let mut narrow = if plan.packed {
                 empty_buckets(plan.event_parts)
@@ -502,7 +516,8 @@ fn event_winners(
             };
             let (mut keys, mut data) = (EventKeys::default(), EventData::default());
             let mut valid_count = 0;
-            chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
+            for chunk in sources {
+                chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
                 let key = encode(id, b'e', &mut keys.wide, &other_ids, plan.packed);
                 let (user, stamp) = match valid {
                     Some((time, sale)) => {
@@ -528,16 +543,20 @@ fn event_winners(
                     }
                 }
                 sink.push(bucket, row);
-            })?;
+                })?;
+            }
             Ok::<_, anyhow::Error>((sink.finish(), narrow, keys, data, valid_count))
         })
         .collect::<Result<Vec<_>>>()?;
     drop(other_ids);
+    let exchange_start=Instant::now();
 
     let mut pieces: Vec<Vec<Fragment>> = empty_buckets(plan.event_parts);
     let mut keys = Vec::with_capacity(chunks.len());
     let mut payloads = Vec::with_capacity(chunks.len());
     let mut work = Work::default();
+    work.scan_time=exchange_start.duration_since(scan_start);
+    work.scan_tasks=chunks.len();
     for (i, (buckets, narrow, k, p, valid)) in chunks.into_iter().enumerate() {
         let chunk = u32::try_from(i)?;
         work.valid += valid;
@@ -569,6 +588,8 @@ fn event_winners(
         work.max_event_bucket = *sizes.last().unwrap_or(&0);
         work.median_event_bucket = sizes[sizes.len() / 2];
     }
+    let winner_start=Instant::now();
+    work.exchange_time=winner_start.duration_since(exchange_start);
     let results = pieces
         .into_par_iter()
         .with_min_len(4)
@@ -673,6 +694,7 @@ fn event_winners(
             }
         }
     }
+    work.winner_time=winner_start.elapsed();
     Ok(Winners {
         partitions,
         data: payloads,
@@ -691,6 +713,7 @@ struct ClickInput {
     partitions: Vec<Vec<ClickBlock>>,
     users: Vec<Vec<[u64; 2]>>,
     ids: ClickIds,
+    elapsed: Duration,
 }
 
 fn raw_clicks(
@@ -702,10 +725,12 @@ fn raw_clicks(
 ) -> Result<ClickInput> {
     let fallback = Names::default();
     let calendar = Calendar::new(window);
-    let pieces = chunks(&data.join("clicks"))?
-        .into_par_iter()
+    let started=Instant::now();
+    let sources = chunks(&data.join("clicks"))?;
+    let pieces = sources
+        .par_chunks(plan.chunks_per_task(sources.len()))
         .enumerate()
-        .map(|(i, chunk)| {
+        .map(|(i, sources)| {
             let mut output: Pieces<RawClick> = empty_buckets(plan.user_parts);
             let mut narrow = if plan.packed {
                 empty_buckets(plan.user_parts)
@@ -715,7 +740,8 @@ fn raw_clicks(
             let mut users = Vec::new();
             let mut ids = ClickKeyChunk::new(i);
             let chunk_id = u32::try_from(i)?;
-            chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
+            for chunk in sources {
+                chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
                 let user = encode(user, b'u', &mut users, raw_users, plan.packed);
                 let part = hash(user) as usize & (plan.user_parts - 1);
                 let mut encoded = None;
@@ -752,7 +778,8 @@ fn raw_clicks(
                     campaign,
                     chunk: chunk_id,
                 });
-            })?;
+                })?;
+            }
             Ok::<_, anyhow::Error>((output, narrow, users, ids))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -778,6 +805,7 @@ fn raw_clicks(
         partitions,
         users,
         ids: ClickIds::new(fallback, ids),
+        elapsed: started.elapsed(),
     })
 }
 
@@ -792,6 +820,34 @@ struct PersonEvent {
 struct Forward {
     events: Vec<PersonEvent>,
     clicks: Vec<Click>,
+}
+
+enum Destinations {
+    Sparse(AHashMap<usize, Forward>),
+    Dense(Vec<Forward>),
+}
+
+impl Destinations {
+    fn new(plan:Plan)->Self {
+        if plan.flat {
+            Self::Dense((0..plan.user_parts).map(|_|Forward::default()).collect())
+        } else {
+            Self::Sparse(AHashMap::default())
+        }
+    }
+    #[inline]
+    fn get(&mut self,bucket:usize)->&mut Forward {
+        match self {
+            Self::Sparse(map)=>map.entry(bucket).or_default(),
+            Self::Dense(rows)=>&mut rows[bucket],
+        }
+    }
+    fn into_blocks(self)->Vec<(usize,Forward)> {
+        match self {
+            Self::Sparse(map)=>map.into_iter().collect(),
+            Self::Dense(rows)=>rows.into_iter().enumerate().filter(|(_,r)|!(r.events.is_empty()&&r.clicks.is_empty())).collect(),
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -847,10 +903,25 @@ impl People {
             events,
             clicks,
         } = self;
+        let n=events.len();
+        Self::finish_groups(groups,events.into_iter(),clicks.into_iter(),n,false,window,data)
+    }
+
+    fn finish_groups(
+        groups:Vec<(u32,Counts)>,
+        events:impl Iterator<Item=PersonEvent>,
+        clicks:impl Iterator<Item=Click>,
+        event_count:usize,
+        ordered_ids:bool,
+        window: Window,
+        data: &[EventData],
+    ) -> (SessionBatch, Vec<Click>) {
         let mut indexes: Vec<_> = (0..groups.len())
             .filter(|&i| groups[i].1.events > 0)
             .collect();
-        indexes.sort_unstable_by_key(|&i| groups[i].0);
+        if !ordered_ids {
+            indexes.sort_unstable_by_key(|&i| groups[i].0);
+        }
         let mut totals = Counts::default();
         let mut heads = vec![Counts::default(); groups.len()];
         let mut person_ids = Vec::with_capacity(indexes.len());
@@ -861,7 +932,7 @@ impl People {
             .checked_sub(window.start)
             .and_then(|v| u32::try_from(v).ok())
             .is_some()
-            && events.len() <= u32::MAX as usize;
+            && event_count <= u32::MAX as usize;
         for i in indexes {
             let (person, n) = groups[i];
             heads[i] = totals;
@@ -973,6 +1044,8 @@ struct Resolver<'a> {
     cache: PersonCache,
     p1: bool,
     numeric: bool,
+    hot: Vec<(u64,Target)>,
+    bucket_bits: u32,
 }
 
 impl Resolver<'_> {
@@ -995,6 +1068,15 @@ impl Resolver<'_> {
         }
         if (WIDE..OTHER).contains(&user) {
             resolve!(self.wide, wide[user as u32 as usize])
+        } else if !self.hot.is_empty() {
+            // All spellings reaching this task have the same low partition
+            // bits. Use independent fingerprint bits for the private cache.
+            let i=(hash(user) as usize>>self.bucket_bits)&(self.hot.len()-1);
+            let (old,value)=self.hot[i];
+            if old==user {return value;}
+            let target=resolve!(self.compact,user);
+            self.hot[i]=(user,target);
+            target
         } else {
             resolve!(self.compact, user)
         }
@@ -1003,10 +1085,12 @@ impl Resolver<'_> {
 
 struct P1 {
     local: (SessionBatch, Vec<Click>),
-    forwarded: AHashMap<usize, Forward>,
+    forwarded: Vec<(usize, Forward)>,
     spells: usize,
     direct: usize,
     elapsed: Duration,
+    group_time: Duration,
+    finish_time: Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1023,6 +1107,10 @@ fn first_pass(
     arena: &storage::Arena,
 ) -> P1 {
     let start = Instant::now();
+    let cap=if plan.flat {
+        let rows=events.iter().map(Vec::len).sum::<usize>()+clicks.iter().map(|c|c.full.len()+c.short.len()).sum::<usize>();
+        (rows/8).clamp(128,32768).next_power_of_two()
+    } else {0};
     let mut ids = Resolver {
         compact: AHashMap::default(),
         wide: AHashMap::default(),
@@ -1032,9 +1120,11 @@ fn first_pass(
         cache: PersonCache::default(),
         p1: plan.p1,
         numeric: plan.packed,
+        hot: vec![(u64::MAX,Target::Here(0)); cap],
+        bucket_bits:plan.user_parts.trailing_zeros(),
     };
     let mut local = People::default();
-    let mut forwarded = AHashMap::<usize, Forward>::default();
+    let mut forwarded = Destinations::new(plan);
     for r in events.into_iter().flatten() {
         let dest = ids.target(r.user, &data[r.chunk as usize].users, &mut local);
         let person = match dest {
@@ -1048,8 +1138,7 @@ fn first_pass(
         match dest {
             Target::Here(_) => local.event(row, data),
             Target::Forward(_) => forwarded
-                .entry(person as usize & (plan.user_parts - 1))
-                .or_default()
+                .get(person as usize & (plan.user_parts - 1))
                 .events
                 .push(row),
         }
@@ -1068,8 +1157,7 @@ fn first_pass(
         match dest {
             Target::Here(_) => local.click(row),
             Target::Forward(_) => forwarded
-                .entry(person as usize & (plan.user_parts - 1))
-                .or_default()
+                .get(person as usize & (plan.user_parts - 1))
                 .clicks
                 .push(row),
         }
@@ -1093,12 +1181,18 @@ fn first_pass(
     let spells = ids.compact.len() + ids.wide.len();
     let direct = local.groups.len();
     drop(ids);
+    let group_time = start.elapsed();
+    let finish_start=Instant::now();
+    let local=local.finish(window,data);
+    let finish_time=finish_start.elapsed();
     P1 {
-        local: local.finish(window, data),
-        forwarded,
+        local,
+        forwarded:forwarded.into_blocks(),
         spells,
         direct,
         elapsed: start.elapsed(),
+        group_time,
+        finish_time,
     }
 }
 
@@ -1106,25 +1200,56 @@ fn second_pass(
     pieces: Vec<Forward>,
     data: &[EventData],
     window: Window,
+    plan:Plan,
 ) -> (SessionBatch, Vec<Click>) {
+    if plan.flat {
+        return second_flat(pieces,data,window,plan.user_parts.trailing_zeros());
+    }
     let mut groups = AHashMap::<u32, u32>::default();
     let mut local = People::default();
     for part in pieces {
         for mut row in part.events {
-            row.person = *groups
-                .entry(row.person)
-                .or_insert_with(|| local.group(row.person));
+            row.person = *groups.entry(row.person).or_insert_with(||local.group(row.person));
             local.event(row, data);
         }
         for mut row in part.clicks {
-            row.person = *groups
-                .entry(row.person)
-                .or_insert_with(|| local.group(row.person));
+            row.person = *groups.entry(row.person).or_insert_with(||local.group(row.person));
             local.click(row);
         }
     }
     drop(groups);
     local.finish(window, data)
+}
+
+fn second_flat(pieces:Vec<Forward>, data:&[EventData],window:Window,bits:u32)->(SessionBatch,Vec<Click>) {
+    // Names assigns monotonic IDs inside interleaved shards. A destination
+    // owns all people sharing its low bits, so the quotient is an exact index.
+    // First count rows without moving them; the scatter then reads the original
+    // blocks directly, avoiding one whole write and read of forwarded rows.
+    let mut groups=Vec::<(u32,Counts)>::new();
+    fn counts(groups:&mut Vec<(u32,Counts)>,id:u32,bits:u32)->&mut Counts {
+        let slot=(id>>bits) as usize;
+        if slot>=groups.len() {groups.resize(slot+1,(0,Counts::default()));}
+        groups[slot].0=id;
+        &mut groups[slot].1
+    }
+    let mut event_count=0;
+    for part in &pieces {
+        event_count+=part.events.len();
+        for row in &part.events {
+            let g=counts(&mut groups,row.person,bits);
+            g.events+=1;
+            if row.stamp>=SIDE && data[row.chunk as usize].extra[(row.stamp^SIDE) as usize].1.is_some() {
+                g.sales+=1;
+            }
+        }
+        for c in &part.clicks {
+            counts(&mut groups,c.person,bits).clicks+=1;
+        }
+    }
+    let events=pieces.iter().flat_map(|p|p.events.iter().copied()).map(|mut e| {e.person>>=bits;e});
+    let clicks=pieces.iter().flat_map(|p|p.clicks.iter().copied()).map(|mut c| {c.person>>=bits;c});
+    People::finish_groups(groups,events,clicks,event_count,true,window,data)
 }
 
 pub type Routed = (
@@ -1174,6 +1299,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         partitions: clicks,
         users: click_users,
         ids,
+        elapsed:click_time,
     } = clicks;
     let p1_start = Instant::now();
     let (click_count, packed_clicks) = if plan.profile {
@@ -1217,10 +1343,13 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let mut later: Vec<Vec<Forward>> = empty_buckets(plan.user_parts);
     let (mut spells, mut direct, mut forwarded_events, mut forwarded_clicks) = (0, 0, 0, 0);
     let mut longest_p1 = Duration::ZERO;
+    let (mut p1_group_tasks,mut p1_finish_tasks)=(Duration::ZERO,Duration::ZERO);
     for r in results {
         spells += r.spells;
         direct += r.direct;
         longest_p1 = longest_p1.max(r.elapsed);
+        p1_group_tasks+=r.group_time;
+        p1_finish_tasks+=r.finish_time;
         sessions.push(r.local.0);
         click_lists.push(r.local.1);
         for (part, rows) in r.forwarded {
@@ -1233,7 +1362,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let rest = later
         .into_par_iter()
         .filter(|p| !p.is_empty())
-        .map(|p| second_pass(p, &payloads, window))
+        .map(|p| second_pass(p, &payloads, window,plan))
         .collect::<Vec<_>>();
     for (s, c) in rest {
         sessions.push(s);
@@ -1245,7 +1374,11 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "stage":"route_storage","exact_duplicate_rows":work.real_duplicates,"linear_probes":work.linear_probes,
             "arena_2mib_regions":arena.stats.regions.load(Relaxed),"arena_pages_claimed":arena.stats.pages.load(Relaxed),
             "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor,
-            "packed_events":work.packed_events,"packed_clicks":packed_clicks
+            "packed_events":work.packed_events,"packed_clicks":packed_clicks,
+            "event_scan_s":work.scan_time.as_secs_f64(),"event_exchange_s":work.exchange_time.as_secs_f64(),
+            "event_winner_route_s":work.winner_time.as_secs_f64(),"click_scan_route_s":click_time.as_secs_f64(),
+            "event_scan_tasks":work.scan_tasks,"p1_group_task_sum_s":p1_group_tasks.as_secs_f64(),
+            "p1_local_aggregate_task_sum_s":p1_finish_tasks.as_secs_f64()
         });
         eprintln!("profile {storage}");
         let v = serde_json::json!({
