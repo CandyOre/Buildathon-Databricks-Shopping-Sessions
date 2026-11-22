@@ -12,7 +12,7 @@ use crate::input::{
 };
 
 const EXTERNAL_ID: u64 = 1 << 63;
-const INVALID_PERSON: u32 = u32::MAX;
+const INVALID_PERSON: u16 = u16::MAX;
 
 // Encode the common prefix plus up to eight following bytes without hashing
 // or base conversion. The high bit is reserved for interned names. Right zero
@@ -72,7 +72,7 @@ pub struct Event {
     pub purchase: u32,
 }
 
-const EXTENDED: u32 = 1 << 31;
+const EXTENDED: u16 = u16::MAX - 1;
 
 // The shard owns seven low ID bits. The remaining 57-bit quotient and a
 // 39-bit location/ingestion code fit in three naturally aligned u32 words.
@@ -246,11 +246,31 @@ impl IdRun<'_> {
     }
 }
 
+// The slab's shard supplies the low person-ID bits. The two reserved local
+// values represent a removed row or an index into the full-width side table.
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct PersonEvent {
-    person: u32,
-    time: u32,
+    low: u16,
+    high: u16,
+    local: u16,
 }
+
+impl PersonEvent {
+    fn new(local: u16, value: u32) -> Self {
+        Self {
+            low: value as u16,
+            high: (value >> 16) as u16,
+            local,
+        }
+    }
+
+    #[inline]
+    fn value(&self) -> u32 {
+        u32::from(self.low) | (u32::from(self.high) << 16)
+    }
+}
+const _: () = assert!(std::mem::size_of::<PersonEvent>() == 6);
 
 struct ChunkPeople {
     rows: ShardSlab<PersonEvent>,
@@ -260,26 +280,22 @@ struct ChunkPeople {
 impl ChunkPeople {
     fn push(&mut self, person: u32, time: i64, purchase: Option<Purchase>, start: i64) -> u32 {
         let offset = time.wrapping_sub(start) as u64;
-        let row = if person < EXTENDED && offset <= u64::from(u32::MAX) && purchase.is_none() {
-            PersonEvent {
-                person,
-                time: offset as u32,
-            }
-        } else {
-            let index = self.extra.len() as u32;
-            self.extra.push((
-                Event {
-                    time,
-                    person,
-                    purchase: 0,
-                },
-                purchase,
-            ));
-            PersonEvent {
-                person: EXTENDED,
-                time: index,
-            }
-        };
+        let local = person / SHARDS as u32;
+        let row =
+            if local < u32::from(EXTENDED) && offset <= u64::from(u32::MAX) && purchase.is_none() {
+                PersonEvent::new(local as u16, offset as u32)
+            } else {
+                let index = self.extra.len() as u32;
+                self.extra.push((
+                    Event {
+                        time,
+                        person,
+                        purchase: 0,
+                    },
+                    purchase,
+                ));
+                PersonEvent::new(EXTENDED, index)
+            };
         let shard = person as usize % SHARDS;
         // Chunk::scan owns only records starting in its 4 MiB byte range.
         // Even if a final record crosses many chunks, this index is below
@@ -342,6 +358,18 @@ fn shards<T: Default>() -> Vec<T> {
     (0..SHARDS).map(|_| T::default()).collect()
 }
 
+#[cfg(feature = "large-input")]
+const PENDING_LOOKUPS: usize = 16;
+
+#[cfg(feature = "large-input")]
+struct WaitingEvent {
+    query: input::Prepared,
+    event_id: u64,
+    ingest: i64,
+    time: i64,
+    purchase: Option<Purchase>,
+}
+
 pub fn read_events(
     data: &Path,
     window: Window,
@@ -366,6 +394,19 @@ pub fn read_events(
                 rows: ShardSlab::new(stride),
                 extra: Vec::new(),
             };
+            #[cfg(feature = "large-input")]
+            let mut next = 0;
+            #[cfg(feature = "large-input")]
+            let mut waiting = Vec::<WaitingEvent>::with_capacity(PENDING_LOOKUPS);
+            #[cfg(feature = "large-input")]
+            let commit = |job: WaitingEvent,
+                          people: &mut PersonCache,
+                          people_rows: &mut ChunkPeople,
+                          id_rows: &mut ChunkIds| {
+                let person = people.prepared(job.query, users, aliases, &[]);
+                let position = people_rows.push(person, job.time, job.purchase, window.start);
+                id_rows.push(job.event_id, job.ingest, position, origin_seconds);
+            };
             chunk.scan_parsed(|[id, user, ts, ingested, kind, product, price]| {
                 if id.is_empty() {
                     return;
@@ -377,6 +418,7 @@ pub fn read_events(
                 // by an odd number. Using the mixed value as the ID stays exact.
                 let mixed = (id ^ (id >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 let id = mixed ^ (mixed >> 31);
+                #[allow(unused_mut)]
                 let mut valid = || {
                     if user.is_empty() || product.is_empty() {
                         return None;
@@ -403,18 +445,58 @@ pub fn read_events(
                         }
                         _ => return None,
                     };
-                    Some((
-                        time,
-                        people.prepared(proposal, users, aliases, user),
-                        purchase,
-                    ))
+                    #[cfg(not(feature = "large-input"))]
+                    {
+                        Some((
+                            time,
+                            people.prepared(proposal, users, aliases, user),
+                            purchase,
+                        ))
+                    }
+                    #[cfg(feature = "large-input")]
+                    {
+                        Some((time, purchase))
+                    }
                 };
                 // Invalid candidates still compete in deduplication. The earliest copy wins.
+                #[cfg(not(feature = "large-input"))]
                 let position = valid().map_or(u32::MAX, |(time, person, purchase)| {
                     people_rows.push(person, time, purchase, window.start)
                 });
+                #[cfg(feature = "large-input")]
+                let position = if let Some((time, purchase)) = valid() {
+                    if proposal.needs_lookup() {
+                        let job = WaitingEvent {
+                            query: proposal,
+                            event_id: id,
+                            ingest: ingested,
+                            time,
+                            purchase,
+                        };
+                        if waiting.len() == PENDING_LOOKUPS {
+                            let ready = std::mem::replace(&mut waiting[next], job);
+                            next = (next + 1) % PENDING_LOOKUPS;
+                            commit(ready, people, &mut people_rows, &mut id_rows);
+                        } else {
+                            waiting.push(job)
+                        }
+                        return;
+                    }
+                    people_rows.push(
+                        people.prepared(proposal, users, aliases, user),
+                        time,
+                        purchase,
+                        window.start,
+                    )
+                } else {
+                    u32::MAX
+                };
                 id_rows.push(id, ingested, position, origin_seconds);
             })?;
+            #[cfg(feature = "large-input")]
+            for job in waiting {
+                commit(job, people, &mut people_rows, &mut id_rows)
+            }
             Ok::<_, anyhow::Error>((id_rows, people_rows))
         })
         .collect::<Result<_>>()?;
@@ -530,7 +612,7 @@ pub fn dedup_and_sessionize(
                 .sum();
             let length = size - losers.len();
             for (chunk, position) in losers {
-                fragments[chunk].at(position).person = INVALID_PERSON;
+                fragments[chunk].at(position).local = INVALID_PERSON;
             }
             if candidates.compact_times && use_counting_sort(length, width) {
                 // Count each user's offsets and purchases independently. Once converted to
@@ -538,15 +620,15 @@ pub fn dedup_and_sessionize(
                 let mut ends = vec![(0u32, 0u32); width];
                 for run in &fragments {
                     for row in run.rows() {
-                        let (person, purchase) = match row.person {
+                        let (local, purchase) = match row.local {
                             INVALID_PERSON => continue,
                             EXTENDED => {
-                                let (ev, p) = run.extra[row.time as usize];
-                                (ev.person, p.is_some())
+                                let (ev, p) = run.extra[row.value() as usize];
+                                (ev.person as usize / SHARDS, p.is_some())
                             }
-                            person => (person, false),
+                            local => (usize::from(local), false),
                         };
-                        let counts = &mut ends[person as usize / SHARDS];
+                        let counts = &mut ends[local];
                         counts.0 += 1;
                         counts.1 += u32::from(purchase);
                     }
@@ -564,16 +646,20 @@ pub fn dedup_and_sessionize(
                 let sale_dst = sales.spare_capacity_mut();
                 for run in fragments {
                     for row in run.rows() {
-                        if row.person == INVALID_PERSON {
+                        if row.local == INVALID_PERSON {
                             continue;
                         }
-                        let (person, time, p) = if row.person == EXTENDED {
-                            let (e, p) = run.extra[row.time as usize];
-                            (e.person, (e.time - candidates.start) as u32, p)
+                        let (local, time, p) = if row.local == EXTENDED {
+                            let (e, p) = run.extra[row.value() as usize];
+                            (
+                                e.person as usize / SHARDS,
+                                (e.time - candidates.start) as u32,
+                                p,
+                            )
                         } else {
-                            (row.person, row.time, None)
+                            (usize::from(row.local), row.value(), None)
                         };
-                        let heads = &mut ends[person as usize / SHARDS];
+                        let heads = &mut ends[local];
                         ts_dst[heads.0 as usize].write(time);
                         heads.0 += 1;
                         if let Some(p) = p {
@@ -604,16 +690,16 @@ pub fn dedup_and_sessionize(
             };
             for run in fragments {
                 for row in run.rows() {
-                    let event = match row.person {
+                    let event = match row.local {
                         INVALID_PERSON => continue,
                         EXTENDED => {
-                            let (mut e, purchase) = run.extra[row.time as usize];
+                            let (mut e, purchase) = run.extra[row.value() as usize];
                             e.purchase = output.add_purchase(purchase);
                             e
                         }
-                        person => Event {
-                            time: candidates.start + i64::from(row.time),
-                            person,
+                        local => Event {
+                            time: candidates.start + i64::from(row.value()),
+                            person: u32::from(local) * SHARDS as u32 + shard as u32,
                             purchase: 0,
                         },
                     };
@@ -826,6 +912,103 @@ mod grouping_tests {
 #[cfg(test)]
 mod shard_slab_tests {
     use super::*;
+
+    #[test]
+    fn six_byte_rows_reserve_both_markers_and_preserve_full_width_exceptions() {
+        let start = -1701;
+        let shard = SHARDS as u32 - 1;
+        let direct = (u32::from(EXTENDED) - 1) * SHARDS as u32 + shard;
+        let mut people = ChunkPeople {
+            rows: ShardSlab::new(1),
+            extra: Vec::new(),
+        };
+        let max_time = start + i64::from(u32::MAX);
+        let pos = people.push(direct, max_time, None, start);
+        assert_eq!(pos, shard);
+        let row = people.rows.fragment(shard as usize).0[0];
+        assert_eq!(row.local, EXTENDED - 1);
+        assert_eq!(row.value(), u32::MAX);
+        for (person, time, sale) in [
+            (direct + SHARDS as u32, start + 65535, None),
+            (direct + 2 * SHARDS as u32, start + 65536, None),
+            (u32::MAX, max_time + 1001, None),
+            (direct, start - 1, None),
+            (
+                direct,
+                start,
+                Some(Purchase {
+                    category: 9,
+                    cents: 27,
+                }),
+            ),
+        ] {
+            let pos = people.push(person, time, sale, start);
+            let (_, spill) = people.rows.fragment(shard as usize);
+            let row = spill[(pos / SHARDS as u32 - 1) as usize];
+            assert_eq!(row.local, EXTENDED);
+            let (ev, stored) = people.extra[row.value() as usize];
+            assert_eq!((ev.person, ev.time), (person, time));
+            assert_eq!(
+                stored.map(|p| (p.category, p.cents)),
+                sale.map(|p| (p.category, p.cents))
+            );
+        }
+        for value in [0, 1, 65535, 65536, 65537, u32::MAX] {
+            assert_eq!(PersonEvent::new(EXTENDED, value).value(), value);
+        }
+    }
+
+    #[test]
+    fn dense_and_full_sort_recover_nonzero_shard_at_u16_person_boundary() {
+        let shard = 91;
+        let start = -1000;
+        let locals = [15, 65533, 65534, 65535, 65536];
+        let run = |compact_times| {
+            let mut ids = ChunkIds {
+                rows: ShardSlab::new(1),
+                exceptional: Vec::new(),
+            };
+            let mut people = ChunkPeople {
+                rows: ShardSlab::new(1),
+                extra: Vec::new(),
+            };
+            let times = [0, 65535, 65536, 16_777_216, u32::MAX - 1];
+            for i in 0..33_000 {
+                let person = locals[i % locals.len()] * SHARDS as u32 + shard as u32;
+                let time = start + i64::from(times[(i / locals.len()) % times.len()]);
+                let sale = (i % 29 == 0).then_some(Purchase {
+                    category: (i % 3) as u32,
+                    cents: 23,
+                });
+                let pos = people.push(person, time, sale, start);
+                ids.push(i as u64, 2000, pos, 0);
+            }
+            // Remove one ordinary and one extended row through the dedup path.
+            for id in [1, 2] {
+                ids.push(id, 1000, u32::MAX, 0);
+            }
+            let batch = Candidates {
+                compact_times,
+                blocks: vec![(ids, people)],
+                start,
+                origin_seconds: 0,
+            };
+            dedup_and_sessionize(batch, 65537)
+        };
+        let (dense, n) = run(true);
+        let (sorted, m) = run(false);
+        assert_eq!((n, m), (32998, 32998));
+        let (a, b) = (&dense[shard].daily, &sorted[shard].daily);
+        let mut seen = a.person.clone();
+        seen.dedup();
+        assert_eq!(seen, locals.map(|p| p * SHARDS as u32 + shard as u32));
+        assert_eq!(a.person, b.person);
+        assert_eq!(a.day, b.day);
+        assert_eq!(a.events, b.events);
+        assert_eq!(a.sessions, b.sessions);
+        assert_eq!(a.revenue, b.revenue);
+        assert_eq!(a.category, b.category);
+    }
 
     #[test]
     fn an_empty_slab_with_zero_hint_exposes_every_disjoint_shard() {

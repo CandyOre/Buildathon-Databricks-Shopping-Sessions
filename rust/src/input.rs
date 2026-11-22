@@ -700,6 +700,52 @@ fn mixed_word(key: u64) -> Option<u64> {
     Some(x ^ (x >> 24))
 }
 
+#[cfg(feature = "large-input")]
+#[inline]
+fn materialize_key(key: u64, mixed: u64, bytes: &[u8]) -> u64 {
+    if key != EMPTY_KEY {
+        return key;
+    }
+    if !bytes.is_empty() {
+        return packed_name(bytes).expect("packed query");
+    }
+    // A queued lookup carries the reversible 57-bit result from mixed_word.
+    // Undo the two XOR shifts and the odd multiplication, then expand the
+    // seven-bit lanes back into the spelling. This is needed only on insertion.
+    let multiplied = mixed ^ (mixed >> 24) ^ (mixed >> 48);
+    let xor = multiplied.wrapping_mul(0x0195_1323_f693_49b7) & ((1 << 57) - 1);
+    let code = xor ^ (xor >> 25) ^ (xor >> 50);
+    let sign = (code >> 56) << 63;
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("bmi2") {
+        return sign | unsafe { std::arch::x86_64::_pdep_u64(code, ASCII_WORD) };
+    }
+    let mut packed = sign;
+    for lane in 0..8 {
+        packed |= ((code >> (lane * 7)) & 127) << (lane * 8);
+    }
+    packed
+}
+
+#[cfg(feature = "large-input")]
+#[cold]
+fn intern_on_overflow(users: &Names, key: u64, mixed: u64, bytes: &[u8]) -> u32 {
+    if bytes.is_empty() {
+        let key = materialize_key(key, mixed, bytes);
+        users.intern(unpack_name(key, &mut [0; 9]))
+    } else {
+        users.intern(text(bytes))
+    }
+}
+
+#[cfg(feature = "large-input")]
+impl Prepared {
+    #[inline]
+    pub fn needs_lookup(self) -> bool {
+        self.0 < READY
+    }
+}
+
 impl Directory {
     fn new(slots: usize) -> Self {
         let buckets = slots / 8;
@@ -804,14 +850,25 @@ impl Directory {
                 {
                     continue;
                 }
-                if let Some(id) = users.register_bounded(key, mixed as usize, limit) {
+                #[cfg(feature = "large-input")]
+                let registered_key = materialize_key(key, mixed, bytes);
+                #[cfg(not(feature = "large-input"))]
+                let registered_key = key;
+                if let Some(id) = users.register_bounded(registered_key, mixed as usize, limit) {
                     cell.store(tag | u64::from(id), Ordering::Release);
                     line.publish(lane, tag);
                     return Some(id);
                 }
                 cell.store(CLOSED, Ordering::Release);
                 line.publish(lane, tag);
-                return Some(users.intern(text(bytes)));
+                #[cfg(not(feature = "large-input"))]
+                {
+                    return Some(users.intern(text(bytes)));
+                }
+                #[cfg(feature = "large-input")]
+                {
+                    return Some(intern_on_overflow(users, key, mixed, bytes));
+                }
             }
         }
         None
@@ -834,9 +891,19 @@ impl Directory {
         }
         let other = self.alternate(home, quotient);
         let tag = tag | (self.id_mask + 1);
-        self.lookup_line(&self.lines[other], tag, key, mixed, bytes, users)
-            .or_else(|| spill.get(&key).copied())
-            .unwrap_or_else(|| users.intern(text(bytes)))
+        let result = self.lookup_line(&self.lines[other], tag, key, mixed, bytes, users);
+        #[cfg(not(feature = "large-input"))]
+        {
+            result
+                .or_else(|| spill.get(&key).copied())
+                .unwrap_or_else(|| users.intern(text(bytes)))
+        }
+        #[cfg(feature = "large-input")]
+        {
+            result
+                .or_else(|| spill.get(&materialize_key(key, mixed, bytes)).copied())
+                .unwrap_or_else(|| intern_on_overflow(users, key, mixed, bytes))
+        }
     }
 }
 
@@ -1103,6 +1170,7 @@ impl Default for PersonCache {
     }
 }
 
+#[cfg(not(feature = "large-input"))]
 #[derive(Clone, Copy)]
 pub enum Prepared {
     Ready(u32),
@@ -1111,18 +1179,52 @@ pub enum Prepared {
     External,
 }
 
+// Ordinary compact requests contain only the bijective 57-bit spelling hash.
+#[cfg(feature = "large-input")]
+#[derive(Clone, Copy)]
+pub struct Prepared(u64);
+#[cfg(feature = "large-input")]
+const READY: u64 = 1 << 63;
+#[cfg(feature = "large-input")]
+const SPILL: u64 = u64::MAX - 1;
+#[cfg(feature = "large-input")]
+const EXTERNAL: u64 = u64::MAX;
+
 impl PersonCache {
     #[inline]
     pub fn prepare(&self, _users: &Names, aliases: &Aliases, bytes: &[u8]) -> Prepared {
         let Some(key) = packed_name(bytes) else {
-            return Prepared::External;
+            #[cfg(not(feature = "large-input"))]
+            {
+                return Prepared::External;
+            }
+            #[cfg(feature = "large-input")]
+            {
+                return Prepared(EXTERNAL);
+            }
         };
         let Some(mixed) = mixed_word(key) else {
-            return Prepared::Spill(key);
+            #[cfg(not(feature = "large-input"))]
+            {
+                return Prepared::Spill(key);
+            }
+            #[cfg(feature = "large-input")]
+            {
+                return Prepared(SPILL);
+            }
         };
         let entry = &self.0[mixed as usize & (self.0.len() - 1)];
-        if entry.key == key {
-            return Prepared::Ready(entry.person);
+        #[cfg(not(feature = "large-input"))]
+        {
+            if entry.key == key {
+                return Prepared::Ready(entry.person);
+            }
+        }
+        #[cfg(feature = "large-input")]
+        {
+            if entry.key == mixed {
+                return Prepared(READY | u64::from(entry.person));
+            }
         }
         let directory = &aliases.table.directory;
         #[cfg(target_arch = "x86_64")]
@@ -1131,7 +1233,14 @@ impl PersonCache {
                 (&directory.lines[directory.home(mixed)] as *const Line).cast(),
             );
         }
-        Prepared::Compact(key, mixed)
+        #[cfg(not(feature = "large-input"))]
+        {
+            Prepared::Compact(key, mixed)
+        }
+        #[cfg(feature = "large-input")]
+        {
+            Prepared(mixed)
+        }
     }
 
     #[inline]
@@ -1143,29 +1252,64 @@ impl PersonCache {
         bytes: &[u8],
     ) -> u32 {
         let table = &aliases.table;
-        match job {
-            Prepared::Ready(id) => id,
-            Prepared::Compact(key, mixed) => {
+        #[cfg(not(feature = "large-input"))]
+        {
+            match job {
+                Prepared::Ready(id) => id,
+                Prepared::Compact(key, mixed) => {
+                    let id = table
+                        .directory
+                        .lookup(mixed, key, bytes, &table.overflow, users);
+                    let slot = mixed as usize & (self.0.len() - 1);
+                    self.0[slot] = CachedPerson { key, person: id };
+                    id
+                }
+                Prepared::Spill(key) => table
+                    .overflow
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| users.intern(text(bytes))),
+                Prepared::External => {
+                    let shard = users.hash.hash_one(bytes) as usize % SHARDS;
+                    let name = text(bytes);
+                    aliases.external[shard]
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| users.intern_in(shard, name))
+                }
+            }
+        }
+        #[cfg(feature = "large-input")]
+        {
+            let word = job.0;
+            if word < READY {
                 let id = table
                     .directory
-                    .lookup(mixed, key, bytes, &table.overflow, users);
-                let slot = mixed as usize & (self.0.len() - 1);
-                self.0[slot] = CachedPerson { key, person: id };
-                id
+                    .lookup(word, EMPTY_KEY, bytes, &table.overflow, users);
+                let slot = word as usize & (self.0.len() - 1);
+                self.0[slot] = CachedPerson {
+                    key: word,
+                    person: id,
+                };
+                return id;
             }
-            Prepared::Spill(key) => table
-                .overflow
-                .get(&key)
-                .copied()
-                .unwrap_or_else(|| users.intern(text(bytes))),
-            Prepared::External => {
-                let shard = users.hash.hash_one(bytes) as usize % SHARDS;
-                let name = text(bytes);
-                aliases.external[shard]
-                    .get(name)
+            if word < SPILL {
+                return word as u32;
+            }
+            if word == SPILL {
+                let key = packed_name(bytes).expect("spill kept original spelling");
+                return table
+                    .overflow
+                    .get(&key)
                     .copied()
-                    .unwrap_or_else(|| users.intern_in(shard, name))
+                    .unwrap_or_else(|| users.intern(text(bytes)));
             }
+            let shard = users.hash.hash_one(bytes) as usize % SHARDS;
+            let name = text(bytes);
+            aliases.external[shard]
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| users.intern_in(shard, name))
         }
     }
 
@@ -1179,6 +1323,30 @@ impl PersonCache {
 mod person_tests {
     use super::*;
 
+    #[cfg(feature = "large-input")]
+    #[test]
+    fn deferred_query_recovers_both_prefixes_and_zero_padding() {
+        for prefix in ['u', 'U'] {
+            for n in 0..65536 {
+                let name = format!("{prefix}{n:x}");
+                let raw = packed_name(name.as_bytes()).unwrap();
+                assert_eq!(
+                    materialize_key(EMPTY_KEY, mixed_word(raw).unwrap(), &[]),
+                    raw
+                );
+            }
+            let mut bytes = [127u8; 9];
+            bytes[0] = prefix as u8;
+            for i in 1..8 {
+                bytes[i] = 0;
+                let raw = packed_name(&bytes).unwrap();
+                assert_eq!(
+                    materialize_key(EMPTY_KEY, mixed_word(raw).unwrap(), &[]),
+                    raw
+                );
+            }
+        }
+    }
     #[test]
     fn directory_quotient_and_side_encode_the_complete_key() {
         let dir = Directory::new(1 << 16);

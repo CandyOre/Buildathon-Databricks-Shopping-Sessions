@@ -25,13 +25,59 @@ fn optimized_cpu() -> bool {
 fn optimized_cpu() -> bool {
     false
 }
+#[cfg(target_arch = "x86_64")]
+fn wide_vectors() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512cd")
+        && std::is_x86_feature_detected!("avx512dq")
+        && std::is_x86_feature_detected!("avx512vl")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn wide_vectors() -> bool {
+    false
+}
+
+// A longer run can hide the latency of random identity lookups by queuing
+// independent events. Small inputs avoid the longer wide-vector pipeline.
+fn large_csv_input(events: &std::path::Path, threshold: u64) -> bool {
+    let Ok(parts) = std::fs::read_dir(events) else {
+        return false;
+    };
+    let mut bytes = 0u64;
+    for part in parts.flatten() {
+        if !part.path().extension().is_some_and(|e| e == "csv") {
+            continue;
+        }
+        if let Ok(metadata) = part.metadata() {
+            if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+                if bytes >= threshold {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn main() {
     let supported = optimized_cpu();
-    let binary = if supported {
+    let data = std::env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into());
+    let binary = if supported
+        && wide_vectors()
+        && large_csv_input(&std::path::Path::new(&data).join("events"), 3 << 30)
+    {
+        "/usr/local/bin/large"
+    } else if supported {
         "/usr/local/bin/optimized"
     } else {
         "/usr/local/bin/portable"
     };
+    if std::env::var_os("PROFILE").is_some_and(|p| p == "1") {
+        eprintln!("selected scorer {binary}");
+    }
     let error = Command::new(binary)
         .args(std::env::args_os().skip(1))
         .exec();

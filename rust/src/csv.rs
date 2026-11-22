@@ -40,35 +40,71 @@ unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         }
     }
     let len = line.len();
-    let (a, qa) = unsafe { masks(line.as_ptr()) };
-    let (b, qb) = if len > 32 && len <= 64 {
-        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
-        (m >> (64 - len), q >> (64 - len))
-    } else if len > 64 {
-        unsafe { masks(line.as_ptr().add(32)) }
-    } else {
-        (0, 0)
+    let masks32 = || {
+        let (a, qa) = unsafe { masks(line.as_ptr()) };
+        let (b, qb) = if len > 32 && len <= 64 {
+            let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+            (m >> (64 - len), q >> (64 - len))
+        } else if len > 64 {
+            unsafe { masks(line.as_ptr().add(32)) }
+        } else {
+            (0, 0)
+        };
+        let (c, qc) = if len > 64 && len <= 96 {
+            let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+            (m >> (96 - len), q >> (96 - len))
+        } else if len > 96 {
+            unsafe { masks(line.as_ptr().add(64)) }
+        } else {
+            (0, 0)
+        };
+        let (d, qd) = if len > 96 {
+            let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
+            (m >> (128 - len), q >> (128 - len))
+        } else {
+            (0, 0)
+        };
+        (a | b << 32, c | d << 32, qa | qb << 32, qc | qd << 32)
     };
-    let (c, qc) = if len > 64 && len <= 96 {
-        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
-        (m >> (96 - len), q >> (96 - len))
-    } else if len > 96 {
-        unsafe { masks(line.as_ptr().add(64)) }
+    #[cfg(all(feature = "large-input", target_feature = "avx512bw"))]
+    let (mut low, mut high, qlow, qhigh) = if N == 7 && len > 64 {
+        unsafe { masks64(line) }
     } else {
-        (0, 0)
+        masks32()
     };
-    let (d, qd) = if len > 96 {
-        let (m, q) = unsafe { masks(line.as_ptr().add(len - 32)) };
-        (m >> (128 - len), q >> (128 - len))
-    } else {
-        (0, 0)
-    };
-    let mut low = a | b << 32;
-    let mut high = c | d << 32;
-    let quote_count = (qa | qb << 32).count_ones() + (qc | qd << 32).count_ones();
-    if (low.count_ones() + high.count_ones()) as usize + 1 != N {
+    #[cfg(not(all(feature = "large-input", target_feature = "avx512bw")))]
+    let (mut low, mut high, qlow, qhigh) = masks32();
+    let nlow = low.count_ones();
+    if (nlow + high.count_ones()) as usize + 1 != N {
         return None;
     }
+    #[cfg(feature = "large-input")]
+    if N == 7 && (3..=5).contains(&nlow) {
+        let cuts = event_cuts(low, high, nlow);
+        if qlow | qhigh == 0 {
+            return Some(event_slices::<N, false>(line, cuts, 0));
+        }
+        #[cfg(target_feature = "bmi2")]
+        {
+            let commas = u128::from(low) | (u128::from(high) << 64);
+            let quotes = u128::from(qlow) | (u128::from(qhigh) << 64);
+            let openings = quotes & ((commas << 1) | 1);
+            let ends = (commas >> 1) | (1u128 << (len - 1));
+            // Each opening borrows up to its own field's end and stops there.
+            // A one-byte quote would have both ends at the same position; XOR
+            // cancels them and rejects the row. Extra interior quotes also fail.
+            let closings = ends & !ends.wrapping_sub(openings);
+            if quotes != (openings ^ closings) {
+                return None;
+            }
+            let following = unsafe {
+                _pext_u64((quotes >> 1) as u64, low) | (_pext_u64(qhigh >> 1, high) << nlow)
+            };
+            let trims = ((following << 1) | (qlow & 1)) as usize;
+            return Some(event_slices::<N, true>(line, cuts, trims));
+        }
+    }
+    let quote_count = qlow.count_ones() + qhigh.count_ones();
     let mut result = [&[][..]; N];
     let mut matched_quotes = 0;
     let mut start = 0;
@@ -93,6 +129,102 @@ unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     }
     // Every quote must be one of the two outer bytes of its own field.
     (matched_quotes == quote_count).then_some(result)
+}
+
+// Event rows of 65--128 bytes fit in two legal overlapping 64-byte loads.
+// Discard the overlap in the trailing masks so that bit zero of the second
+// pair describes byte 64 in the input.
+#[cfg(feature = "large-input")]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn masks64(line: &[u8]) -> (u64, u64, u64, u64) {
+    let (low, tail, qlow, qtail): (u64, u64, u64, u64);
+    unsafe {
+        std::arch::asm!(
+            "vpbroadcastb zmm0, {comma:e}",
+            "vpbroadcastb zmm1, {quote:e}",
+            "vmovdqu64 zmm2, [{head}]",
+            "vmovdqu64 zmm3, [{last}]",
+            "vpcmpeqb k1, zmm2, zmm0",
+            "vpcmpeqb k2, zmm3, zmm0",
+            "vpcmpeqb k3, zmm2, zmm1",
+            "vpcmpeqb k4, zmm3, zmm1",
+            "kmovq {low}, k1",
+            "kmovq {tail}, k2",
+            "kmovq {qlow}, k3",
+            "kmovq {qtail}, k4",
+            comma = in(reg) u32::from(b','),
+            quote = in(reg) u32::from(b'"'),
+            head = in(reg) line.as_ptr(),
+            last = in(reg) line.as_ptr().add(line.len() - 64),
+            low = lateout(reg) low, tail = lateout(reg) tail,
+            qlow = lateout(reg) qlow, qtail = lateout(reg) qtail,
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+            out("k1") _, out("k2") _, out("k3") _, out("k4") _,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    let skip = 128 - line.len();
+    (low, tail >> skip, qlow, qtail >> skip)
+}
+
+// The first three delimiters and the last delimiter can be extracted on
+// independent chains. Only the middle two depend on which half owns them.
+#[cfg(feature = "large-input")]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn event_cuts(low: u64, high: u64, nlow: u32) -> [usize; 6] {
+    let low1 = low & (low - 1);
+    let low2 = low1 & (low1 - 1);
+    debug_assert!((3..=5).contains(&nlow));
+    let low3 = low2 & (low2 - 1);
+    let high_last = 63 - high.leading_zeros();
+    let high_rest = high ^ (1u64 << high_last);
+    let d = if low3 != 0 {
+        low3.trailing_zeros()
+    } else {
+        64 + high.trailing_zeros()
+    };
+    let e = if high_rest != 0 {
+        127 - high_rest.leading_zeros()
+    } else {
+        63 - low.leading_zeros()
+    };
+    [
+        low.trailing_zeros(),
+        low1.trailing_zeros(),
+        low2.trailing_zeros(),
+        d,
+        e,
+        64 + high_last,
+    ]
+    .map(|p| p as usize)
+}
+
+#[cfg(feature = "large-input")]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn event_slices<const N: usize, const QUOTED: bool>(
+    line: &[u8],
+    cuts: [usize; 6],
+    trims: usize,
+) -> [&[u8]; N] {
+    let [a, b, c, d, e, f] = cuts;
+    let field = |index: usize, start: usize, end: usize| {
+        let trim = if QUOTED { (trims >> index) & 1 } else { 0 };
+        // The six delimiters are in increasing order within the row. A set
+        // trim bit certifies two distinct outer quotes for its field.
+        unsafe { line.get_unchecked(start + trim..end - trim) }
+    };
+    let mut result = [&[][..]; N];
+    result[0] = field(0, 0, a);
+    result[1] = field(1, a + 1, b);
+    result[2] = field(2, b + 1, c);
+    result[3] = field(3, c + 1, d);
+    result[4] = field(4, d + 1, e);
+    result[5] = field(5, e + 1, f);
+    result[6] = field(6, f + 1, line.len());
+    result
 }
 
 fn fields_portable<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
@@ -141,6 +273,51 @@ mod field_tests {
                 let mut line = vec![b'a'; padding];
                 line.extend_from_slice(suffix);
                 assert_eq!(fields::<7>(&line), fields_portable::<7>(&line));
+            }
+        }
+    }
+
+    #[cfg(feature = "large-input")]
+    #[test]
+    fn seven_slices_match_every_quoting_pattern_and_mutated_boundaries() {
+        for timestamp_width in [13, 20, 25] {
+            let timestamp = vec![b'9'; timestamp_width];
+            for empty_product in [false, true] {
+                let product: &[u8] = if empty_product { b"" } else { b"p12345" };
+                let values: [&[u8]; 7] = [
+                    b"e12345678",
+                    b"u12345678",
+                    &timestamp,
+                    b"2028-02-29T00:00:00Z",
+                    b"view",
+                    product,
+                    b"",
+                ];
+                for quoted in 0..128 {
+                    let mut line = Vec::new();
+                    for (index, value) in values.iter().enumerate() {
+                        if index != 0 {
+                            line.push(b',');
+                        }
+                        let wrapped = quoted & (1 << index) != 0;
+                        if wrapped {
+                            line.push(b'"');
+                        }
+                        line.extend_from_slice(value);
+                        if wrapped {
+                            line.push(b'"');
+                        }
+                    }
+                    assert_eq!(fields::<7>(&line), Some(values));
+                    for i in 0..line.len() {
+                        let keep = line[i];
+                        for byte in [b'"', b',', b'\r'] {
+                            line[i] = byte;
+                            assert_eq!(fields::<7>(&line), fields_portable::<7>(&line));
+                        }
+                        line[i] = keep;
+                    }
+                }
             }
         }
     }
