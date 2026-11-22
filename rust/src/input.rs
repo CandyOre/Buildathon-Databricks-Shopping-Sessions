@@ -575,41 +575,41 @@ pub struct Dimensions {
 impl Dimensions {
     pub fn read(data: &Path) -> Result<Self> {
         let read_products = || -> Result<_> {
-        let mut pairs = Vec::new();
-        scan_file(&data.join("products.csv"), |row| {
-            if let Some([product, category]) = fields(row) {
-                pairs.push((text(product).to_owned(), text(category).to_owned()));
-            }
-        })?;
-        let mut categories: Vec<_> = pairs.iter().map(|(_, category)| category.clone()).collect();
-        categories.push("unknown".into());
-        categories.sort_unstable();
-        categories.dedup();
-        let unknown_category = categories
-            .binary_search_by(|s| s.as_str().cmp("unknown"))
-            .unwrap() as u32;
-        let products = pairs
-            .into_iter()
-            .map(|(product, category)| {
-                (product, categories.binary_search(&category).unwrap() as u32)
-            })
-            .collect();
-        Ok((categories, products, unknown_category))
+            let mut pairs = Vec::new();
+            scan_file(&data.join("products.csv"), |row| {
+                if let Some([product, category]) = fields(row) {
+                    pairs.push((text(product).to_owned(), text(category).to_owned()));
+                }
+            })?;
+            let mut categories: Vec<_> = pairs.iter().map(|(_, category)| category.clone()).collect();
+            categories.push("unknown".into());
+            categories.sort_unstable();
+            categories.dedup();
+            let unknown_category = categories
+                .binary_search_by(|s| s.as_str().cmp("unknown"))
+                .unwrap() as u32;
+            let products = pairs
+                .into_iter()
+                .map(|(product, category)| {
+                    (product, categories.binary_search(&category).unwrap() as u32)
+                })
+                .collect();
+            Ok((categories, products, unknown_category))
         };
         let read_campaigns = || -> Result<_> {
-        let mut campaigns = vec![("organic".into(), "organic".into())];
-        scan_file(&data.join("campaigns.csv"), |row| {
-            if let Some([campaign, channel]) = fields(row) {
-                campaigns.push((text(campaign).to_owned(), text(channel).to_owned()));
-            }
-        })?;
-        let campaign_ids = campaigns
-            .iter()
-            .enumerate()
-            .skip(1)
-            .map(|(id, (campaign, _))| (campaign.clone(), id as u32))
-            .collect();
-        Ok((campaigns, campaign_ids))
+            let mut campaigns = vec![("organic".into(), "organic".into())];
+            scan_file(&data.join("campaigns.csv"), |row| {
+                if let Some([campaign, channel]) = fields(row) {
+                    campaigns.push((text(campaign).to_owned(), text(channel).to_owned()));
+                }
+            })?;
+            let campaign_ids = campaigns
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(id, (campaign, _))| (campaign.clone(), id as u32))
+                .collect();
+            Ok((campaigns, campaign_ids))
         };
         let (products, campaigns) = if perf_on("PERF_DIM_PARALLEL") {
             rayon::join(read_products, read_campaigns)
@@ -1087,6 +1087,10 @@ impl LinkGraph {
         // There are at most two distinct endpoints per edge. Leave a free slot
         // for the terminating search, even when every endpoint is distinct.
         let capacity = (2 * edges + 1).max(1024).next_power_of_two();
+        Self::with_capacity(capacity, external_names)
+    }
+
+    fn with_capacity(capacity: usize, external_names: Vec<Vec<Arc<str>>>) -> Self {
         assert!(capacity <= u32::MAX as usize, "too many linked names");
         let entries = (0..capacity)
             .into_par_iter()
@@ -1102,26 +1106,75 @@ impl LinkGraph {
     }
 
     fn slot_for_link(&self, key: u64, hash: usize) -> u32 {
+        self.find_slot::<false>(key, hash).expect("the full graph has room for all endpoints")
+    }
+
+    fn find_slot<const BOUNDED: bool>(&self, key: u64, hash: usize) -> Option<u32> {
         let mask = self.entries.len() - 1;
         let mut index = hash & mask;
+        let mut probes = 0;
         loop {
+            if BOUNDED {
+                probes += 1;
+                if probes > 64 { return None; }
+            }
             let slot = &self.entries[index];
             let stored = slot.key.load(Ordering::Acquire);
             if stored == key {
-                return index as u32;
+                return Some(index as u32);
             }
             if stored == EMPTY_KEY {
                 match slot
                     .key
                     .compare_exchange(EMPTY_KEY, key, Ordering::AcqRel, Ordering::Acquire)
                 {
-                    Ok(_) => return index as u32,
-                    Err(raced) if raced == key => return index as u32,
+                    Ok(_) => return Some(index as u32),
+                    Err(raced) if raced == key => return Some(index as u32),
                     Err(_) => {}
                 }
             }
             index = (index + 1) & mask;
         }
+    }
+
+    fn connect<const BOUNDED: bool>(
+        &self, batches: &[Vec<(u64, u64)>], hash: &RandomState, prefetch: bool,
+    ) -> bool {
+        let edge = |l, lh, r, rh| -> Option<()> {
+            self.join(self.find_slot::<BOUNDED>(l, lh)?, self.find_slot::<BOUNDED>(r, rh)?);
+            Some(())
+        };
+        batches.par_iter().all(|edges| edges.par_chunks(4096).all(|part| {
+            if !prefetch {
+                return part.iter().all(|&(l,r)| {
+                    edge(l, hash.hash_one(l) as usize, r, hash.hash_one(r) as usize).is_some()
+                });
+            }
+            for group in part.chunks(32) {
+                let mut short = [(0, 0, 0, 0); 32];
+                let mut n = 0;
+                for &(l,r) in group {
+                    let lh = hash.hash_one(l) as usize;
+                    let rh = hash.hash_one(r) as usize;
+                    if l >= EXTERNAL_NAME || r >= EXTERNAL_NAME {
+                        if edge(l, lh, r, rh).is_none() { return false; }
+                    } else {
+                        #[cfg(target_arch = "x86_64")]
+                        for h in [lh,rh] {
+                            let address = &self.entries[h & (self.entries.len()-1)];
+                            unsafe { std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(
+                                (address as *const Entry).cast()); }
+                        }
+                        short[n] = (l,lh,r,rh);
+                        n += 1;
+                    }
+                }
+                for &(l,lh,r,rh) in &short[..n] {
+                    if edge(l, lh, r, rh).is_none() { return false; }
+                }
+            }
+            true
+        }))
     }
 
     fn root(&self, mut id: u32) -> u32 {
@@ -1302,16 +1355,26 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
             (state.ids, state.names)
         })
         .unzip();
-    let graph = LinkGraph::new(edge_count, external_names);
-    batches.into_par_iter().for_each(|edges| {
-        edges.par_chunks(4096).for_each(|part| {
-            for &(left, right) in part {
-                let a = graph.slot_for_link(left, users.hash.hash_one(left) as usize);
-                let b = graph.slot_for_link(right, users.hash.hash_one(right) as usize);
-                graph.join(a, b);
-            }
-        });
-    });
+    let prefetch = perf_on("PERF_LINK_PREFETCH");
+    let compact = perf_on("PERF_LINK_COMPACT");
+    let graph = if compact {
+        let capacity = (edge_count + edge_count / 4 + 1).max(1024).next_power_of_two();
+        let graph = LinkGraph::with_capacity(capacity, external_names);
+        if graph.connect::<true>(&batches, &users.hash, prefetch) {
+            graph
+        } else {
+            let names = graph.external_names;
+            drop(graph.entries);
+            let full = LinkGraph::new(edge_count, names);
+            assert!(full.connect::<false>(&batches, &users.hash, prefetch));
+            full
+        }
+    } else {
+        let graph = LinkGraph::new(edge_count, external_names);
+        assert!(graph.connect::<false>(&batches, &users.hash, prefetch));
+        graph
+    };
+    drop(batches);
     let table = graph.finish(&mut external, &users.hash);
     let dynamic_start = table.canonical.len().div_ceil(SHARDS);
     for shard in &mut users.shards {
@@ -1509,6 +1572,22 @@ impl PersonCache {
 #[cfg(test)]
 mod person_tests {
     use super::*;
+
+    #[test]
+    fn bounded_link_graph_retries_without_losing_components() {
+        let hash = RandomState::new();
+        let batches = vec![(0u64..300).map(|n| (n * 2, n * 2 + 1)).collect::<Vec<_>>()];
+        let small = LinkGraph::with_capacity(16, Vec::new());
+        assert!(!small.connect::<true>(&batches, &hash, true));
+        let full = LinkGraph::new(batches[0].len(), Vec::new());
+        assert!(full.connect::<false>(&batches, &hash, true));
+        for &(a,b) in &batches[0] {
+            let a_slot = full.slot_for_link(a, hash.hash_one(a) as usize);
+            let b_slot = full.slot_for_link(b, hash.hash_one(b) as usize);
+            assert_eq!(full.root(a_slot), full.root(b_slot));
+            assert_eq!(full.entries[full.root(a_slot) as usize].key.load(Ordering::Relaxed), a);
+        }
+    }
 
     #[cfg(feature = "large-input")]
     #[test]
