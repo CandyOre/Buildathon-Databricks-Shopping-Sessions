@@ -1138,13 +1138,16 @@ impl LinkGraph {
     }
 
     fn connect<const BOUNDED: bool>(
-        &self, batches: &[Vec<(u64, u64)>], hash: &RandomState, prefetch: bool,
+        &self, batches: &[Vec<(u64, u64)>], hash: &RandomState, prefetch: bool, prefetched: &AtomicU64,
     ) -> bool {
         let edge = |l, lh, r, rh| -> Option<()> {
             self.join(self.find_slot::<BOUNDED>(l, lh)?, self.find_slot::<BOUNDED>(r, rh)?);
             Some(())
         };
+        let profile = crate::csv::work_enabled();
         batches.par_iter().all(|edges| edges.par_chunks(4096).all(|part| {
+            let mut local = 0;
+            let complete = (|| {
             if !prefetch {
                 return part.iter().all(|&(l,r)| {
                     edge(l, hash.hash_one(l) as usize, r, hash.hash_one(r) as usize).is_some()
@@ -1159,6 +1162,7 @@ impl LinkGraph {
                     if l >= EXTERNAL_NAME || r >= EXTERNAL_NAME {
                         if edge(l, lh, r, rh).is_none() { return false; }
                     } else {
+                        if profile { local += 2; }
                         #[cfg(target_arch = "x86_64")]
                         for h in [lh,rh] {
                             let address = &self.entries[h & (self.entries.len()-1)];
@@ -1174,6 +1178,9 @@ impl LinkGraph {
                 }
             }
             true
+            })();
+            if profile { prefetched.fetch_add(local, Ordering::Relaxed); }
+            complete
         }))
     }
 
@@ -1357,23 +1364,38 @@ pub fn read_aliases(data: &Path, users: &mut Names) -> Result<Aliases> {
         .unzip();
     let prefetch = perf_on("PERF_LINK_PREFETCH");
     let compact = perf_on("PERF_LINK_COMPACT");
+    let prefetched = AtomicU64::new(0);
+    let mut retried = false;
     let graph = if compact {
         let capacity = (edge_count + edge_count / 4 + 1).max(1024).next_power_of_two();
         let graph = LinkGraph::with_capacity(capacity, external_names);
-        if graph.connect::<true>(&batches, &users.hash, prefetch) {
+        if graph.connect::<true>(&batches, &users.hash, prefetch, &prefetched) {
             graph
         } else {
+            retried = true;
             let names = graph.external_names;
             drop(graph.entries);
             let full = LinkGraph::new(edge_count, names);
-            assert!(full.connect::<false>(&batches, &users.hash, prefetch));
+            assert!(full.connect::<false>(&batches, &users.hash, prefetch, &prefetched));
             full
         }
     } else {
         let graph = LinkGraph::new(edge_count, external_names);
-        assert!(graph.connect::<false>(&batches, &users.hash, prefetch));
+        assert!(graph.connect::<false>(&batches, &users.hash, prefetch, &prefetched));
         graph
     };
+    if crate::csv::work_enabled() {
+        let mut sizes: Vec<_> = batches.iter().map(Vec::len).collect();
+        sizes.sort_unstable();
+        let short_pairs: usize = batches.iter().map(|b| b.iter().filter(|&&(l,r)| l<EXTERNAL_NAME && r<EXTERNAL_NAME).count()).sum();
+        eprintln!("profile {}", serde_json::json!({
+            "stage":"work_link_graph", "edges":edge_count, "short_pairs":short_pairs,
+            "max_task_edges":sizes.last().copied().unwrap_or(0),
+            "median_task_edges":sizes.get(sizes.len()/2).copied().unwrap_or(0),
+            "requested_prefetches":prefetched.load(Ordering::Relaxed),
+            "capacity_retries":usize::from(retried), "final_slots":graph.entries.len(),
+        }));
+    }
     drop(batches);
     let table = graph.finish(&mut external, &users.hash);
     let dynamic_start = table.canonical.len().div_ceil(SHARDS);
@@ -1578,9 +1600,10 @@ mod person_tests {
         let hash = RandomState::new();
         let batches = vec![(0u64..300).map(|n| (n * 2, n * 2 + 1)).collect::<Vec<_>>()];
         let small = LinkGraph::with_capacity(16, Vec::new());
-        assert!(!small.connect::<true>(&batches, &hash, true));
+        let counted = AtomicU64::new(0);
+        assert!(!small.connect::<true>(&batches, &hash, true, &counted));
         let full = LinkGraph::new(batches[0].len(), Vec::new());
-        assert!(full.connect::<false>(&batches, &hash, true));
+        assert!(full.connect::<false>(&batches, &hash, true, &counted));
         for &(a,b) in &batches[0] {
             let a_slot = full.slot_for_link(a, hash.hash_one(a) as usize);
             let b_slot = full.slot_for_link(b, hash.hash_one(b) as usize);

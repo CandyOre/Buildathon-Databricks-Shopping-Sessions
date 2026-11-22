@@ -405,13 +405,16 @@ impl Mapping {
         }
     }
 
-    fn span(&self, start: u64, end: u64, visit: &mut impl FnMut(&[u8])) {
+    fn span(&self, start: u64, end: u64, visit: &mut impl FnMut(&[u8])) -> (usize, usize) {
         let bytes = unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.len) };
         let start = (start as usize).min(bytes.len());
         let end = usize::try_from(end).unwrap_or(usize::MAX).min(bytes.len());
         let before = start.saturating_sub(1);
+        let mut scanned = end - before;
+        let mut overrun = 0;
         if before < end {
             if let Some(newline) = memchr(b'\n', &bytes[before..end]) {
+                scanned = newline + 1;
                 let first = before + newline + 1;
                 if first < end {
                     let last = if end == bytes.len() || bytes[end - 1] == b'\n' {
@@ -419,6 +422,8 @@ impl Mapping {
                     } else {
                         memchr(b'\n', &bytes[end..]).map_or(bytes.len(), |offset| end + offset + 1)
                     };
+                    overrun = last - end;
+                    scanned += overrun + last - first;
                     visit(&bytes[first..last]);
                 }
             }
@@ -433,6 +438,7 @@ impl Mapping {
                 unsafe { libc::madvise(self.data.as_ptr().add(first).cast(), last - first, libc::MADV_DONTNEED); }
             }
         }
+        (scanned, overrun)
     }
 }
 
@@ -458,6 +464,82 @@ fn each_line<'a>(bytes: &'a [u8], row: &mut impl FnMut(&'a [u8])) {
     if start < bytes.len() { row(&bytes[start..]); }
 }
 
+pub(crate) fn work_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| perf_on("PROFILE_WORK"))
+}
+
+#[derive(Default)]
+struct IoWork {
+    reads: u64,
+    read_bytes: u64,
+    mapped: u64,
+    mapped_scan_bytes: u64,
+    overrun: u64,
+}
+
+impl IoWork {
+    fn read(&mut self, offset: u64, len: usize, end: u64) {
+        self.reads += 1;
+        self.read_bytes += len as u64;
+        self.overrun += (offset + len as u64).saturating_sub(end) - offset.saturating_sub(end);
+    }
+}
+
+const WORK_NAMES: [&str; 19] = ["tasks", "nominal_bytes", "read_calls", "read_bytes", "mapped_tasks",
+    "mapped_scan_bytes", "overrun_bytes", "rows", "row_bytes", "quoted_rows", "malformed_rows",
+    "canonical_id_rows", "other_id_rows", "ts_f1_shape", "ts_f2_shape", "ts_epoch_digits",
+    "ts_other", "over_128b_rows", "over_128k_rows"];
+const GROUPS: [&str; 4] = ["events", "clicks", "links", "dimensions"];
+type Counts = [u64; WORK_NAMES.len()];
+static TOTALS: std::sync::Mutex<[Counts; 4]> = std::sync::Mutex::new([[0; WORK_NAMES.len()]; 4]);
+
+fn profile_group(path: &Path) -> usize {
+    let folder = path.parent().and_then(Path::file_name).and_then(|s| s.to_str());
+    GROUPS[..3].iter().position(|&s| Some(s) == folder).unwrap_or(3)
+}
+
+fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
+    counts[7] += 1;
+    counts[8] += line.len() as u64;
+    counts[9] += u64::from(memchr(b'"', line).is_some());
+    counts[17] += u64::from(line.len() > 128);
+    counts[18] += u64::from(line.len() > 128 * 1024);
+    let pair = match group {
+        0 => fields::<7>(line).map(|f| (f[0],f[2],b'e')),
+        1 => fields::<4>(line).map(|f| (f[0],f[3],b'k')),
+        _ => {
+            counts[10] += u64::from(fields::<2>(line).is_none());
+            return;
+        }
+    };
+    let Some((id, ts, prefix)) = pair else { counts[10] += 1; return; };
+    let canonical = id.first() == Some(&prefix) &&
+        (matches!(id.len(), 2..=9) && id[1..].iter().all(|v| v.is_ascii_digit() || v.is_ascii_lowercase())
+         || id.len() == 33 && id[1..].iter().all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(v)));
+    counts[if canonical {11} else {12}] += 1;
+    let format = if ts.len()==20 && ts[10]==b'T' && ts[19]==b'Z' { 13 }
+        else if ts.len()==25 && ts[10]==b'T' && matches!(ts[19],b'+'|b'-') {14}
+        else if !ts.is_empty() && ts.iter().all(u8::is_ascii_digit) {15} else {16};
+    counts[format] += 1;
+}
+
+fn submit_work(group: usize, nominal: u64, io: IoWork, mut counts: Counts) {
+    counts[..7].copy_from_slice(&[1, nominal, io.reads, io.read_bytes, io.mapped, io.mapped_scan_bytes, io.overrun]);
+    for (d,s) in TOTALS.lock().unwrap()[group].iter_mut().zip(counts) { *d += s; }
+}
+
+pub fn print_work() {
+    if !work_enabled() { return; }
+    let totals = TOTALS.lock().unwrap();
+    for (name, counts) in GROUPS.into_iter().zip(totals.iter()) {
+        let mut record = serde_json::Map::new();
+        record.insert("stage".into(), format!("work_csv_{name}").into());
+        for (&key, &value) in WORK_NAMES.iter().zip(counts) { record.insert(key.into(), value.into()); }
+        eprintln!("profile {}", serde_json::Value::Object(record));
+    }
+}
+
 struct ScanBuffer {
     bytes: Vec<u8>,
     partial_line: Vec<u8>,
@@ -476,9 +558,20 @@ impl Chunk {
     }
 
     pub fn scan(&self, mut row: impl FnMut(&[u8])) -> Result<()> {
+        let mut io = IoWork::default();
+        if !work_enabled() { return self.scan_inner::<false>(row, &mut io); }
+        let group = profile_group(&self.source.path);
+        let mut counts = Counts::default();
+        let result = self.scan_inner::<true>(|line| { observe_line(&mut counts, group, line); row(line); }, &mut io);
+        submit_work(group, self.end-self.start, io, counts);
+        result
+    }
+
+    fn scan_inner<const WORK: bool>(&self, mut row: impl FnMut(&[u8]), io: &mut IoWork) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(map) = &self.source.mapping {
-            map.span(self.start, self.end, &mut |span| each_line(span, &mut row));
+            let (n, extra) = map.span(self.start, self.end, &mut |span| each_line(span, &mut row));
+            if WORK { io.mapped = 1; io.mapped_scan_bytes=n as u64; io.overrun=extra as u64; }
             return Ok(());
         }
         let mut file = File::open(&self.source.path)?;
@@ -498,6 +591,7 @@ impl Chunk {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     result => result?,
                 };
+                if WORK { io.read(offset, len, self.end); }
                 if len == 0 {
                     if !partial_line.is_empty() {
                         row(partial_line);
@@ -537,9 +631,23 @@ impl Chunk {
     // The last record at EOF may have no LF. This lets a numeric decoder hold
     // borrowed fields from several adjacent rows while their buffer is live.
     fn spans(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
+        let mut io = IoWork::default();
+        if !work_enabled() { return self.spans_inner::<false>(visit,&mut io); }
+        let group = profile_group(&self.source.path);
+        let mut counts = Counts::default();
+        let result = self.spans_inner::<true>(|span| {
+            each_line(span, &mut |line| observe_line(&mut counts,group,line));
+            visit(span);
+        }, &mut io);
+        submit_work(group,self.end-self.start,io,counts);
+        result
+    }
+
+    fn spans_inner<const WORK: bool>(&self, mut visit: impl FnMut(&[u8]), io: &mut IoWork) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(map) = &self.source.mapping {
-            map.span(self.start, self.end, &mut visit);
+            let (n, extra) = map.span(self.start, self.end, &mut visit);
+            if WORK { io.mapped=1; io.mapped_scan_bytes=n as u64; io.overrun=extra as u64; }
             return Ok(());
         }
         let mut file = File::open(&self.source.path)?;
@@ -554,6 +662,7 @@ impl Chunk {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     result => result?,
                 };
+                if WORK { io.read(offset,n,self.end); }
                 if n == 0 {
                     if !partial_line.is_empty() { visit(partial_line); }
                     return Ok(());
@@ -759,10 +868,11 @@ mod scan_tests {
 }
 
 pub fn scan_file(path: &Path, row: impl FnMut(&[u8])) -> Result<()> {
+    let len = path.metadata()?.len();
     Chunk {
-        source: Arc::new(Source::new(path.to_owned(), path.metadata()?.len(), use_mmap())),
+        source: Arc::new(Source::new(path.to_owned(), len, use_mmap())),
         start: 0,
-        end: u64::MAX,
+        end: len,
     }
     .scan(row)
     .with_context(|| format!("reading {}", path.display()))
