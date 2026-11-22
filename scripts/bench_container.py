@@ -30,6 +30,7 @@ def main():
     parser.add_argument("volume")
     parser.add_argument("dataset", help="input subdirectory on the volume")
     parser.add_argument("images", nargs="+", help="image tags in actual run order")
+    parser.add_argument("--variants", type=Path, help="optional JSON mapping labels to an image and environment")
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
@@ -38,6 +39,7 @@ def main():
                         help="check resident input pages before each run and log the result")
     parser.add_argument("--export", type=Path, help="copy the last run's output to a new directory")
     args = parser.parse_args()
+    variants = json.loads(args.variants.read_text(encoding="utf8")) if args.variants else {}
     if args.export and args.export.exists():
         parser.error("--export must refer to a new directory")
     args.log.parent.mkdir(parents=True, exist_ok=True)
@@ -82,7 +84,12 @@ def main():
             command += ["-e", "PROFILE=1"]
         try:
             start = perf_counter()
-            result = subprocess.run(["docker", *command, image], text=True, capture_output=True)
+            variant = variants.get(image)
+            if variant:
+                for key, value in variant.get("env", {}).items():
+                    command += ["-e", f"{key}={value}"]
+            actual_image = variant["image"] if variant else image
+            result = subprocess.run(["docker", *command, actual_image], text=True, capture_output=True)
             host_wall = perf_counter() - start
             print(result.stderr, end="", flush=True)
             result.check_returncode()
@@ -98,6 +105,12 @@ def main():
                        resident_bytes_after_eviction=resident_bytes if args.cache == "evict" else None,
                        stages=[json.loads(line[8:]) for line in result.stderr.splitlines()
                                if line.startswith("profile ")])
+            if variant:
+                row.update(image_ref=actual_image, environment=variant.get("env", {}))
+            if args.profile:
+                close = next((s.get("epoch_us") for s in row["stages"] if s["stage"]=="write_parquet"), None)
+                if close:
+                    row["write_to_exit_s"] = datetime.fromisoformat(state["FinishedAt"]).timestamp() - close / 1e6
             with args.log.open("a", encoding="utf-8") as file:
                 print(json.dumps(row), file=file)
             print(f"{image} {args.dataset}  container {duration:.6f}s  CLI {host_wall:.6f}s", flush=True)

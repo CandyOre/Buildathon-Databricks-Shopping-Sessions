@@ -4,6 +4,8 @@ mod input;
 mod output;
 mod profile;
 mod records;
+mod routed;
+mod runtime;
 
 use std::env;
 use std::path::PathBuf;
@@ -26,22 +28,43 @@ fn main() -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()?;
-    let window = input::Window::read(&data)?;
-    let dimensions = input::Dimensions::read(&data)?;
-    let mut users = input::Names::default();
-    let aliases = input::read_aliases(&data, &mut users)?;
-    profile.stage("load_dimensions_and_links");
+    let (window, dimensions) = if runtime::flag("PERF_PARALLEL_SETUP") {
+        enum Setup { Window(input::Window), Tables(input::Dimensions) }
+        let first = data.clone();
+        let second = data.clone();
+        let mut jobs = runtime::run::<Result<Setup>>(vec![
+            Box::new(move || input::Window::read(&first).map(Setup::Window)),
+            Box::new(move || input::Dimensions::read(&second).map(Setup::Tables)),
+        ]).into_iter();
+        match (jobs.next().unwrap()?, jobs.next().unwrap()?) {
+            (Setup::Window(w), Setup::Tables(d)) => (w, d),
+            _ => unreachable!(),
+        }
+    } else {
+        (input::Window::read(&data)?, input::Dimensions::read(&data)?)
+    };
+    let (mut session_batches, clicks, click_ids, user_names, event_count) =
+        if runtime::flag("PERF_ROUTE") {
+            profile.stage("load_dimensions");
+            let rows = routed::run(&data, window, &dimensions)?;
+            profile.stage("route_and_sessionize");
+            rows
+        } else {
+            let mut users = input::Names::default();
+            let aliases = input::read_aliases(&data, &mut users)?;
+            profile.stage("load_dimensions_and_links");
+            let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
+            profile.stage("parse_events");
+            let (sessions, count) = records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
+            profile.stage("dedup_and_sessionize");
+            let (clicks, ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
+            drop(aliases);
+            let names = users.into_people();
+            profile.stage("parse_and_sort_clicks");
+            (sessions, clicks, ids, names, count)
+        };
 
-    let candidates = records::read_events(&data, window, &dimensions, &users, &aliases)?;
-    profile.stage("parse_events");
-    let (mut session_batches, event_count) =
-        records::dedup_and_sessionize(candidates, users.person_slots_per_shard());
-    profile.stage("dedup_and_sessionize");
-    let (clicks, click_ids) = records::read_clicks(&data, window, &dimensions, &users, &aliases)?;
-    drop(aliases);
-    let user_names = users.into_people();
-    profile.stage("parse_and_sort_clicks");
-
+    let dictionaries = output::prepare_names(&session_batches, &user_names)?;
     let campaign_daily = aggregate::campaign_daily(
         &mut session_batches,
         clicks,
@@ -54,11 +77,15 @@ fn main() -> Result<()> {
         &out,
         session_batches,
         campaign_daily,
-        &user_names,
-        &dimensions,
+        user_names,
+        dimensions,
+        dictionaries,
     )?;
     profile.stage("write_parquet");
     profile.finish();
     eprintln!("Wrote user_daily and campaign_daily from {event_count} valid, deduplicated events");
+    if runtime::flag("PERF_EXIT_AFTER_CLOSE") {
+        std::process::exit(0);
+    }
     Ok(())
 }

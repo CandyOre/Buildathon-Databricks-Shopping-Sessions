@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
@@ -16,31 +16,89 @@ use crate::input::{Dimensions, PersonNames};
 const BATCH_SIZE: usize = 65_536;
 const USER_PARTS: usize = 8;
 
+struct Options {
+    rows: usize,
+    buffer: usize,
+    plain: bool,
+    merge: bool,
+    workers: usize,
+}
+
+fn options() -> &'static Options {
+    static OPTIONS: OnceLock<Options> = OnceLock::new();
+    OPTIONS.get_or_init(|| Options {
+        rows: crate::runtime::number("PERF_GROUP_ROWS", BATCH_SIZE).clamp(1, i32::MAX as usize),
+        buffer: crate::runtime::number("PERF_WRITE_BUFFER", 256 << 10).clamp(4096, 16 << 20),
+        plain: crate::runtime::flag("PERF_USER_PLAIN"),
+        merge: crate::runtime::flag("PERF_MERGE_GROUPS"),
+        workers: crate::runtime::number("PERF_WRITERS", USER_PARTS).clamp(1, USER_PARTS),
+    })
+}
+
+#[derive(Default)]
+pub struct PreparedNames {
+    // (exclusive end row, start byte of the length-prefixed UTF-8 name).
+    runs: Vec<(usize, usize)>,
+    bytes: Vec<u8>,
+}
+
+pub fn prepare_names(batches: &[SessionBatch], names: &PersonNames) -> Result<Option<Vec<PreparedNames>>> {
+    if !crate::runtime::flag("PERF_PREPARE_NAMES") { return Ok(None); }
+    (0..USER_PARTS).into_par_iter().map(|part| {
+        let start = (part * batches.len()).div_ceil(USER_PARTS);
+        let end = ((part + 1) * batches.len()).div_ceil(USER_PARTS);
+        let mut dictionary = PreparedNames::default();
+        let mut buffer = [0; 9];
+        let mut last = None;
+        for (i, &person) in batches[start..end].iter().flat_map(|b| &b.daily.person).enumerate() {
+            if last != Some(person) {
+                let name = names.get(person, &mut buffer);
+                let offset = dictionary.bytes.len();
+                dictionary.bytes.extend_from_slice(&i32::try_from(name.len())?.to_le_bytes());
+                dictionary.bytes.extend_from_slice(name.as_bytes());
+                dictionary.runs.push((i + 1, offset));
+                last = Some(person);
+            } else {
+                dictionary.runs.last_mut().unwrap().0 = i + 1;
+            }
+        }
+        Ok(dictionary)
+    }).collect::<Result<Vec<_>>>().map(Some)
+}
+
 pub fn write(
     output: &Path,
     users: Vec<SessionBatch>,
     campaigns: CampaignDays,
-    names: &PersonNames,
-    dimensions: &Dimensions,
+    names: PersonNames,
+    dimensions: Dimensions,
+    dictionaries: Option<Vec<PreparedNames>>,
 ) -> Result<()> {
-    let (user_result, campaign_result) = rayon::join(
-        || {
-            let shards = users.len();
-            let mut parts: [Vec<_>; USER_PARTS] = std::array::from_fn(|_| Vec::new());
-            for (i, shard) in users.into_iter().enumerate() {
-                parts[i * USER_PARTS / shards].push(shard);
+    let shards = users.len();
+    let mut parts: [Vec<_>; USER_PARTS] = std::array::from_fn(|_| Vec::new());
+    for (i, batch) in users.into_iter().enumerate() {
+        parts[i * USER_PARTS / shards].push(batch);
+    }
+    let output = output.to_owned();
+    let names = Arc::new(names);
+    let dimensions = Arc::new(dimensions);
+    let mut dictionaries = dictionaries.unwrap_or_default().into_iter();
+    let mut lanes: Vec<Vec<_>> = (0..options().workers).map(|_| Vec::new()).collect();
+    for (part, batches) in parts.into_iter().enumerate() {
+        lanes[part % options().workers].push((part, batches, dictionaries.next()));
+    }
+    let mut tasks: Vec<crate::runtime::Work<Result<()>>> = Vec::new();
+    for lane in lanes {
+        let (dir, ids, dims) = (output.clone(), names.clone(), dimensions.clone());
+        tasks.push(Box::new(move || {
+            for (part, batches, dictionary) in lane {
+                direct::users(&dir, part, batches, &ids, &dims, dictionary.as_ref())?;
             }
-            parts
-                .into_par_iter()
-                .enumerate()
-                .try_for_each(|(part, batches)| {
-                    write_users(output, part, batches, names, dimensions)
-                })
-        },
-        || write_campaigns(output, campaigns, dimensions),
-    );
-    user_result?;
-    campaign_result
+            Ok(())
+        }));
+    }
+    tasks.push(Box::new(move || write_campaigns(&output, campaigns, &dimensions)));
+    crate::runtime::run(tasks).into_iter().collect()
 }
 
 fn open(
@@ -58,7 +116,7 @@ fn open(
             .collect::<Vec<_>>(),
     ));
     let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(if crate::runtime::flag("PERF_CAMPAIGN_PLAIN") { Compression::UNCOMPRESSED } else { Compression::SNAPPY })
         .set_max_row_group_size(BATCH_SIZE)
         .build();
     let writer = ArrowWriter::try_new(
@@ -67,16 +125,6 @@ fn open(
         Some(properties),
     )?;
     Ok((schema, writer))
-}
-
-fn write_users(
-    output: &Path,
-    part: usize,
-    users: Vec<SessionBatch>,
-    names: &PersonNames,
-    dimensions: &Dimensions,
-) -> Result<()> {
-    direct::users(output, part, users, names, dimensions)
 }
 
 fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensions) -> Result<()> {
@@ -94,8 +142,12 @@ fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensio
             ("assisted_sessions", DataType::Int64, false),
         ],
     )?;
-    let rows: Vec<_> = campaigns.into_iter().collect();
-    for rows in rows.chunks(BATCH_SIZE) {
+    let mut iter = campaigns.into_iter();
+    let mut rows = Vec::with_capacity(BATCH_SIZE.min(iter.size_hint().0));
+    loop {
+        rows.clear();
+        rows.extend(iter.by_ref().take(BATCH_SIZE));
+        if rows.is_empty() { break; }
         let lookup = |id: u32| &dimensions.campaigns[id as usize];
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from_iter_values(
@@ -356,6 +408,7 @@ mod direct {
     }
 
     impl Group {
+        #[cfg(test)]
         fn prepare(
             &mut self,
             daily: &DailyColumns,
@@ -364,6 +417,14 @@ mod direct {
             dimensions: &Dimensions,
             categories: Option<&CategoryDictionary>,
         ) -> Result<usize> {
+            self.prepare_rows(daily, start, names, dimensions, categories, None, 0)
+        }
+
+        fn prepare_rows(
+            &mut self, daily: &DailyColumns, start: usize, names: &PersonNames,
+            dimensions: &Dimensions, categories: Option<&CategoryDictionary>,
+            prepared: Option<&PreparedNames>, base: usize,
+        ) -> Result<usize> {
             self.dictionary.clear();
             self.runs.clear();
             let mut previous = None;
@@ -371,15 +432,24 @@ mod direct {
             let mut present = 0;
             let mut end = start;
             let mut buffer = [0; 9];
-            let limit = daily.person.len().min(start + BATCH_SIZE);
+            let limit = daily.person.len().min(start.saturating_add(options().rows));
+            let mut run = prepared.map_or(0, |p| p.runs.partition_point(|r| r.0 <= base + start));
             while end != limit {
                 let person = daily.person[end];
-                let name = if previous != Some(person) {
+                let changed = previous != Some(person);
+                let name = if changed && prepared.is_none() {
                     Some(names.get(person, &mut buffer))
                 } else {
                     None
                 };
-                let extra_name = name.map_or(0, |s| 4 + s.len());
+                let encoded = if changed {
+                    prepared.map(|p| {
+                        if p.runs[run].0 <= base + end { run += 1; }
+                        let stop = p.runs.get(run + 1).map_or(p.bytes.len(), |r| r.1);
+                        &p.bytes[p.runs[run].1..stop]
+                    })
+                } else { None };
+                let extra_name = encoded.map_or_else(|| name.map_or(0, |s| 4 + s.len()), |s| s.len());
                 let extra_category = daily.category[end].map_or(0, |id| {
                     categories
                         .map_or_else(|| 4 + dimensions.categories[id as usize].len(), |d| d.width)
@@ -392,8 +462,12 @@ mod direct {
                 {
                     break;
                 }
-                if let Some(name) = name {
-                    plain_string(&mut self.dictionary, name)?;
+                if changed {
+                    if let Some(bytes) = encoded {
+                        self.dictionary.extend_from_slice(bytes);
+                    } else {
+                        plain_string(&mut self.dictionary, name.unwrap())?;
+                    }
                     self.runs.push(1);
                     previous = Some(person);
                 } else {
@@ -456,7 +530,7 @@ mod direct {
 
     impl Writer {
         fn open(path: &Path) -> Result<Self> {
-            let mut file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
+            let mut file = BufWriter::with_capacity(options().buffer, File::create(path)?);
             file.write_all(b"PAR1")?;
             Ok(Self {
                 file,
@@ -538,7 +612,7 @@ mod direct {
         ) -> Result<f::ColumnChunk> {
             let largest = data.len().max(dictionary.map_or(0, |(raw, _)| raw.len()));
             let codec =
-                if max_compress_len(largest) <= i32::MAX as usize && largest <= i32::MAX as usize {
+                if !options().plain && max_compress_len(largest) <= i32::MAX as usize && largest <= i32::MAX as usize {
                     f::CompressionCodec::SNAPPY
                 } else {
                     f::CompressionCodec::UNCOMPRESSED
@@ -695,6 +769,7 @@ mod direct {
         shards: Vec<SessionBatch>,
         names: &PersonNames,
         dimensions: &Dimensions,
+        dictionary: Option<&PreparedNames>,
     ) -> Result<()> {
         let directory = output.join("user_daily");
         fs::create_dir_all(&directory)?;
@@ -702,11 +777,30 @@ mod direct {
         let mut group = Group::default();
         let mut numbers = Numeric::default();
         let categories = CategoryDictionary::build(&dimensions.categories)?;
-        for shard in shards {
-            let daily = shard.daily;
+        let mut columns: Vec<_> = shards.into_iter().map(|s| s.daily).collect();
+        if options().merge && columns.len() > 1 {
+            let mut merged = DailyColumns::default();
+            let n = columns.iter().map(|s| s.person.len()).sum();
+            macro_rules! append_column {
+                ($field:ident) => {{
+                    merged.$field.reserve_exact(n);
+                    for part in &mut columns { merged.$field.append(&mut part.$field); }
+                }};
+            }
+            append_column!(person);
+            append_column!(day);
+            append_column!(sessions);
+            append_column!(events);
+            append_column!(revenue);
+            append_column!(category);
+            columns = vec![merged];
+        }
+        let mut base = 0;
+        for daily in columns {
+            crate::runtime::huge_pages(&daily.person);
             let mut start = 0;
             while start < daily.person.len() {
-                let end = group.prepare(&daily, start, names, dimensions, categories.as_ref())?;
+                let end = group.prepare_rows(&daily, start, names, dimensions, categories.as_ref(), dictionary, base)?;
                 writer.group(
                     &daily,
                     start,
@@ -717,6 +811,7 @@ mod direct {
                 )?;
                 start = end;
             }
+            base += daily.person.len();
         }
         writer.close()
     }
