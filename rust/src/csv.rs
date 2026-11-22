@@ -30,6 +30,28 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,popcnt")]
 unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    #[cfg(feature = "large-input")]
+    if N == 7 && wide_scan() {
+        return unsafe { fields_vector::<N, true>(line) };
+    }
+    unsafe { fields_vector::<N, false>(line) }
+}
+
+#[cfg(all(feature = "large-input", target_arch = "x86_64"))]
+fn wide_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("PERF_WIDE_SCAN")
+            .map_or(cfg!(target_feature = "avx512bw"), |v| v == "1");
+        enabled
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,popcnt")]
+unsafe fn fields_vector<const N: usize, const WIDE: bool>(line: &[u8]) -> Option<[&[u8]; N]> {
     use std::arch::x86_64::*;
 
     #[inline(always)]
@@ -71,13 +93,13 @@ unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         };
         (a | b << 32, c | d << 32, qa | qb << 32, qc | qd << 32)
     };
-    #[cfg(all(feature = "large-input", target_feature = "avx512bw"))]
-    let (mut low, mut high, qlow, qhigh) = if N == 7 && len > 64 {
+    #[cfg(feature = "large-input")]
+    let (mut low, mut high, qlow, qhigh) = if WIDE && N == 7 && len > 64 {
         unsafe { masks64(line) }
     } else {
         masks32()
     };
-    #[cfg(not(all(feature = "large-input", target_feature = "avx512bw")))]
+    #[cfg(not(feature = "large-input"))]
     let (mut low, mut high, qlow, qhigh) = masks32();
     let nlow = low.count_ones();
     if (nlow + high.count_ones()) as usize + 1 != N {
@@ -140,7 +162,7 @@ unsafe fn fields_avx2<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 // Discard the overlap in the trailing masks so that bit zero of the second
 // pair describes byte 64 in the input.
 #[cfg(feature = "large-input")]
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn masks64(line: &[u8]) -> (u64, u64, u64, u64) {
     let (low, tail, qlow, qtail): (u64, u64, u64, u64);
@@ -261,6 +283,37 @@ fn fields_portable<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 #[cfg(test)]
 mod field_tests {
     use super::*;
+
+    #[cfg(all(feature = "large-input", target_arch = "x86_64"))]
+    #[test]
+    fn wide_overlap_keeps_each_delimiter_bit_exactly_once() {
+        if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+            return;
+        }
+        let bytes: Vec<u8> = (0..193)
+            .map(|i| match i % 11 {
+                0 | 1 => b',',
+                3 | 7 => b'"',
+                _ => b'x',
+            })
+            .collect();
+        for len in 65..=128 {
+            for offset in 0..64 {
+                let line = &bytes[offset..offset + len];
+                let mask = |chunk: &[u8], byte| {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0, |m, (i, &v)| m | (u64::from(v == byte) << i))
+                };
+                let (a, b) = line.split_at(64);
+                assert_eq!(
+                    unsafe { masks64(line) },
+                    (mask(a, b','), mask(b, b','), mask(a, b'"'), mask(b, b'"'))
+                );
+            }
+        }
+    }
 
     #[test]
     fn vector_boundaries_agree_with_portable_csv() {
@@ -923,14 +976,24 @@ impl Chunk {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,bmi1,popcnt")]
-    unsafe fn scan_parsed_avx2<const N: usize>(
+    unsafe fn scan_parsed_avx2<const N: usize>(&self, row: impl FnMut([&[u8]; N])) -> Result<()> {
+        #[cfg(feature = "large-input")]
+        if N == 7 && wide_scan() {
+            return unsafe { self.scan_vector::<N, true>(row) };
+        }
+        unsafe { self.scan_vector::<N, false>(row) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,popcnt")]
+    unsafe fn scan_vector<const N: usize, const WIDE: bool>(
         &self,
         mut row: impl FnMut([&[u8]; N]),
     ) -> Result<()> {
         self.scan(|line| {
             let values = if (32..=128).contains(&line.len()) {
                 // SAFETY: target features are active and the vector loads fit.
-                unsafe { fields_avx2(line) }
+                unsafe { fields_vector::<N, WIDE>(line) }
             } else {
                 fields_portable(line)
             };

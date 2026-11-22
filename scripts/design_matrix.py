@@ -86,7 +86,8 @@ TRIALS = {
     "portable": ("control", {"PERF_ISA":"portable"}),
     "v3": ("control", {"PERF_ISA":"v3"}),
     "wide": ("control", {"PERF_ISA":"wide"}),
-    "cascade": ("control", {"PERF_ISA":"cascade"}),
+    "wide-scan": ("wide", {"PERF_WIDE_SCAN":"1"}),
+    "cascade": ("wide", {"PERF_ISA":"cascade"}),
     "early-clicks": ("routed-p1", {"PERF_ROUTE_CLICKS":"early"}),
     "write-buckets": ("routed-p1", {"PERF_ROUTE_WRITES":"buffered"}),
     "stream": ("write-buckets", {"PERF_ROUTE_WRITES":"stream"}),
@@ -108,10 +109,11 @@ def settings(name):
     return {**(settings(parent) if parent else {}), **changes}
 
 
-def call(work, volume, case, order, variants, label, *, export=False, profile=False, cold=False):
+def call(work, volume, case, order, variants, label, *, export=False, profile=False, cold=False,
+         case_config=False, record_peers=False):
     directory = work / label
     directory.mkdir(parents=True, exist_ok=True)
-    conf = directory / "variants.json"
+    conf = directory / (case+".variants.json" if case_config else "variants.json")
     if conf.exists() and json.loads(conf.read_text()) != variants:
         raise ValueError(f"Changed variants in {directory}")
     conf.write_text(json.dumps(variants, indent=2))
@@ -121,6 +123,8 @@ def call(work, volume, case, order, variants, label, *, export=False, profile=Fa
         if partial.exists():
             raise FileExistsError(f"Incomplete previous trial: {partial}")
         flags = ["--variants", conf, "--verify-cache", "--log", partial]
+        if record_peers:
+            flags += ["--record-peers"]
         if export:
             flags += ["--export", directory / case]
         if profile:

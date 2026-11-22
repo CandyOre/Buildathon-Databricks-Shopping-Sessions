@@ -134,7 +134,7 @@ foreach ($ds in "s83-20m","s37-20m","s83-60m") {
 
 压力脚本发布到全新卷子目录并校验 SHA-256。低/高重复组行数、键长、其他列及总字节相同；多小文件组保留原始行流；超长行组只扩展两条 view 的商品字段。各组做 A/B 双向全列比较，等价布局再跨组比较。`--quick` 只跑一对。
 
-运行时 `PERF_ISA=portable/v3/wide/cascade` 在镜像已构建且 CPU 特征满足时选对应程序。默认按 CPU 和事件 CSV 总字节调度，`PERF_LARGE_BYTES` 为 3 GiB。`SCORER_STATIC=1` 配合 `RUNTIME_IMAGE=scratch`，镜像自带 Rust 调度器。正式比较保持 mimalloc 和镜像的 `MIMALLOC_PURGE_DELAY=10000` 一致。默认 LTO 为 thin，已有 PGO 配置用于 v4 大输入程序。重训时用独立种子，并记录训练提交和参数。
+运行时 `PERF_ISA=portable/v3/wide/cascade` 在镜像已构建且 CPU 特征满足时选对应程序。默认按 CPU 和事件 CSV 总字节调度，`PERF_LARGE_BYTES` 为 3 GiB。`SCORER_STATIC=1` 配合 `RUNTIME_IMAGE=scratch`，镜像自带 Rust 调度器。正式比较保持 mimalloc 和镜像的 `MIMALLOC_PURGE_DELAY=10000` 一致。默认 LTO 为 thin，已有 PGO 配置用于 v4 大输入程序。重训时用独立种子，并记录训练提交和参数。`PERF_WIDE_SCAN=1` 在提供 AVX-512F/BW 的大输入入口上，对 65–128 B 事件行实际使用两个 64 B 载荷。`SCORER_CASCADE_PKU=0` 在编译 Cascade Lake 入口时禁用 PKU 指令，用于虚拟机未暴露内存保护键的机器，其他 ISA 检查仍执行。
 
 ```powershell
 docker run --rm --network none --cpuset-cpus 0,2,4,6,8,10,12,14 --cpus 8 --memory 24g --memory-swap 24g --mount "type=volume,source=$vol,target=/data" "${vol}:generator" --seed 91 --events 8000000 --clicks 2000000 --threads 8 --output /data/design-s91-8m

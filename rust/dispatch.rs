@@ -45,7 +45,12 @@ fn cascade_cpu() -> bool {
     let x = unsafe { __cpuid_count(7, 0) };
     let state = unsafe { __cpuid_count(0xd, 1) }.eax;
     let ebx = (1 << 0) | (1 << 10) | (1 << 18) | (1 << 19) | (1 << 23) | (1 << 24);
-    let ecx = (1 << 3) | (1 << 4) | (1 << 11); // PKU, OS support for PKU, AVX512VNNI
+    let pku = if option_env!("SCORER_CASCADE_PKU") == Some("0") {
+        0
+    } else {
+        (1 << 3) | (1 << 4)
+    };
+    let ecx = pku | (1 << 11); // AVX512VNNI and any required PKU support.
     wide_vectors()
         && optimized_cpu()
         && std::is_x86_feature_detected!("pclmulqdq")

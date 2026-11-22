@@ -19,7 +19,7 @@ def export(volume, row, target):
 
 def trial(work, study, volume, case, name, variants, check_each):
     seq = list("ABBAAB")
-    rows = call(work,volume,case,seq,variants,name)
+    rows = call(work,volume,case,seq,variants,name,record_peers=True)
     sides = ([r for r in rows if r["image"]==k] for k in "AB")
     a,b = sides
     reference = study/"tables"/case/"b"

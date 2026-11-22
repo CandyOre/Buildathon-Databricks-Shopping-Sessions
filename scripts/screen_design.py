@@ -31,7 +31,7 @@ def main():
             for label, variant in zip(pair,(parent,name)):
                 variants[label] = dict(image=args.image, env=settings(variant))
             order.extend(reversed(pair) if (n+i)%2 else pair)
-    rows = call(args.work.resolve(),volume,args.case,order,variants,"pairs")
+    rows = call(args.work.resolve(),volume,args.case,order,variants,"pairs",case_config=True)
     results = []
     for name in args.names:
         a, b = ([r["seconds"] for r in rows if r["image"]==name+"-"+label] for label in "AB")

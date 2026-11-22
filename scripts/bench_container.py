@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--cpuset", default="0,2,4,6,8,10,12,14")
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--record-peers", action="store_true",help="record running container IDs immediately before each timed launch")
     parser.add_argument("--cache", choices=("warm", "evict"), default="warm")
     parser.add_argument("--verify-cache", action="store_true",
                         help="check resident input pages before each run and log the result")
@@ -83,6 +84,7 @@ def main():
         if args.profile:
             command += ["-e", "PROFILE=1"]
         try:
+            peers = docker("ps","-q",capture=True).split() if args.record_peers else None
             start = perf_counter()
             variant = variants.get(image)
             if variant:
@@ -113,6 +115,8 @@ def main():
                                if line.startswith("profile ")])
             if variant:
                 row.update(image_ref=actual_image, environment=variant.get("env", {}))
+            if peers is not None:
+                row["other_running_containers"] = peers
             if args.profile:
                 close = next((s.get("epoch_us") for s in row["stages"] if s["stage"]=="write_parquet"), None)
                 if close:

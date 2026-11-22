@@ -133,7 +133,9 @@ def column_statistics(data, column):
 
 
 def inspect_file(path, details=False):
-    metadata = pq.ParquetFile(path).metadata
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata
+    schema = [dict(name=f.name, type=str(f.type), nullable=f.nullable) for f in parquet_file.schema_arrow]
     totals, all_kinds, codecs = empty_counts(), Counter(), Counter()
     groups = []
     with path.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
@@ -162,7 +164,7 @@ def inspect_file(path, details=False):
                 record["columns"] = cols
             groups.append(record)
         size = len(data)
-    return dict(file=str(path), file_bytes=size, rows=metadata.num_rows, row_groups=len(groups),
+    return dict(file=str(path), file_bytes=size, rows=metadata.num_rows, row_groups=len(groups),schema=schema,
                 **totals, page_types=all_kinds, codec_chunks=codecs,
                 non_chunk_file_bytes=size - totals["compressed_chunk_bytes"], groups=groups)
 
