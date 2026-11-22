@@ -493,8 +493,13 @@ pub fn text(bytes: &[u8]) -> &str {
 }
 
 pub struct DimIndex<const CAMPAIGN: bool> {
-    dense: Vec<u32>,
+    dense: DenseValues,
     other: AHashMap<String, u32>,
+}
+
+enum DenseValues {
+    Wide(Vec<u32>),
+    Byte(Vec<u8>),
 }
 impl<const C: bool> DimIndex<C> {
     #[inline]
@@ -519,8 +524,15 @@ impl<const C: bool> DimIndex<C> {
     }
     #[inline]
     pub fn lookup(&self, name: &[u8]) -> Option<u32> {
-        if let Some(id) = Self::number(name).and_then(|n| self.dense.get(n)) {
-            return (*id != u32::MAX).then_some(*id);
+        if let Some(n) = Self::number(name) {
+            match &self.dense {
+                DenseValues::Wide(values) => if let Some(&id) = values.get(n) {
+                    return (id != u32::MAX).then_some(id);
+                },
+                DenseValues::Byte(values) => if let Some(&id) = values.get(n) {
+                    return (id != u8::MAX).then_some(u32::from(id));
+                },
+            }
         }
         self.other.get(text(name)).copied()
     }
@@ -541,6 +553,13 @@ impl<const C: bool> FromIterator<(String, u32)> for DimIndex<C> {
                 other.insert(s, id);
             }
         }
+        let dense = if !C && perf_on("PERF_DIM_NARROW")
+            && dense.iter().all(|&value| value < 255 || value == u32::MAX) {
+            // Casting the wide missing-value sentinel yields the byte sentinel.
+            DenseValues::Byte(dense.into_iter().map(|value| value as u8).collect())
+        } else {
+            DenseValues::Wide(dense)
+        };
         Self { dense, other }
     }
 }
@@ -555,6 +574,7 @@ pub struct Dimensions {
 
 impl Dimensions {
     pub fn read(data: &Path) -> Result<Self> {
+        let read_products = || -> Result<_> {
         let mut pairs = Vec::new();
         scan_file(&data.join("products.csv"), |row| {
             if let Some([product, category]) = fields(row) {
@@ -574,7 +594,9 @@ impl Dimensions {
                 (product, categories.binary_search(&category).unwrap() as u32)
             })
             .collect();
-
+        Ok((categories, products, unknown_category))
+        };
+        let read_campaigns = || -> Result<_> {
         let mut campaigns = vec![("organic".into(), "organic".into())];
         scan_file(&data.join("campaigns.csv"), |row| {
             if let Some([campaign, channel]) = fields(row) {
@@ -587,6 +609,15 @@ impl Dimensions {
             .skip(1)
             .map(|(id, (campaign, _))| (campaign.clone(), id as u32))
             .collect();
+        Ok((campaigns, campaign_ids))
+        };
+        let (products, campaigns) = if perf_on("PERF_DIM_PARALLEL") {
+            rayon::join(read_products, read_campaigns)
+        } else {
+            (read_products(), read_campaigns())
+        };
+        let (categories, products, unknown_category) = products?;
+        let (campaigns, campaign_ids) = campaigns?;
         Ok(Self {
             categories,
             products,
@@ -1333,6 +1364,18 @@ const READY: u64 = 1 << 63;
 const SPILL: u64 = u64::MAX - 1;
 #[cfg(feature = "large-input")]
 const EXTERNAL: u64 = u64::MAX;
+
+impl Prepared {
+    #[cfg(not(feature = "large-input"))]
+    pub(crate) fn work_class(self) -> usize {
+        match self { Self::Ready(_) => 0, Self::Compact(..) => 1, Self::Spill(_) => 2, Self::External => 3 }
+    }
+
+    #[cfg(feature = "large-input")]
+    pub(crate) fn work_class(self) -> usize {
+        match self.0 { SPILL => 2, EXTERNAL => 3, word if word & READY != 0 => 0, _ => 1 }
+    }
+}
 
 impl PersonCache {
     #[inline]
