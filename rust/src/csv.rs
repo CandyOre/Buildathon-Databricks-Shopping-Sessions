@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use memchr::memchr_iter;
+use memchr::{memchr, memchr_iter, memrchr};
 
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -340,9 +340,120 @@ pub fn parts(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub struct Chunk {
-    path: Arc<Path>,
+    source: Arc<Source>,
     start: u64,
     end: u64,
+}
+
+struct Source {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    mapping: Option<Mapping>,
+}
+
+impl Source {
+    fn new(path: PathBuf, len: u64, mapped: bool) -> Self {
+        #[cfg(target_os = "linux")]
+        let mapping = if mapped && len != 0 {
+            Mapping::open(&path, len).ok()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = (len, mapped);
+        Self { path, #[cfg(target_os = "linux")] mapping }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct Mapping {
+    data: std::ptr::NonNull<u8>,
+    len: usize,
+    release_page_size: usize,
+}
+
+// The scorer's input volume is read-only throughout a run. Every access to
+// the mapping is read-only; the last Arc<Source> owns the unmap.
+#[cfg(target_os = "linux")]
+unsafe impl Send for Mapping {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for Mapping {}
+
+#[cfg(target_os = "linux")]
+impl Mapping {
+    fn open(path: &Path, len: u64) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let len = usize::try_from(len)?;
+        anyhow::ensure!(len <= isize::MAX as usize, "mapping exceeds addressable slice");
+        let file = File::open(path)?;
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let page = if perf_on("PERF_PAGE_RELEASE") {
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0)
+        } else { 0 };
+        if let Some(data) = std::ptr::NonNull::new(ptr.cast()) {
+            Ok(Self { data, len, release_page_size: page })
+        } else {
+            unsafe { libc::munmap(ptr, len); }
+            anyhow::bail!("null mapping address")
+        }
+    }
+
+    fn span(&self, start: u64, end: u64, visit: &mut impl FnMut(&[u8])) {
+        let bytes = unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.len) };
+        let start = (start as usize).min(bytes.len());
+        let end = usize::try_from(end).unwrap_or(usize::MAX).min(bytes.len());
+        let before = start.saturating_sub(1);
+        if before < end {
+            if let Some(newline) = memchr(b'\n', &bytes[before..end]) {
+                let first = before + newline + 1;
+                if first < end {
+                    let last = if end == bytes.len() || bytes[end - 1] == b'\n' {
+                        end
+                    } else {
+                        memchr(b'\n', &bytes[end..]).map_or(bytes.len(), |offset| end + offset + 1)
+                    };
+                    visit(&bytes[first..last]);
+                }
+            }
+        }
+        // Advise only complete pages inside this task's nominal byte range.
+        // Linux DONTNEED on a clean file mapping releases PTEs, not file data.
+        let page = self.release_page_size;
+        if page != 0 {
+            let first = start.div_ceil(page) * page;
+            let last = end / page * page;
+            if first < last {
+                unsafe { libc::madvise(self.data.as_ptr().add(first).cast(), last - first, libc::MADV_DONTNEED); }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Mapping {
+    fn drop(&mut self) { unsafe { libc::munmap(self.data.as_ptr().cast(), self.len); } }
+}
+
+pub(crate) fn perf_on(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+fn use_mmap() -> bool {
+    std::env::var_os("PERF_IO").is_some_and(|v| v == "mmap")
+}
+
+fn each_line<'a>(bytes: &'a [u8], row: &mut impl FnMut(&'a [u8])) {
+    let mut start = 0;
+    for end in memchr_iter(b'\n', bytes) {
+        row(&bytes[start..end]);
+        start = end + 1;
+    }
+    if start < bytes.len() { row(&bytes[start..]); }
 }
 
 struct ScanBuffer {
@@ -363,7 +474,12 @@ impl Chunk {
     }
 
     pub fn scan(&self, mut row: impl FnMut(&[u8])) -> Result<()> {
-        let mut file = File::open(&self.path)?;
+        #[cfg(target_os = "linux")]
+        if let Some(map) = &self.source.mapping {
+            map.span(self.start, self.end, &mut |span| each_line(span, &mut row));
+            return Ok(());
+        }
+        let mut file = File::open(&self.source.path)?;
         let mut offset = self.start.saturating_sub(1);
         file.seek(SeekFrom::Start(offset))?;
         SCAN_BUFFER.with_borrow_mut(|buffer| {
@@ -415,6 +531,75 @@ impl Chunk {
 }
 
 impl Chunk {
+    // Each span starts on a record boundary and ends after a complete record.
+    // The last record at EOF may have no LF. This lets a numeric decoder hold
+    // borrowed fields from several adjacent rows while their buffer is live.
+    fn spans(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(map) = &self.source.mapping {
+            map.span(self.start, self.end, &mut visit);
+            return Ok(());
+        }
+        let mut file = File::open(&self.source.path)?;
+        let mut offset = self.start.saturating_sub(1);
+        file.seek(SeekFrom::Start(offset))?;
+        SCAN_BUFFER.with_borrow_mut(|buf| {
+            let ScanBuffer { bytes, partial_line } = buf;
+            partial_line.clear();
+            let mut skip = true;
+            loop {
+                let n = match file.read(bytes) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if n == 0 {
+                    if !partial_line.is_empty() { visit(partial_line); }
+                    return Ok(());
+                }
+                let block = &bytes[..n];
+                let mut pos = 0;
+                if skip {
+                    let limit = self.end.saturating_sub(offset).min(n as u64) as usize;
+                    if let Some(i) = memchr(b'\n', &block[..limit]) {
+                        pos = i + 1;
+                        skip = false;
+                    } else {
+                        offset += n as u64;
+                        if offset >= self.end { return Ok(()); }
+                        continue;
+                    }
+                }
+                if !partial_line.is_empty() {
+                    if let Some(i) = memchr(b'\n', &block[pos..]) {
+                        partial_line.extend_from_slice(&block[pos..=pos+i]);
+                        visit(partial_line);
+                        partial_line.clear();
+                        pos += i + 1;
+                    } else {
+                        partial_line.extend_from_slice(&block[pos..]);
+                        offset += n as u64;
+                        continue;
+                    }
+                }
+                if offset + pos as u64 >= self.end { return Ok(()); }
+                let remaining = self.end - offset;
+                if remaining <= n as u64 {
+                    let boundary = remaining as usize - 1;
+                    if let Some(i) = memchr(b'\n', &block[boundary..]) {
+                        visit(&block[pos..=boundary+i]);
+                        return Ok(());
+                    }
+                }
+                if let Some(i) = memrchr(b'\n', &block[pos..]) {
+                    visit(&block[pos..=pos+i]);
+                    pos += i + 1;
+                }
+                partial_line.extend_from_slice(&block[pos..]);
+                offset += n as u64;
+            }
+        })
+    }
+
     pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2")
@@ -456,17 +641,28 @@ pub fn chunks(directory: &Path) -> Result<Vec<Chunk>> {
         .into_iter()
         .map(|path| {
             let length = path.metadata()?.len();
-            Ok((length, Arc::<Path>::from(path)))
+            Ok((length, path))
         })
         .collect::<Result<Vec<_>>>()?;
     paths.sort_unstable_by_key(|(len, _)| std::cmp::Reverse(*len));
+    let total = paths.iter().fold(0u64, |s, (n, _)| s.saturating_add(*n));
+    let chunk_bytes = match std::env::var("PERF_CHUNK").as_deref() {
+        Ok("adaptive") => {
+            let target = total / (rayon::current_num_threads().max(1) as u64 * 256);
+            target.clamp(64 << 10, 2 << 20).next_power_of_two()
+        }
+        Ok(n) => n.parse::<u64>().unwrap_or(CHUNK_BYTES).clamp(4096, CHUNK_BYTES),
+        Err(_) => CHUNK_BYTES,
+    };
+    let mapped = use_mmap();
     let jobs = paths.into_iter().flat_map(|(len, path)| {
+        let source = Arc::new(Source::new(path, len, mapped));
         (0..len)
-            .step_by(CHUNK_BYTES as usize)
+            .step_by(chunk_bytes as usize)
             .map(move |start| Chunk {
-                path: path.clone(),
+                source: source.clone(),
                 start,
-                end: (start + CHUNK_BYTES).min(len),
+                end: start.saturating_add(chunk_bytes).min(len),
             })
     });
     Ok(jobs.collect())
@@ -530,10 +726,25 @@ mod scan_tests {
             }
         }
         fs::write(&path, &data)?;
+        for mapped in [false, true] {
+            let source = Arc::new(Source::new(path.clone(), data.len() as u64, mapped));
+            #[cfg(target_os = "linux")]
+            if mapped { assert!(source.mapping.is_some()); }
+            let mut actual = Vec::new();
+            for start in (0..data.len()).step_by(block) {
+                let chunk = Chunk {
+                    source: source.clone(),
+                    start: start as u64,
+                    end: (start + block).min(data.len()) as u64,
+                };
+                chunk.spans(|span| each_line(span, &mut |row| actual.push(row.to_vec())))?;
+            }
+            assert_eq!(actual.as_slice(), expected);
+        }
         let mut actual = Vec::new();
         for start in (0..data.len()).step_by(block) {
             Chunk {
-                path: Arc::from(path.as_path()),
+                source: Arc::new(Source::new(path.clone(), data.len() as u64, false)),
                 start: start as u64,
                 end: (start + block).min(data.len()) as u64,
             }
@@ -547,7 +758,7 @@ mod scan_tests {
 
 pub fn scan_file(path: &Path, row: impl FnMut(&[u8])) -> Result<()> {
     Chunk {
-        path: Arc::from(path),
+        source: Arc::new(Source::new(path.to_owned(), path.metadata()?.len(), use_mmap())),
         start: 0,
         end: u64::MAX,
     }
