@@ -66,8 +66,8 @@ pub(super) struct ShortEvent(u64, u64);
 
 impl ShortEvent {
     #[inline]
-    pub fn key(self, k:&EventKeys)->u64 {
-        from_code(self.0 & ((1 << 42) - 1),42,&k.wide)
+    pub fn key(self, k: &EventKeys) -> u64 {
+        from_code(self.0 & ((1 << 42) - 1), 42, &k.wide)
     }
     pub fn pack(e: EventRow) -> Option<Self> {
         const NO_TIME: u32 = (1 << 21) - 1;

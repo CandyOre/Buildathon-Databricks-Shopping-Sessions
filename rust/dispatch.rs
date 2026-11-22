@@ -42,16 +42,22 @@ fn wide_vectors() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn cascade_cpu() -> bool {
     use std::arch::x86_64::__cpuid_count;
-    let x = unsafe { __cpuid_count(7,0) };
-    let state = unsafe { __cpuid_count(0xd,1) }.eax;
-    let ebx = (1<<0) | (1<<10) | (1<<18) | (1<<19) | (1<<23) | (1<<24);
-    let ecx = (1<<3) | (1<<4) | (1<<11); // PKU, OS support for PKU, AVX512VNNI
-    wide_vectors() && optimized_cpu() && std::is_x86_feature_detected!("pclmulqdq")
-        && std::is_x86_feature_detected!("rdrand") && x.ebx & ebx == ebx
-        && x.ecx & ecx == ecx && state & 0b1011 == 0b1011
+    let x = unsafe { __cpuid_count(7, 0) };
+    let state = unsafe { __cpuid_count(0xd, 1) }.eax;
+    let ebx = (1 << 0) | (1 << 10) | (1 << 18) | (1 << 19) | (1 << 23) | (1 << 24);
+    let ecx = (1 << 3) | (1 << 4) | (1 << 11); // PKU, OS support for PKU, AVX512VNNI
+    wide_vectors()
+        && optimized_cpu()
+        && std::is_x86_feature_detected!("pclmulqdq")
+        && std::is_x86_feature_detected!("rdrand")
+        && x.ebx & ebx == ebx
+        && x.ecx & ecx == ecx
+        && state & 0b1011 == 0b1011
 }
 #[cfg(not(target_arch = "x86_64"))]
-fn cascade_cpu() -> bool { false }
+fn cascade_cpu() -> bool {
+    false
+}
 
 // A longer run can hide the latency of random identity lookups by queuing
 // independent events. Small inputs avoid the longer wide-vector pipeline.
@@ -80,14 +86,20 @@ fn main() {
     let supported = optimized_cpu();
     let data = std::env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into());
     let requested = std::env::var("PERF_ISA").unwrap_or_default();
-    let threshold = std::env::var("PERF_LARGE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(3 << 30);
+    let threshold = std::env::var("PERF_LARGE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3 << 30);
     let binary = if requested == "portable" {
         "/usr/local/bin/portable"
-    } else if requested == "cascade" && option_env!("SCORER_CASCADE") == Some("1") && cascade_cpu() {
+    } else if requested == "cascade" && option_env!("SCORER_CASCADE") == Some("1") && cascade_cpu()
+    {
         "/usr/local/bin/cascade"
-    } else if requested != "v3" && supported
+    } else if requested != "v3"
+        && supported
         && wide_vectors()
-        && (requested == "wide" || large_csv_input(&std::path::Path::new(&data).join("events"), threshold))
+        && (requested == "wide"
+            || large_csv_input(&std::path::Path::new(&data).join("events"), threshold))
     {
         "/usr/local/bin/large"
     } else if supported {

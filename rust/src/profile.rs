@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,28 +60,47 @@ impl SystemSample {
         let mut out = Self::default();
         if let Ok(io) = fs::read_to_string("/proc/self/io") {
             for (key, value) in io.lines().filter_map(|line| line.split_once(": ")) {
-                if let Ok(v) = value.parse() { out.counts.insert(key.to_owned(), v); }
+                if let Ok(v) = value.parse() {
+                    out.counts.insert(key.to_owned(), v);
+                }
             }
         }
-        if let Some((minor,major,user,kernel)) = fs::read_to_string("/proc/self/stat").ok().and_then(|s| ticks(&s)) {
-            for (key,value) in [("minor_faults",minor),("major_faults",major),("user_ticks",user),("system_ticks",kernel)] {
-                out.counts.insert(key.to_owned(),value);
+        if let Some((minor, major, user, kernel)) = fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| ticks(&s))
+        {
+            for (key, value) in [
+                ("minor_faults", minor),
+                ("major_faults", major),
+                ("user_ticks", user),
+                ("system_ticks", kernel),
+            ] {
+                out.counts.insert(key.to_owned(), value);
             }
         }
         if let Ok(tasks) = fs::read_dir("/proc/self/task") {
             for entry in tasks.flatten() {
                 let tid = entry.file_name().to_string_lossy().into_owned();
                 if let Ok(stat) = fs::read_to_string(entry.path().join("stat")) {
-                    if let Some((_,_,u,s)) = ticks(&stat) { out.threads.insert(tid.clone(),u+s); }
+                    if let Some((_, _, u, s)) = ticks(&stat) {
+                        out.threads.insert(tid.clone(), u + s);
+                    }
                     // /proc/<pid>/stat field 39 is the last processor number.
-                    if let Some(cpu) = stat.rsplit_once(") ").and_then(|(_,s)|s.split_whitespace().nth(36))
-                        .and_then(|s|s.parse().ok()) { out.last_cpu.insert(tid.clone(),cpu); }
+                    if let Some(cpu) = stat
+                        .rsplit_once(") ")
+                        .and_then(|(_, s)| s.split_whitespace().nth(36))
+                        .and_then(|s| s.parse().ok())
+                    {
+                        out.last_cpu.insert(tid.clone(), cpu);
+                    }
                 }
                 if let Ok(stat) = fs::read_to_string(entry.path().join("schedstat")) {
-                    let mut values = stat.split_whitespace().filter_map(|s|s.parse::<u64>().ok());
-                    if let (Some(run),Some(wait)) = (values.next(),values.next()) {
-                        out.running_ns.insert(tid.clone(),run);
-                        out.runnable_wait_ns.insert(tid,wait);
+                    let mut values = stat
+                        .split_whitespace()
+                        .filter_map(|s| s.parse::<u64>().ok());
+                    if let (Some(run), Some(wait)) = (values.next(), values.next()) {
+                        out.running_ns.insert(tid.clone(), run);
+                        out.runnable_wait_ns.insert(tid, wait);
                     }
                 }
             }
@@ -89,8 +108,10 @@ impl SystemSample {
         out
     }
 
-    fn delta(new: &BTreeMap<String,u64>, old:&BTreeMap<String,u64>) -> BTreeMap<String,u64> {
-        new.iter().map(|(k,v)| (k.clone(),v.saturating_sub(*old.get(k).unwrap_or(&0)))).collect()
+    fn delta(new: &BTreeMap<String, u64>, old: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+        new.iter()
+            .map(|(k, v)| (k.clone(), v.saturating_sub(*old.get(k).unwrap_or(&0))))
+            .collect()
     }
 }
 
@@ -100,24 +121,68 @@ struct HardwareCounter {
 }
 
 impl HardwareCounter {
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     fn open(cache: u64) -> Self {
         use std::os::fd::FromRawFd;
         // PERF_ATTR_SIZE_VER0. Count user-mode read misses and inherit on the
         // Rayon workers which will be created after the profiler starts.
         #[repr(C)]
-        struct Attr { kind:u32, size:u32, config:u64, period:u64, sample:u64, format:u64, flags:u64, wakeup:u32, bp_type:u32, config1:u64 }
-        let attr=Attr {kind:3,size:64,config:cache | (1<<16), period:0,sample:0,format:0,
-            flags:(1<<1)|(1<<5)|(1<<6), wakeup:0,bp_type:0,config1:0};
-        let fd=unsafe {libc::syscall(libc::SYS_perf_event_open,&attr as *const Attr,0,-1,-1,8)};
-        if fd < 0 { Self {file:None,errno:std::io::Error::last_os_error().raw_os_error()} }
-        else { Self {file:Some(unsafe {fs::File::from_raw_fd(fd as i32)}),errno:None} }
+        struct Attr {
+            kind: u32,
+            size: u32,
+            config: u64,
+            period: u64,
+            sample: u64,
+            format: u64,
+            flags: u64,
+            wakeup: u32,
+            bp_type: u32,
+            config1: u64,
+        }
+        let attr = Attr {
+            kind: 3,
+            size: 64,
+            config: cache | (1 << 16),
+            period: 0,
+            sample: 0,
+            format: 0,
+            flags: (1 << 1) | (1 << 5) | (1 << 6),
+            wakeup: 0,
+            bp_type: 0,
+            config1: 0,
+        };
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                &attr as *const Attr,
+                0,
+                -1,
+                -1,
+                8,
+            )
+        };
+        if fd < 0 {
+            Self {
+                file: None,
+                errno: std::io::Error::last_os_error().raw_os_error(),
+            }
+        } else {
+            Self {
+                file: Some(unsafe { fs::File::from_raw_fd(fd as i32) }),
+                errno: None,
+            }
+        }
     }
-    #[cfg(not(target_os="linux"))]
-    fn open(_:u64) -> Self { Self {file:None,errno:None} }
+    #[cfg(not(target_os = "linux"))]
+    fn open(_: u64) -> Self {
+        Self {
+            file: None,
+            errno: None,
+        }
+    }
     fn value(&self) -> Option<u64> {
-        let mut file=self.file.as_ref()?;
-        let mut bytes=[0;8];
+        let mut file = self.file.as_ref()?;
+        let mut bytes = [0; 8];
         file.read_exact(&mut bytes).ok()?;
         Some(u64::from_ne_bytes(bytes))
     }
@@ -135,7 +200,7 @@ pub struct Profiler {
     total: Instant,
     sample: Option<Arc<Mutex<Sample>>>,
     thread: Option<JoinHandle<()>>,
-    hardware: Option<[HardwareCounter;2]>,
+    hardware: Option<[HardwareCounter; 2]>,
 }
 
 impl Profiler {
@@ -148,7 +213,7 @@ impl Profiler {
             hardware: None,
         };
         if enabled {
-            profile.hardware=Some([HardwareCounter::open(2),HardwareCounter::open(3)]);
+            profile.hardware = Some([HardwareCounter::open(2), HardwareCounter::open(3)]);
             let current = status_kib("VmRSS:");
             let sample = Arc::new(Mutex::new(Sample {
                 started: total,
@@ -189,7 +254,7 @@ impl Profiler {
                 "thread_runnable_wait_ns":SystemSample::delta(&observation.runnable_wait_ns,&sample.system.runnable_wait_ns),
                 "thread_last_cpu":observation.last_cpu,
             });
-            sample.system=observation;
+            sample.system = observation;
             eprintln!("profile {data}");
             sample.started = end;
             sample.start_rss_kib = end_rss;
@@ -199,9 +264,18 @@ impl Profiler {
 
     pub fn finish(&mut self) {
         if self.sample.is_some() {
-            let h=self.hardware.as_ref().unwrap();
-            let huge=fs::read_to_string("/proc/self/smaps_rollup").ok().and_then(|s| s.lines().find_map(|l|
-                l.strip_prefix("AnonHugePages:")?.split_whitespace().next()?.parse::<u64>().ok()));
+            let h = self.hardware.as_ref().unwrap();
+            let huge = fs::read_to_string("/proc/self/smaps_rollup")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find_map(|l| {
+                        l.strip_prefix("AnonHugePages:")?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                });
             let data = json!({
                 "stage": "total", "elapsed_s": self.total.elapsed().as_secs_f64(),
                 "peak_rss_kib": status_kib("VmHWM:"), "container_peak_bytes": cgroup_peak_bytes(),

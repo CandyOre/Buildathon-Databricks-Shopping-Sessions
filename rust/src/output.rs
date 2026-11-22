@@ -42,28 +42,43 @@ pub struct PreparedNames {
     bytes: Vec<u8>,
 }
 
-pub fn prepare_names(batches: &[SessionBatch], names: &PersonNames) -> Result<Option<Vec<PreparedNames>>> {
-    if !crate::runtime::flag("PERF_PREPARE_NAMES") { return Ok(None); }
-    (0..USER_PARTS).into_par_iter().map(|part| {
-        let start = (part * batches.len()).div_ceil(USER_PARTS);
-        let end = ((part + 1) * batches.len()).div_ceil(USER_PARTS);
-        let mut dictionary = PreparedNames::default();
-        let mut buffer = [0; 9];
-        let mut last = None;
-        for (i, &person) in batches[start..end].iter().flat_map(|b| &b.daily.person).enumerate() {
-            if last != Some(person) {
-                let name = names.get(person, &mut buffer);
-                let offset = dictionary.bytes.len();
-                dictionary.bytes.extend_from_slice(&i32::try_from(name.len())?.to_le_bytes());
-                dictionary.bytes.extend_from_slice(name.as_bytes());
-                dictionary.runs.push((i + 1, offset));
-                last = Some(person);
-            } else {
-                dictionary.runs.last_mut().unwrap().0 = i + 1;
+pub fn prepare_names(
+    batches: &[SessionBatch],
+    names: &PersonNames,
+) -> Result<Option<Vec<PreparedNames>>> {
+    if !crate::runtime::flag("PERF_PREPARE_NAMES") {
+        return Ok(None);
+    }
+    (0..USER_PARTS)
+        .into_par_iter()
+        .map(|part| {
+            let start = (part * batches.len()).div_ceil(USER_PARTS);
+            let end = ((part + 1) * batches.len()).div_ceil(USER_PARTS);
+            let mut dictionary = PreparedNames::default();
+            let mut buffer = [0; 9];
+            let mut last = None;
+            for (i, &person) in batches[start..end]
+                .iter()
+                .flat_map(|b| &b.daily.person)
+                .enumerate()
+            {
+                if last != Some(person) {
+                    let name = names.get(person, &mut buffer);
+                    let offset = dictionary.bytes.len();
+                    dictionary
+                        .bytes
+                        .extend_from_slice(&i32::try_from(name.len())?.to_le_bytes());
+                    dictionary.bytes.extend_from_slice(name.as_bytes());
+                    dictionary.runs.push((i + 1, offset));
+                    last = Some(person);
+                } else {
+                    dictionary.runs.last_mut().unwrap().0 = i + 1;
+                }
             }
-        }
-        Ok(dictionary)
-    }).collect::<Result<Vec<_>>>().map(Some)
+            Ok(dictionary)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 pub fn write(
@@ -91,9 +106,15 @@ pub fn write(
     let mut campaign = Some((campaigns, dimensions.clone()));
     for (index, lane) in lanes.into_iter().enumerate() {
         let (dir, ids, dims) = (output.clone(), names.clone(), dimensions.clone());
-        let first = if index == 0 && crate::runtime::flag("PERF_CAMPAIGN_FIRST") { campaign.take() } else { None };
+        let first = if index == 0 && crate::runtime::flag("PERF_CAMPAIGN_FIRST") {
+            campaign.take()
+        } else {
+            None
+        };
         tasks.push(Box::new(move || {
-            if let Some((rows, dims)) = first { write_campaigns(&dir, rows, &dims)?; }
+            if let Some((rows, dims)) = first {
+                write_campaigns(&dir, rows, &dims)?;
+            }
             for (part, batches, dictionary) in lane {
                 direct::users(&dir, part, batches, &ids, &dims, dictionary.as_ref())?;
             }
@@ -121,7 +142,11 @@ fn open(
             .collect::<Vec<_>>(),
     ));
     let properties = WriterProperties::builder()
-        .set_compression(if crate::runtime::flag("PERF_CAMPAIGN_PLAIN") { Compression::UNCOMPRESSED } else { Compression::SNAPPY })
+        .set_compression(if crate::runtime::flag("PERF_CAMPAIGN_PLAIN") {
+            Compression::UNCOMPRESSED
+        } else {
+            Compression::SNAPPY
+        })
         .set_max_row_group_size(BATCH_SIZE)
         .build();
     let writer = ArrowWriter::try_new(
@@ -153,7 +178,9 @@ fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensio
     loop {
         rows.clear();
         rows.extend(iter.by_ref().take(BATCH_SIZE));
-        if rows.is_empty() { break; }
+        if rows.is_empty() {
+            break;
+        }
         let lookup = |id: u32| &dimensions.campaigns[id as usize];
         let columns: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from_iter_values(
@@ -182,8 +209,11 @@ fn write_campaigns(output: &Path, campaigns: CampaignDays, dimensions: &Dimensio
     }
     let meta = writer.close()?;
     if let Some(clock) = clock {
-        eprintln!("profile {}", serde_json::json!({"stage":"campaign_writer_work",
-            "elapsed_s":clock.elapsed().as_secs_f64(),"row_groups":meta.row_groups.len(),"rows":meta.num_rows}));
+        eprintln!(
+            "profile {}",
+            serde_json::json!({"stage":"campaign_writer_work",
+            "elapsed_s":clock.elapsed().as_secs_f64(),"row_groups":meta.row_groups.len(),"rows":meta.num_rows})
+        );
     }
     Ok(())
 }
@@ -431,9 +461,14 @@ mod direct {
         }
 
         fn prepare_rows(
-            &mut self, daily: &DailyColumns, start: usize, names: &PersonNames,
-            dimensions: &Dimensions, categories: Option<&CategoryDictionary>,
-            prepared: Option<&PreparedNames>, base: usize,
+            &mut self,
+            daily: &DailyColumns,
+            start: usize,
+            names: &PersonNames,
+            dimensions: &Dimensions,
+            categories: Option<&CategoryDictionary>,
+            prepared: Option<&PreparedNames>,
+            base: usize,
         ) -> Result<usize> {
             self.dictionary.clear();
             self.runs.clear();
@@ -454,12 +489,17 @@ mod direct {
                 };
                 let encoded = if changed {
                     prepared.map(|p| {
-                        if p.runs[run].0 <= base + end { run += 1; }
+                        if p.runs[run].0 <= base + end {
+                            run += 1;
+                        }
                         let stop = p.runs.get(run + 1).map_or(p.bytes.len(), |r| r.1);
                         &p.bytes[p.runs[run].1..stop]
                     })
-                } else { None };
-                let extra_name = encoded.map_or_else(|| name.map_or(0, |s| 4 + s.len()), |s| s.len());
+                } else {
+                    None
+                };
+                let extra_name =
+                    encoded.map_or_else(|| name.map_or(0, |s| 4 + s.len()), |s| s.len());
                 let extra_category = daily.category[end].map_or(0, |id| {
                     categories
                         .map_or_else(|| 4 + dimensions.categories[id as usize].len(), |d| d.width)
@@ -621,12 +661,14 @@ mod direct {
             dictionary: Option<(&[u8], usize)>,
         ) -> Result<f::ColumnChunk> {
             let largest = data.len().max(dictionary.map_or(0, |(raw, _)| raw.len()));
-            let codec =
-                if !options().plain && max_compress_len(largest) <= i32::MAX as usize && largest <= i32::MAX as usize {
-                    f::CompressionCodec::SNAPPY
-                } else {
-                    f::CompressionCodec::UNCOMPRESSED
-                };
+            let codec = if !options().plain
+                && max_compress_len(largest) <= i32::MAX as usize
+                && largest <= i32::MAX as usize
+            {
+                f::CompressionCodec::SNAPPY
+            } else {
+                f::CompressionCodec::UNCOMPRESSED
+            };
             let first = self.pos;
             let mut uncompressed = 0;
             let mut encodings = vec![f::Encoding::PLAIN];
@@ -794,7 +836,9 @@ mod direct {
             macro_rules! append_column {
                 ($field:ident) => {{
                     merged.$field.reserve_exact(n);
-                    for part in &mut columns { merged.$field.append(&mut part.$field); }
+                    for part in &mut columns {
+                        merged.$field.append(&mut part.$field);
+                    }
                 }};
             }
             append_column!(person);
@@ -816,8 +860,18 @@ mod direct {
             let mut start = 0;
             while start < daily.person.len() {
                 let t = measure.then(std::time::Instant::now);
-                let end = group.prepare_rows(&daily, start, names, dimensions, categories.as_ref(), dictionary, base)?;
-                if let Some(t) = t { prepare_ns += t.elapsed().as_nanos() as u64; }
+                let end = group.prepare_rows(
+                    &daily,
+                    start,
+                    names,
+                    dimensions,
+                    categories.as_ref(),
+                    dictionary,
+                    base,
+                )?;
+                if let Some(t) = t {
+                    prepare_ns += t.elapsed().as_nanos() as u64;
+                }
                 let t = measure.then(std::time::Instant::now);
                 writer.group(
                     &daily,
@@ -827,17 +881,24 @@ mod direct {
                     &mut numbers,
                     categories.as_ref(),
                 )?;
-                if let Some(t) = t { encode_write_ns += t.elapsed().as_nanos() as u64; }
+                if let Some(t) = t {
+                    encode_write_ns += t.elapsed().as_nanos() as u64;
+                }
                 start = end;
             }
             base += daily.person.len();
-            if hold { held.push(daily); }
+            if hold {
+                held.push(daily);
+            }
         }
         let groups = writer.groups.len();
         writer.close()?;
         if measure {
-            eprintln!("profile {}", serde_json::json!({"stage":"user_writer_work","part":part,
-                "rows":base,"row_groups":groups,"prepare_ns":prepare_ns,"encode_write_ns":encode_write_ns}));
+            eprintln!(
+                "profile {}",
+                serde_json::json!({"stage":"user_writer_work","part":part,
+                "rows":base,"row_groups":groups,"prepare_ns":prepare_ns,"encode_write_ns":encode_write_ns})
+            );
         }
         drop(held);
         Ok(())

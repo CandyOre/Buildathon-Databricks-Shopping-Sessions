@@ -12,9 +12,9 @@
 //! With `PERF_ROUTE_INPUT_PAGES=1`, both full and packed lanes write
 //! directly into 4 KiB pages. WRITES selects ordinary, batched, or streaming
 //! stores for these lanes. Native pages take priority over a slab.
+mod forward;
 mod packed;
 mod storage;
-mod forward;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -140,11 +140,11 @@ enum EventStripe {
 }
 
 impl EventKeys {
-    fn prefixes(&self,part:usize)->(&[EventRow],&[packed::ShortEvent]) {
+    fn prefixes(&self, part: usize) -> (&[EventRow], &[packed::ShortEvent]) {
         match &self.stripe {
-            None => (&[],&[]),
-            Some(EventStripe::Full(s)) => (s.prefix(part),&[]),
-            Some(EventStripe::Short(s)) => (&[],s.prefix(part)),
+            None => (&[], &[]),
+            Some(EventStripe::Full(s)) => (s.prefix(part), &[]),
+            Some(EventStripe::Short(s)) => (&[], s.prefix(part)),
         }
     }
 }
@@ -303,7 +303,8 @@ struct RawClick {
 
 // Each of these records consists entirely of initialized integers. Its size
 // equals the sum of its field widths, so byte-wise SIMD copies see no padding.
-const _:()=assert!(size_of::<RawClick>()==8*3+4*2&&size_of::<EventRow>()==8*2+4*2);
+const _: () =
+    assert!(size_of::<RawClick>() == 8 * 3 + 4 * 2 && size_of::<EventRow>() == 8 * 2 + 4 * 2);
 unsafe impl storage::PageRecord for EventRow {}
 unsafe impl storage::PageRecord for RawClick {}
 unsafe impl storage::PageRecord for packed::ShortEvent {}
@@ -331,7 +332,7 @@ struct Work {
     exchange_time: Duration,
     winner_time: Duration,
     scan_tasks: usize,
-    stripe_rows:usize,
+    stripe_rows: usize,
 }
 
 struct Winners {
@@ -375,14 +376,18 @@ struct Plan {
     flat: bool,
     forward_blocks: bool,
     chunk_group: usize,
-    slab:bool,
-    input_pages:bool,
+    slab: bool,
+    input_pages: bool,
 }
 
 impl Plan {
-    fn chunks_per_task(self, n:usize) -> usize {
-        let target=if self.input_pages {self.chunk_group.max(16)} else {self.chunk_group};
-        target.min((n/(rayon::current_num_threads()*2)).max(1))
+    fn chunks_per_task(self, n: usize) -> usize {
+        let target = if self.input_pages {
+            self.chunk_group.max(16)
+        } else {
+            self.chunk_group
+        };
+        target.min((n / (rayon::current_num_threads() * 2)).max(1))
     }
     fn new(bytes: usize) -> Result<Self> {
         let event_parts = bytes.div_ceil(3 << 20).clamp(8, 2048).next_power_of_two();
@@ -394,7 +399,10 @@ impl Plan {
             _ => anyhow::bail!("unknown PERF_ROUTE_WRITES"),
         };
         let chunk_group = switch("PERF_ROUTE_CHUNKS", "1").parse::<usize>()?;
-        ensure!((1..=128).contains(&chunk_group), "PERF_ROUTE_CHUNKS must be 1..128");
+        ensure!(
+            (1..=128).contains(&chunk_group),
+            "PERF_ROUTE_CHUNKS must be 1..128"
+        );
         Ok(Self {
             event_parts: config_size("PERF_ROUTE_EVENT_BUCKETS", event_parts)?,
             user_parts: config_size("PERF_ROUTE_USER_BUCKETS", user_parts)?,
@@ -408,8 +416,8 @@ impl Plan {
             flat: switch("PERF_ROUTE_GROUPS", "map") == "flat",
             forward_blocks: switch("PERF_ROUTE_FORWARD", "rows") == "blocks",
             chunk_group,
-            slab:switch("PERF_ROUTE_SLAB","0")=="1",
-            input_pages:switch("PERF_ROUTE_INPUT_PAGES","0")=="1",
+            slab: switch("PERF_ROUTE_SLAB", "0") == "1",
+            input_pages: switch("PERF_ROUTE_INPUT_PAGES", "0") == "1",
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
             p1: switch("PERF_ROUTE_P1", "1") != "0",
             early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
@@ -499,48 +507,79 @@ struct Fragment {
     prefix_len: u32,
     full: Vec<EventRow>,
     short: Vec<packed::ShortEvent>,
-    pages:NativeBlock<EventRow,packed::ShortEvent>,
+    pages: NativeBlock<EventRow, packed::ShortEvent>,
 }
 
-struct NativeBlock<T:Copy,S:Copy> {
+struct NativeBlock<T: Copy, S: Copy> {
     // Ordinary Vec/slab fragments need just one null pointer per fragment.
-    lanes:Option<Box<(Option<storage::Pages<T>>,Option<storage::Pages<S>>)>>,
+    lanes: Option<Box<(Option<storage::Pages<T>>, Option<storage::Pages<S>>)>>,
 }
 
-impl<T:Copy,S:Copy> Default for NativeBlock<T,S> {
-    fn default()->Self {Self{lanes:None}}
-}
-
-impl<T:Copy,S:Copy> NativeBlock<T,S> {
-    fn new(full:Option<storage::Pages<T>>,short:Option<storage::Pages<S>>)->Self {
-        Self{lanes:if full.is_some()||short.is_some() {Some(Box::new((full,short)))}else{None}}
+impl<T: Copy, S: Copy> Default for NativeBlock<T, S> {
+    fn default() -> Self {
+        Self { lanes: None }
     }
-    fn full(&self)->Option<&storage::Pages<T>> {self.lanes.as_deref()?.0.as_ref()}
-    fn short(&self)->Option<&storage::Pages<S>> {self.lanes.as_deref()?.1.as_ref()}
-    fn len(&self)->usize {self.full().map_or(0,|p|p.len())+self.narrow_len()}
-    fn narrow_len(&self)->usize {self.short().map_or(0,|p|p.len())}
-    fn capacity_bytes(&self)->usize {self.full().map_or(0,|p|p.capacity_bytes())+self.short().map_or(0,|p|p.capacity_bytes())}
 }
 
-struct NativeWriters<T:storage::PageRecord,S:storage::PageRecord> {
-    full:storage::InputWriter<T>,
-    short:Option<storage::InputWriter<S>>,
-}
-
-impl<T:storage::PageRecord,S:storage::PageRecord> NativeWriters<T,S> {
-    fn new(arena:&storage::Arena,parts:usize,plan:Plan,kind:storage::InputKind)->Self {
-        Self {full:storage::InputWriter::new(arena,parts,plan.writes,kind),
-              short:plan.packed.then(||storage::InputWriter::new(arena,parts,plan.writes,kind))}
+impl<T: Copy, S: Copy> NativeBlock<T, S> {
+    fn new(full: Option<storage::Pages<T>>, short: Option<storage::Pages<S>>) -> Self {
+        Self {
+            lanes: if full.is_some() || short.is_some() {
+                Some(Box::new((full, short)))
+            } else {
+                None
+            },
+        }
     }
-    fn finish(self)->Vec<NativeBlock<T,S>> {
-        let mut short=self.short.map(storage::InputWriter::finish).unwrap_or_default().into_iter();
-        self.full.finish().into_iter().map(|full|NativeBlock::new(full,short.next().flatten())).collect()
+    fn full(&self) -> Option<&storage::Pages<T>> {
+        self.lanes.as_deref()?.0.as_ref()
+    }
+    fn short(&self) -> Option<&storage::Pages<S>> {
+        self.lanes.as_deref()?.1.as_ref()
+    }
+    fn len(&self) -> usize {
+        self.full().map_or(0, |p| p.len()) + self.narrow_len()
+    }
+    fn narrow_len(&self) -> usize {
+        self.short().map_or(0, |p| p.len())
+    }
+    fn capacity_bytes(&self) -> usize {
+        self.full().map_or(0, |p| p.capacity_bytes())
+            + self.short().map_or(0, |p| p.capacity_bytes())
+    }
+}
+
+struct NativeWriters<T: storage::PageRecord, S: storage::PageRecord> {
+    full: storage::InputWriter<T>,
+    short: Option<storage::InputWriter<S>>,
+}
+
+impl<T: storage::PageRecord, S: storage::PageRecord> NativeWriters<T, S> {
+    fn new(arena: &storage::Arena, parts: usize, plan: Plan, kind: storage::InputKind) -> Self {
+        Self {
+            full: storage::InputWriter::new(arena, parts, plan.writes, kind),
+            short: plan
+                .packed
+                .then(|| storage::InputWriter::new(arena, parts, plan.writes, kind)),
+        }
+    }
+    fn finish(self) -> Vec<NativeBlock<T, S>> {
+        let mut short = self
+            .short
+            .map(storage::InputWriter::finish)
+            .unwrap_or_default()
+            .into_iter();
+        self.full
+            .finish()
+            .into_iter()
+            .map(|full| NativeBlock::new(full, short.next().flatten()))
+            .collect()
     }
 }
 
 impl Fragment {
     fn len(&self) -> usize {
-        self.full.len() + self.short.len()+self.prefix_len as usize+self.pages.len()
+        self.full.len() + self.short.len() + self.prefix_len as usize + self.pages.len()
     }
     fn rows<'a>(
         &'a self,
@@ -550,11 +589,19 @@ impl Fragment {
         let chunk = self.chunk;
         let k = &keys[chunk as usize];
         let p = &payloads[chunk as usize];
-        let (full,small)=k.prefixes(self.bucket as usize);
-        full.iter().chain(&self.full).copied()
-            .chain(self.pages.full().into_iter().flat_map(|p|p.iter()))
-            .chain(small.iter().chain(&self.short).copied()
-                .chain(self.pages.short().into_iter().flat_map(|p|p.iter())).map(move |s| s.unpack(k, p)))
+        let (full, small) = k.prefixes(self.bucket as usize);
+        full.iter()
+            .chain(&self.full)
+            .copied()
+            .chain(self.pages.full().into_iter().flat_map(|p| p.iter()))
+            .chain(
+                small
+                    .iter()
+                    .chain(&self.short)
+                    .copied()
+                    .chain(self.pages.short().into_iter().flat_map(|p| p.iter()))
+                    .map(move |s| s.unpack(k, p)),
+            )
             .map(move |row| Candidate { row, chunk })
     }
 }
@@ -565,17 +612,31 @@ enum Rows {
 }
 
 impl Rows {
-    fn visit_ids(&self,keys:&[EventKeys], mut emit:impl FnMut(u64)) {
+    fn visit_ids(&self, keys: &[EventKeys], mut emit: impl FnMut(u64)) {
         match self {
-            Self::Fragments(pieces)=>for p in pieces {
-                let keys=&keys[p.chunk as usize];
-                let (full,short)=keys.prefixes(p.bucket as usize);
-                for row in full.iter().chain(&p.full) {emit(row.id);}
-                for row in short.iter().chain(&p.short) {emit(row.key(keys));}
-                if let Some(page)=p.pages.full() {for row in page.iter(){emit(row.id);}}
-                if let Some(page)=p.pages.short() {for row in page.iter(){emit(row.key(keys));}}
-            },
-            Self::Pages(p)=>p.iter().for_each(|c| emit(c.row.id)),
+            Self::Fragments(pieces) => {
+                for p in pieces {
+                    let keys = &keys[p.chunk as usize];
+                    let (full, short) = keys.prefixes(p.bucket as usize);
+                    for row in full.iter().chain(&p.full) {
+                        emit(row.id);
+                    }
+                    for row in short.iter().chain(&p.short) {
+                        emit(row.key(keys));
+                    }
+                    if let Some(page) = p.pages.full() {
+                        for row in page.iter() {
+                            emit(row.id);
+                        }
+                    }
+                    if let Some(page) = p.pages.short() {
+                        for row in page.iter() {
+                            emit(row.key(keys));
+                        }
+                    }
+                }
+            }
+            Self::Pages(p) => p.iter().for_each(|c| emit(c.row.id)),
         }
     }
 
@@ -602,30 +663,54 @@ fn event_winners(
     let other_ids = Names::default();
     let calendar = Calendar::new(window);
     let base = window.start.div_euclid(1000);
-    let scan_start=Instant::now();
-    let bucket_header=size_of::<Vec<EventRow>>() * if plan.packed {2} else {1};
-    let stripe_padding=if plan.slab {8*if plan.packed {size_of::<packed::ShortEvent>()} else {size_of::<EventRow>()} + size_of::<u32>()} else {0};
-    let groups=crate::csv::work_groups(&plans,plan.chunks_per_task(plans.len()),plan.event_parts*(bucket_header+stripe_padding));
-    let chunks = crate::runtime::stage_map("route_decode_events",groups,|sources| {
-            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.event_parts,plan,storage::InputKind::Event));
-            let mut sink = BucketWriter::new(if plan.input_pages {0} else {plan.event_parts}, plan.writes);
-            let mut narrow = if plan.packed && !plan.input_pages {
-                empty_buckets(plan.event_parts)
+    let scan_start = Instant::now();
+    let bucket_header = size_of::<Vec<EventRow>>() * if plan.packed { 2 } else { 1 };
+    let stripe_padding = if plan.slab {
+        8 * if plan.packed {
+            size_of::<packed::ShortEvent>()
+        } else {
+            size_of::<EventRow>()
+        } + size_of::<u32>()
+    } else {
+        0
+    };
+    let groups = crate::csv::work_groups(
+        &plans,
+        plan.chunks_per_task(plans.len()),
+        plan.event_parts * (bucket_header + stripe_padding),
+    );
+    let chunks = crate::runtime::stage_map("route_decode_events", groups, |sources| {
+        let mut pages = plan
+            .input_pages
+            .then(|| NativeWriters::new(arena, plan.event_parts, plan, storage::InputKind::Event));
+        let mut sink = BucketWriter::new(
+            if plan.input_pages {
+                0
             } else {
-                Vec::new()
-            };
-            let (mut keys, mut data) = (EventKeys::default(), EventData::default());
-            let mut stripe=(plan.slab && !plan.input_pages).then(||{
-                // This reserve uses the same conservative byte density as
-                // the original scorer. Actual keys still determine all rows.
-                let bytes=sources.iter().map(Chunk::byte_len).sum::<usize>();
-                let stride=bytes.div_ceil(70*plan.event_parts)+8;
-                if plan.packed {EventStripe::Short(storage::Stripe::new(plan.event_parts,stride))}
-                else {EventStripe::Full(storage::Stripe::new(plan.event_parts,stride))}
-            });
-            let mut valid_count = 0;
-            for chunk in sources {
-                chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
+                plan.event_parts
+            },
+            plan.writes,
+        );
+        let mut narrow = if plan.packed && !plan.input_pages {
+            empty_buckets(plan.event_parts)
+        } else {
+            Vec::new()
+        };
+        let (mut keys, mut data) = (EventKeys::default(), EventData::default());
+        let mut stripe = (plan.slab && !plan.input_pages).then(|| {
+            // This reserve uses the same conservative byte density as
+            // the original scorer. Actual keys still determine all rows.
+            let bytes = sources.iter().map(Chunk::byte_len).sum::<usize>();
+            let stride = bytes.div_ceil(70 * plan.event_parts) + 8;
+            if plan.packed {
+                EventStripe::Short(storage::Stripe::new(plan.event_parts, stride))
+            } else {
+                EventStripe::Full(storage::Stripe::new(plan.event_parts, stride))
+            }
+        });
+        let mut valid_count = 0;
+        for chunk in sources {
+            chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, valid| {
                 let key = encode(id, b'e', &mut keys.wide, &other_ids, plan.packed);
                 let (user, stamp) = match valid {
                     Some((time, sale)) => {
@@ -646,61 +731,90 @@ fn event_winners(
                 let bucket = hash(key) as usize & (plan.event_parts - 1);
                 if plan.packed {
                     if let Some(s) = packed::ShortEvent::pack(row) {
-                        if let Some(w)=&mut pages {w.short.as_mut().unwrap().push(bucket,s);return;}
-                        if let Some(EventStripe::Short(slab))=&mut stripe {
-                            if slab.push(bucket,s) {return;}
+                        if let Some(w) = &mut pages {
+                            w.short.as_mut().unwrap().push(bucket, s);
+                            return;
+                        }
+                        if let Some(EventStripe::Short(slab)) = &mut stripe {
+                            if slab.push(bucket, s) {
+                                return;
+                            }
                         }
                         narrow[bucket].push(s);
                         return;
                     }
                 }
-                if let Some(w)=&mut pages {w.full.push(bucket,row);return;}
-                if let Some(EventStripe::Full(slab))=&mut stripe {
-                    if slab.push(bucket,row) {return;}
+                if let Some(w) = &mut pages {
+                    w.full.push(bucket, row);
+                    return;
+                }
+                if let Some(EventStripe::Full(slab)) = &mut stripe {
+                    if slab.push(bucket, row) {
+                        return;
+                    }
                 }
                 sink.push(bucket, row);
-                })?;
-            }
-            keys.stripe=stripe;
-            Ok::<_, anyhow::Error>((sink.finish(), narrow, pages.map(NativeWriters::finish).unwrap_or_default(),keys, data, valid_count))
-        })
-        .into_iter().collect::<Result<Vec<_>>>()?;
+            })?;
+        }
+        keys.stripe = stripe;
+        Ok::<_, anyhow::Error>((
+            sink.finish(),
+            narrow,
+            pages.map(NativeWriters::finish).unwrap_or_default(),
+            keys,
+            data,
+            valid_count,
+        ))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     drop(other_ids);
-    let exchange_start=Instant::now();
+    let exchange_start = Instant::now();
 
     let mut pieces: Vec<Vec<Fragment>> = empty_buckets(plan.event_parts);
     let mut keys = Vec::with_capacity(chunks.len());
     let mut payloads = Vec::with_capacity(chunks.len());
     let mut work = Work::default();
-    work.scan_time=exchange_start.duration_since(scan_start);
-    work.scan_tasks=chunks.len();
-    for (i, (buckets, narrow, pages,k, p, valid)) in chunks.into_iter().enumerate() {
+    work.scan_time = exchange_start.duration_since(scan_start);
+    work.scan_tasks = chunks.len();
+    for (i, (buckets, narrow, pages, k, p, valid)) in chunks.into_iter().enumerate() {
         let chunk = u32::try_from(i)?;
         work.valid += valid;
         work.wide_events += k.wide.len();
         work.wide_users += p.users.len();
         work.ingest_side += k.ingests.len();
         work.side_rows += p.extra.len();
-        if let Some(s)=&k.stripe {
-            work.event_capacity+=match s {EventStripe::Full(v)=>v.capacity_bytes(),EventStripe::Short(v)=>v.capacity_bytes()};
+        if let Some(s) = &k.stripe {
+            work.event_capacity += match s {
+                EventStripe::Full(v) => v.capacity_bytes(),
+                EventStripe::Short(v) => v.capacity_bytes(),
+            };
         }
         payloads.push(p);
         let mut narrow = narrow.into_iter();
-        let mut full=buckets.into_iter();
-        let mut pages=pages.into_iter();
-        for (part,dest) in pieces.iter_mut().enumerate() {
-            let full=full.next().unwrap_or_default();
-            let page=pages.next().unwrap_or_default();
+        let mut full = buckets.into_iter();
+        let mut pages = pages.into_iter();
+        for (part, dest) in pieces.iter_mut().enumerate() {
+            let full = full.next().unwrap_or_default();
+            let page = pages.next().unwrap_or_default();
             let short = narrow.next().unwrap_or_default();
-            let (full_prefix,short_prefix)=k.prefixes(part);
-            let prefix_len=u32::try_from(full_prefix.len()+short_prefix.len())?;
-            work.stripe_rows+=prefix_len as usize;
-            work.parsed += full.len() + short.len()+prefix_len as usize+page.len();
-            work.packed_events += short.len()+short_prefix.len()+page.narrow_len();
+            let (full_prefix, short_prefix) = k.prefixes(part);
+            let prefix_len = u32::try_from(full_prefix.len() + short_prefix.len())?;
+            work.stripe_rows += prefix_len as usize;
+            work.parsed += full.len() + short.len() + prefix_len as usize + page.len();
+            work.packed_events += short.len() + short_prefix.len() + page.narrow_len();
             work.event_capacity += full.capacity() * size_of::<EventRow>()
-                + short.capacity() * size_of::<packed::ShortEvent>()+page.capacity_bytes();
-            if page.len()!=0 || prefix_len!=0 || !(full.is_empty() && short.is_empty()) {
-                dest.push(Fragment { chunk, bucket:part as u16, prefix_len, full, short, pages:page });
+                + short.capacity() * size_of::<packed::ShortEvent>()
+                + page.capacity_bytes();
+            if page.len() != 0 || prefix_len != 0 || !(full.is_empty() && short.is_empty()) {
+                dest.push(Fragment {
+                    chunk,
+                    bucket: part as u16,
+                    prefix_len,
+                    full,
+                    short,
+                    pages: page,
+                });
             }
         }
         keys.push(k);
@@ -715,17 +829,25 @@ fn event_winners(
         work.max_event_bucket = *sizes.last().unwrap_or(&0);
         work.median_event_bucket = sizes[sizes.len() / 2];
     }
-    let winner_start=Instant::now();
-    work.exchange_time=winner_start.duration_since(exchange_start);
-    let results = crate::runtime::stage_map_init("route_event_dedup",pieces,4,Scratch::default, |scratch, pieces| {
+    let winner_start = Instant::now();
+    work.exchange_time = winner_start.duration_since(exchange_start);
+    let results = crate::runtime::stage_map_init(
+        "route_event_dedup",
+        pieces,
+        4,
+        Scratch::default,
+        |scratch, pieces| {
             if !plan.reuse {
                 *scratch = Scratch::default();
             }
             let n: usize = pieces.iter().map(Fragment::len).sum();
             // Hash bits already consumed by partitioning cannot discriminate
             // bitmap slots. Avoid allocating unreachable addresses.
-            let reachable=1usize<<(30-plan.event_parts.trailing_zeros());
-            let slots=n.saturating_mul(plan.factor).clamp(64,reachable).next_power_of_two();
+            let reachable = 1usize << (30 - plan.event_parts.trailing_zeros());
+            let slots = n
+                .saturating_mul(plan.factor)
+                .clamp(64, reachable)
+                .next_power_of_two();
             let rows = if plan.arena && !plan.input_pages {
                 let all = pieces.iter().flat_map(|p| p.rows(&keys, &payloads));
                 Rows::Pages(arena.pack(all))
@@ -805,7 +927,8 @@ fn event_winners(
                 route(c);
             }
             (output, count, disputed, duplicate, linear.probes)
-        });
+        },
+    );
     drop(keys);
     let mut partitions: Vec<Pieces<WinnerRow>> = empty_buckets(plan.user_parts);
     let mut count = 0;
@@ -820,7 +943,7 @@ fn event_winners(
             }
         }
     }
-    work.winner_time=winner_start.elapsed();
+    work.winner_time = winner_start.elapsed();
     Ok(Winners {
         partitions,
         data: payloads,
@@ -833,17 +956,22 @@ struct ClickBlock {
     chunk: u32,
     full: Vec<RawClick>,
     short: Vec<packed::ShortClick>,
-    pages:NativeBlock<RawClick,packed::ShortClick>,
+    pages: NativeBlock<RawClick, packed::ShortClick>,
 }
 
 impl ClickBlock {
-    fn decoded(self,base:i64,wide:&[[u64;2]])->impl Iterator<Item=RawClick> + '_ {
-        let chunk=self.chunk;
-        let (full,short)=self.pages.lanes.map(|p|*p).unwrap_or_default();
-        self.full.into_iter()
+    fn decoded(self, base: i64, wide: &[[u64; 2]]) -> impl Iterator<Item = RawClick> + '_ {
+        let chunk = self.chunk;
+        let (full, short) = self.pages.lanes.map(|p| *p).unwrap_or_default();
+        self.full
+            .into_iter()
             .chain(full.into_iter().flatten())
-            .chain(self.short.into_iter().chain(short.into_iter().flatten())
-                .map(move |c|c.unpack(chunk,base,wide)))
+            .chain(
+                self.short
+                    .into_iter()
+                    .chain(short.into_iter().flatten())
+                    .map(move |c| c.unpack(chunk, base, wide)),
+            )
     }
 }
 
@@ -860,28 +988,34 @@ fn raw_clicks(
     window: Window,
     dimensions: &Dimensions,
     raw_users: &Names,
-    arena:&storage::Arena,
+    arena: &storage::Arena,
 ) -> Result<ClickInput> {
     let fallback = Names::default();
     let calendar = Calendar::new(window);
-    let started=Instant::now();
+    let started = Instant::now();
     let sources = chunks(&data.join("clicks"))?;
-    let metadata=plan.user_parts*size_of::<Vec<RawClick>>() * if plan.packed {2} else {1};
-    let groups=crate::csv::work_groups(&sources,plan.chunks_per_task(sources.len()),metadata);
-    let groups=groups.into_iter().enumerate().collect();
-    let pieces = crate::runtime::stage_map("route_decode_clicks",groups,|(i, sources)| {
-            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.user_parts,plan,storage::InputKind::Click));
-            let mut output: Pieces<RawClick> = if plan.input_pages { Vec::new() } else {empty_buckets(plan.user_parts)};
-            let mut narrow = if plan.packed && !plan.input_pages {
-                empty_buckets(plan.user_parts)
-            } else {
-                Vec::new()
-            };
-            let mut users = Vec::new();
-            let mut ids = ClickKeyChunk::new(i);
-            let chunk_id = u32::try_from(i)?;
-            for chunk in sources {
-                chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
+    let metadata = plan.user_parts * size_of::<Vec<RawClick>>() * if plan.packed { 2 } else { 1 };
+    let groups = crate::csv::work_groups(&sources, plan.chunks_per_task(sources.len()), metadata);
+    let groups = groups.into_iter().enumerate().collect();
+    let pieces = crate::runtime::stage_map("route_decode_clicks", groups, |(i, sources)| {
+        let mut pages = plan
+            .input_pages
+            .then(|| NativeWriters::new(arena, plan.user_parts, plan, storage::InputKind::Click));
+        let mut output: Pieces<RawClick> = if plan.input_pages {
+            Vec::new()
+        } else {
+            empty_buckets(plan.user_parts)
+        };
+        let mut narrow = if plan.packed && !plan.input_pages {
+            empty_buckets(plan.user_parts)
+        } else {
+            Vec::new()
+        };
+        let mut users = Vec::new();
+        let mut ids = ClickKeyChunk::new(i);
+        let chunk_id = u32::try_from(i)?;
+        for chunk in sources {
+            chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
                 let user = encode(user, b'u', &mut users, raw_users, plan.packed);
                 let part = hash(user) as usize & (plan.user_parts - 1);
                 let mut encoded = None;
@@ -906,45 +1040,58 @@ fn raw_clicks(
                         )
                     });
                     if let Some(c) = compact {
-                        if let Some(w)=&mut pages {w.short.as_mut().unwrap().push(part,c);}
-                        else {narrow[part].push(c);}
+                        if let Some(w) = &mut pages {
+                            w.short.as_mut().unwrap().push(part, c);
+                        } else {
+                            narrow[part].push(c);
+                        }
                         return;
                     }
                 }
                 let id = encoded.unwrap_or_else(|| ids.encode(id, &fallback));
-                let row=RawClick {
+                let row = RawClick {
                     user,
                     time,
                     id,
                     campaign,
                     chunk: chunk_id,
                 };
-                if let Some(w)=&mut pages {w.full.push(part,row);}
-                else {output[part].push(row);}
-                })?;
-            }
-            Ok::<_, anyhow::Error>((output, narrow, pages.map(NativeWriters::finish).unwrap_or_default(),users, ids))
-        })
-        .into_iter().collect::<Result<Vec<_>>>()?;
+                if let Some(w) = &mut pages {
+                    w.full.push(part, row);
+                } else {
+                    output[part].push(row);
+                }
+            })?;
+        }
+        Ok::<_, anyhow::Error>((
+            output,
+            narrow,
+            pages.map(NativeWriters::finish).unwrap_or_default(),
+            users,
+            ids,
+        ))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     let mut partitions: Vec<Vec<ClickBlock>> = empty_buckets(plan.user_parts);
     let mut users = Vec::with_capacity(pieces.len());
     let mut ids = Vec::with_capacity(pieces.len());
-    for (i, (out, narrow, pages,u, k)) in pieces.into_iter().enumerate() {
+    for (i, (out, narrow, pages, u, k)) in pieces.into_iter().enumerate() {
         users.push(u);
         ids.push(k);
         let mut narrow = narrow.into_iter();
-        let mut full=out.into_iter();
-        let mut pages=pages.into_iter();
+        let mut full = out.into_iter();
+        let mut pages = pages.into_iter();
         for dest in &mut partitions {
-            let full=full.next().unwrap_or_default();
-            let page=pages.next().unwrap_or_default();
+            let full = full.next().unwrap_or_default();
+            let page = pages.next().unwrap_or_default();
             let short = narrow.next().unwrap_or_default();
-            if page.len()!=0 || !(full.is_empty() && short.is_empty()) {
+            if page.len() != 0 || !(full.is_empty() && short.is_empty()) {
                 dest.push(ClickBlock {
                     chunk: i as u32,
                     full,
                     short,
-                    pages:page,
+                    pages: page,
                 });
             }
         }
@@ -976,24 +1123,28 @@ enum Destinations {
 }
 
 impl Destinations {
-    fn new(plan:Plan)->Self {
+    fn new(plan: Plan) -> Self {
         if plan.flat {
-            Self::Dense((0..plan.user_parts).map(|_|Forward::default()).collect())
+            Self::Dense((0..plan.user_parts).map(|_| Forward::default()).collect())
         } else {
             Self::Sparse(AHashMap::default())
         }
     }
     #[inline]
-    fn get(&mut self,bucket:usize)->&mut Forward {
+    fn get(&mut self, bucket: usize) -> &mut Forward {
         match self {
-            Self::Sparse(map)=>map.entry(bucket).or_default(),
-            Self::Dense(rows)=>&mut rows[bucket],
+            Self::Sparse(map) => map.entry(bucket).or_default(),
+            Self::Dense(rows) => &mut rows[bucket],
         }
     }
-    fn into_blocks(self)->Vec<(usize,Forward)> {
+    fn into_blocks(self) -> Vec<(usize, Forward)> {
         match self {
-            Self::Sparse(map)=>map.into_iter().collect(),
-            Self::Dense(rows)=>rows.into_iter().enumerate().filter(|(_,r)|!(r.events.is_empty()&&r.clicks.is_empty())).collect(),
+            Self::Sparse(map) => map.into_iter().collect(),
+            Self::Dense(rows) => rows
+                .into_iter()
+                .enumerate()
+                .filter(|(_, r)| !(r.events.is_empty() && r.clicks.is_empty()))
+                .collect(),
         }
     }
 }
@@ -1051,16 +1202,24 @@ impl People {
             events,
             clicks,
         } = self;
-        let n=events.len();
-        Self::finish_groups(groups,events.into_iter(),clicks.into_iter(),n,false,window,data)
+        let n = events.len();
+        Self::finish_groups(
+            groups,
+            events.into_iter(),
+            clicks.into_iter(),
+            n,
+            false,
+            window,
+            data,
+        )
     }
 
     fn finish_groups(
-        groups:Vec<(u32,Counts)>,
-        events:impl Iterator<Item=PersonEvent>,
-        clicks:impl Iterator<Item=Click>,
-        event_count:usize,
-        ordered_ids:bool,
+        groups: Vec<(u32, Counts)>,
+        events: impl Iterator<Item = PersonEvent>,
+        clicks: impl Iterator<Item = Click>,
+        event_count: usize,
+        ordered_ids: bool,
         window: Window,
         data: &[EventData],
     ) -> (SessionBatch, Vec<Click>) {
@@ -1192,13 +1351,19 @@ struct Resolver<'a> {
     cache: PersonCache,
     p1: bool,
     numeric: bool,
-    hot: Vec<(u64,Target)>,
+    hot: Vec<(u64, Target)>,
     bucket_bits: u32,
 }
 
 impl Resolver<'_> {
     #[inline]
-    fn target(&mut self, user: u64, wide: &[[u64; 2]], local: &mut People, outbound: &mut forward::Builder) -> Target {
+    fn target(
+        &mut self,
+        user: u64,
+        wide: &[[u64; 2]],
+        local: &mut People,
+        outbound: &mut forward::Builder,
+    ) -> Target {
         macro_rules! resolve {
             ($map:expr, $key:expr) => {
                 *$map.entry($key).or_insert_with(|| {
@@ -1219,11 +1384,13 @@ impl Resolver<'_> {
         } else if !self.hot.is_empty() {
             // All spellings reaching this task have the same low partition
             // bits. Use independent fingerprint bits for the private cache.
-            let i=(hash(user) as usize>>self.bucket_bits)&(self.hot.len()-1);
-            let (old,value)=self.hot[i];
-            if old==user {return value;}
-            let target=resolve!(self.compact,user);
-            self.hot[i]=(user,target);
+            let i = (hash(user) as usize >> self.bucket_bits) & (self.hot.len() - 1);
+            let (old, value) = self.hot[i];
+            if old == user {
+                return value;
+            }
+            let target = resolve!(self.compact, user);
+            self.hot[i] = (user, target);
             target
         } else {
             resolve!(self.compact, user)
@@ -1255,10 +1422,16 @@ fn first_pass(
     arena: &storage::Arena,
 ) -> P1 {
     let start = Instant::now();
-    let cap=if plan.flat {
-        let rows=events.iter().map(Vec::len).sum::<usize>()+clicks.iter().map(|c|c.full.len()+c.short.len()+c.pages.len()).sum::<usize>();
-        (rows/8).clamp(128,32768).next_power_of_two()
-    } else {0};
+    let cap = if plan.flat {
+        let rows = events.iter().map(Vec::len).sum::<usize>()
+            + clicks
+                .iter()
+                .map(|c| c.full.len() + c.short.len() + c.pages.len())
+                .sum::<usize>();
+        (rows / 8).clamp(128, 32768).next_power_of_two()
+    } else {
+        0
+    };
     let mut ids = Resolver {
         compact: AHashMap::default(),
         wide: AHashMap::default(),
@@ -1268,13 +1441,18 @@ fn first_pass(
         cache: PersonCache::default(),
         p1: plan.p1,
         numeric: plan.packed,
-        hot: vec![(u64::MAX,Target::Here(0)); cap],
-        bucket_bits:plan.user_parts.trailing_zeros(),
+        hot: vec![(u64::MAX, Target::Here(0)); cap],
+        bucket_bits: plan.user_parts.trailing_zeros(),
     };
     let mut local = People::default();
     let mut forwarded = forward::Builder::new(plan);
     for r in events.into_iter().flatten() {
-        let dest = ids.target(r.user, &data[r.chunk as usize].users, &mut local, &mut forwarded);
+        let dest = ids.target(
+            r.user,
+            &data[r.chunk as usize].users,
+            &mut local,
+            &mut forwarded,
+        );
         let person = match dest {
             Target::Here(p) | Target::Forward(p) => p,
         };
@@ -1285,11 +1463,16 @@ fn first_pass(
         };
         match dest {
             Target::Here(_) => local.event(row, data),
-            Target::Forward(_) => forwarded.event(row,data),
+            Target::Forward(_) => forwarded.event(row, data),
         }
     }
     let mut accept_click = |c: RawClick| {
-        let dest = ids.target(c.user, &click_users[c.chunk as usize], &mut local, &mut forwarded);
+        let dest = ids.target(
+            c.user,
+            &click_users[c.chunk as usize],
+            &mut local,
+            &mut forwarded,
+        );
         let person = match dest {
             Target::Here(p) | Target::Forward(p) => p,
         };
@@ -1308,7 +1491,7 @@ fn first_pass(
     let decoded = clicks.into_iter().flat_map(|block| {
         let chunk = block.chunk;
         let wide = &click_users[chunk as usize];
-        block.decoded(base,wide)
+        block.decoded(base, wide)
     });
     if plan.arena && !plan.input_pages {
         arena.pack(decoded).iter().for_each(accept_click);
@@ -1319,12 +1502,12 @@ fn first_pass(
     let direct = local.groups.len();
     drop(ids);
     let group_time = start.elapsed();
-    let finish_start=Instant::now();
-    let local=local.finish(window,data);
-    let finish_time=finish_start.elapsed();
+    let finish_start = Instant::now();
+    let local = local.finish(window, data);
+    let finish_time = finish_start.elapsed();
     P1 {
         local,
-        forwarded:forwarded.finish(),
+        forwarded: forwarded.finish(),
         spells,
         direct,
         elapsed: start.elapsed(),
@@ -1337,20 +1520,24 @@ fn second_pass(
     pieces: Vec<Forward>,
     data: &[EventData],
     window: Window,
-    plan:Plan,
+    plan: Plan,
 ) -> (SessionBatch, Vec<Click>) {
     if plan.flat {
-        return second_flat(pieces,data,window,plan.user_parts.trailing_zeros());
+        return second_flat(pieces, data, window, plan.user_parts.trailing_zeros());
     }
     let mut groups = AHashMap::<u32, u32>::default();
     let mut local = People::default();
     for part in pieces {
         for mut row in part.events {
-            row.person = *groups.entry(row.person).or_insert_with(||local.group(row.person));
+            row.person = *groups
+                .entry(row.person)
+                .or_insert_with(|| local.group(row.person));
             local.event(row, data);
         }
         for mut row in part.clicks {
-            row.person = *groups.entry(row.person).or_insert_with(||local.group(row.person));
+            row.person = *groups
+                .entry(row.person)
+                .or_insert_with(|| local.group(row.person));
             local.click(row);
         }
     }
@@ -1358,49 +1545,73 @@ fn second_pass(
     local.finish(window, data)
 }
 
-fn second_flat(pieces:Vec<Forward>, data:&[EventData],window:Window,bits:u32)->(SessionBatch,Vec<Click>) {
+fn second_flat(
+    pieces: Vec<Forward>,
+    data: &[EventData],
+    window: Window,
+    bits: u32,
+) -> (SessionBatch, Vec<Click>) {
     // Names assigns monotonic IDs inside interleaved shards. A destination
     // owns all people sharing its low bits, so the quotient is an exact index.
     // First count rows without moving them; the scatter then reads the original
     // blocks directly, avoiding one whole write and read of forwarded rows.
-    let mut groups=Vec::<(u32,Counts)>::new();
-    fn counts(groups:&mut Vec<(u32,Counts)>,id:u32,bits:u32)->&mut Counts {
-        let slot=(id>>bits) as usize;
-        if slot>=groups.len() {groups.resize(slot+1,(0,Counts::default()));}
-        groups[slot].0=id;
+    let mut groups = Vec::<(u32, Counts)>::new();
+    fn counts(groups: &mut Vec<(u32, Counts)>, id: u32, bits: u32) -> &mut Counts {
+        let slot = (id >> bits) as usize;
+        if slot >= groups.len() {
+            groups.resize(slot + 1, (0, Counts::default()));
+        }
+        groups[slot].0 = id;
         &mut groups[slot].1
     }
-    let mut event_count=0;
+    let mut event_count = 0;
     for part in &pieces {
-        event_count+=part.events.len();
+        event_count += part.events.len();
         for row in &part.events {
-            let g=counts(&mut groups,row.person,bits);
-            g.events+=1;
-            if row.stamp>=SIDE && data[row.chunk as usize].extra[(row.stamp^SIDE) as usize].1.is_some() {
-                g.sales+=1;
+            let g = counts(&mut groups, row.person, bits);
+            g.events += 1;
+            if row.stamp >= SIDE
+                && data[row.chunk as usize].extra[(row.stamp ^ SIDE) as usize]
+                    .1
+                    .is_some()
+            {
+                g.sales += 1;
             }
         }
         for c in &part.clicks {
-            counts(&mut groups,c.person,bits).clicks+=1;
+            counts(&mut groups, c.person, bits).clicks += 1;
         }
     }
-    let events=pieces.iter().flat_map(|p|p.events.iter().copied()).map(|mut e| {e.person>>=bits;e});
-    let clicks=pieces.iter().flat_map(|p|p.clicks.iter().copied()).map(|mut c| {c.person>>=bits;c});
-    People::finish_groups(groups,events,clicks,event_count,true,window,data)
+    let events = pieces
+        .iter()
+        .flat_map(|p| p.events.iter().copied())
+        .map(|mut e| {
+            e.person >>= bits;
+            e
+        });
+    let clicks = pieces
+        .iter()
+        .flat_map(|p| p.clicks.iter().copied())
+        .map(|mut c| {
+            c.person >>= bits;
+            c
+        });
+    People::finish_groups(groups, events, clicks, event_count, true, window, data)
 }
 
 pub enum Campaigns {
-    Pending(Vec<Vec<Click>>,ClickIds),
+    Pending(Vec<Vec<Click>>, ClickIds),
     Ready(aggregate::CampaignDays),
 }
 
-pub type Routed = (Vec<SessionBatch>,Campaigns,PersonNames,usize);
+pub type Routed = (Vec<SessionBatch>, Campaigns, PersonNames, usize);
 
 pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Routed> {
     let tasks = chunks(&data.join("events"))?;
     let bytes = tasks.iter().map(Chunk::byte_len).sum();
     let plan = Plan::new(bytes)?;
-    let fused=crate::runtime::flag("PERF_ROUTE_FUSED").then(||aggregate::FusedCampaigns::new(dimensions.campaigns.len(),window));
+    let fused = crate::runtime::flag("PERF_ROUTE_FUSED")
+        .then(|| aggregate::FusedCampaigns::new(dimensions.campaigns.len(), window));
     let arena = storage::Arena::new(plan.reuse);
     let started = Instant::now();
     let read_links = || -> Result<_> {
@@ -1411,7 +1622,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let read_data = || -> Result<_> {
         let users = Names::default();
         let events = || event_winners(tasks, plan, window, dimensions, &users, &arena);
-        let clicks = || raw_clicks(data, plan, window, dimensions, &users,&arena);
+        let clicks = || raw_clicks(data, plan, window, dimensions, &users, &arena);
         let (winners, clicks) = if plan.early_clicks {
             let (ev, cl) = rayon::join(events, clicks);
             (ev?, cl?)
@@ -1436,7 +1647,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         partitions: clicks,
         users: click_users,
         ids,
-        elapsed:click_time,
+        elapsed: click_time,
     } = clicks;
     let p1_start = Instant::now();
     let (click_count, packed_clicks) = if plan.profile {
@@ -1444,7 +1655,10 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             .iter()
             .flatten()
             .fold((0usize, 0usize), |(total, small), c| {
-                (total + c.full.len() + c.short.len()+c.pages.len(), small + c.short.len()+c.pages.narrow_len())
+                (
+                    total + c.full.len() + c.short.len() + c.pages.len(),
+                    small + c.short.len() + c.pages.narrow_len(),
+                )
             })
     } else {
         (0, 0)
@@ -1454,27 +1668,27 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     } else {
         0
     };
-    let partitions=events.into_iter().zip(clicks).collect();
-    let results = crate::runtime::stage_map("route_first_pass",partitions,|(e, c)| {
-            let mut result=first_pass(
-                e,
-                c,
-                &payloads,
-                &click_users,
-                &other,
-                &users,
-                &aliases,
-                window,
-                plan,
-                &arena,
-            );
-            if let Some(acc)=&fused {
-                let start=Instant::now();
-                acc.consume(&mut result.local.0,&mut result.local.1,&ids);
-                result.elapsed+=start.elapsed();
-            }
-            result
-        });
+    let partitions = events.into_iter().zip(clicks).collect();
+    let results = crate::runtime::stage_map("route_first_pass", partitions, |(e, c)| {
+        let mut result = first_pass(
+            e,
+            c,
+            &payloads,
+            &click_users,
+            &other,
+            &users,
+            &aliases,
+            window,
+            plan,
+            &arena,
+        );
+        if let Some(acc) = &fused {
+            let start = Instant::now();
+            acc.consume(&mut result.local.0, &mut result.local.1, &ids);
+            result.elapsed += start.elapsed();
+        }
+        result
+    });
     drop(other);
     drop(aliases);
     drop(click_users);
@@ -1484,27 +1698,31 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let (mut spells, mut direct) = (0, 0);
     let mut forward_work = forward::Work::default();
     let mut longest_p1 = Duration::ZERO;
-    let (mut p1_group_tasks,mut p1_finish_tasks)=(Duration::ZERO,Duration::ZERO);
+    let (mut p1_group_tasks, mut p1_finish_tasks) = (Duration::ZERO, Duration::ZERO);
     for r in results {
         spells += r.spells;
         direct += r.direct;
         longest_p1 = longest_p1.max(r.elapsed);
-        p1_group_tasks+=r.group_time;
-        p1_finish_tasks+=r.finish_time;
+        p1_group_tasks += r.group_time;
+        p1_finish_tasks += r.finish_time;
         sessions.push(r.local.0);
         click_lists.push(r.local.1);
         for (part, rows) in r.forwarded {
-            if plan.profile { rows.account(&mut forward_work); }
+            if plan.profile {
+                rows.account(&mut forward_work);
+            }
             later[part].push(rows);
         }
     }
     let p2_start = Instant::now();
-    let later=later.into_iter().filter(|p| !p.is_empty()).collect();
-    let rest = crate::runtime::stage_map("route_second_pass",later,|p| {
-            let (mut batch,mut clicks)=forward::finish(p,&payloads,window,plan);
-            if let Some(acc)=&fused {acc.consume(&mut batch,&mut clicks,&ids);}
-            (batch,clicks)
-        });
+    let later = later.into_iter().filter(|p| !p.is_empty()).collect();
+    let rest = crate::runtime::stage_map("route_second_pass", later, |p| {
+        let (mut batch, mut clicks) = forward::finish(p, &payloads, window, plan);
+        if let Some(acc) = &fused {
+            acc.consume(&mut batch, &mut clicks, &ids);
+        }
+        (batch, clicks)
+    });
     for (s, c) in rest {
         sessions.push(s);
         click_lists.push(c);
@@ -1548,9 +1766,12 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
         });
         eprintln!("profile {v}");
     }
-    let campaigns=if let Some(acc)=fused {Campaigns::Ready(acc.finish(&sessions))}
-        else {Campaigns::Pending(click_lists,ids)};
-    Ok((sessions,campaigns,users.into_people(),count))
+    let campaigns = if let Some(acc) = fused {
+        Campaigns::Ready(acc.finish(&sessions))
+    } else {
+        Campaigns::Pending(click_lists, ids)
+    };
+    Ok((sessions, campaigns, users.into_people(), count))
 }
 
 #[cfg(test)]

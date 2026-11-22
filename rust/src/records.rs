@@ -8,9 +8,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::csv::chunks;
-use crate::input::{
-    self, Aliases, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text,
-};
+use crate::input::{self, Aliases, Dimensions, LOOKBACK, Names, PersonCache, SHARDS, Window, text};
 
 const EXTERNAL_ID: u64 = 1 << 63;
 const INVALID_PERSON: u16 = u16::MAX;
@@ -80,8 +78,13 @@ pub(crate) struct ClickKeyChunk {
 impl ClickKeyChunk {
     pub(crate) fn new(index: usize) -> Self {
         static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wide = *WIDE.get_or_init(|| std::env::var_os("PERF_CLICK_KEYS").is_none_or(|v| v != "intern"));
-        Self { index, hex: Vec::new(), wide }
+        let wide =
+            *WIDE.get_or_init(|| std::env::var_os("PERF_CLICK_KEYS").is_none_or(|v| v != "intern"));
+        Self {
+            index,
+            hex: Vec::new(),
+            wide,
+        }
     }
 
     pub(crate) fn encode(&mut self, id: &[u8], names: &Names) -> u64 {
@@ -108,7 +111,10 @@ impl ClickIds {
         for chunk in chunks {
             hex[chunk.index] = chunk.hex;
         }
-        Self { external: names.into_names(), hex }
+        Self {
+            external: names.into_names(),
+            hex,
+        }
     }
 
     #[inline]
@@ -133,8 +139,10 @@ impl ClickIds {
         if id >= HEX_CLICK {
             let alphabet = b"0123456789abcdef";
             let words = self.words(id);
-            for (out, byte) in buffer[1..].chunks_exact_mut(2)
-                .zip(words.into_iter().flat_map(u64::to_be_bytes)) {
+            for (out, byte) in buffer[1..]
+                .chunks_exact_mut(2)
+                .zip(words.into_iter().flat_map(u64::to_be_bytes))
+            {
                 out[0] = alphabet[(byte >> 4) as usize];
                 out[1] = alphabet[(byte & 15) as usize];
             }
@@ -519,11 +527,20 @@ pub fn read_events(
     let origin_seconds = window.start.div_euclid(1000) - 86_400;
     let work = work_enabled();
     let chunks = chunks(&data.join("events"))?;
-    let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
+    let input_bytes = if work {
+        chunks.iter().map(|c| c.byte_len()).sum::<usize>()
+    } else {
+        0
+    };
     let overhead = size_of::<(ChunkIds, ChunkPeople)>()
         + 9 * SHARDS * (size_of::<EntryId>() + size_of::<PersonEvent>());
-    let groups=crate::csv::work_groups(&chunks,1,overhead);
-    let parsed: Vec<_> = crate::runtime::stage_map_init("decode_events",groups,1,PersonCache::default, |people, group| {
+    let groups = crate::csv::work_groups(&chunks, 1, overhead);
+    let parsed: Vec<_> = crate::runtime::stage_map_init(
+        "decode_events",
+        groups,
+        1,
+        PersonCache::default,
+        |people, group| {
             // Approximate only the backing capacity. Arbitrary CSV lengths and
             // shard skew are handled by the exact per-shard continuation.
             let bytes = group.iter().map(|c| c.byte_len()).sum::<usize>();
@@ -546,10 +563,16 @@ pub fn read_events(
                 let position = people_rows.push(person, job.time, job.purchase, window.start);
                 id_rows.push_event(job.event_id, job.ingest, position, origin_seconds);
             };
-            let mut store = |people: &mut PersonCache, proposal: input::Prepared, id: EventId,
-                             user: &[u8], ingested: i64, payload: Option<(i64, Option<Purchase>)>| {
+            let mut store = |people: &mut PersonCache,
+                             proposal: input::Prepared,
+                             id: EventId,
+                             user: &[u8],
+                             ingested: i64,
+                             payload: Option<(i64, Option<Purchase>)>| {
                 let position = if let Some((time, purchase)) = payload {
-                    if work { id_rows.identity_work[proposal.work_class()] += 1; }
+                    if work {
+                        id_rows.identity_work[proposal.work_class()] += 1;
+                    }
                     #[cfg(feature = "large-input")]
                     if proposal.needs_lookup() {
                         let job = WaitingEvent {
@@ -576,28 +599,47 @@ pub fn read_events(
                 // Invalid candidates still compete for the earliest ingest.
                 id_rows.push_event(id, ingested, position, origin_seconds);
             };
-            group.iter().try_for_each(|chunk| if crate::csv::batch_size() != 0 {
-                chunk.scan_events(&calendar, window, dimensions, |id, user, ingest, payload| {
-                    let proposal = people.prepare(users, aliases, user);
-                    store(people, proposal, EventId::parse(id, &ids), user, ingest, payload);
-                })
-            } else {
-                chunk.scan_parsed(|f: [&[u8]; 7]| {
-                    if f[0].is_empty() { return; }
-                    let proposal = people.prepare(users, aliases, f[1]);
-                    let (time, ingest) = calendar.event_times(f[2], f[3]);
-                    let id = EventId::parse(f[0], &ids);
-                    let payload = crate::csv::event_payload(&f, time, ingest, window, dimensions);
-                    store(people, proposal, id, f[1], ingest, payload);
-                })
+            group.iter().try_for_each(|chunk| {
+                if crate::csv::batch_size() != 0 {
+                    chunk.scan_events(
+                        &calendar,
+                        window,
+                        dimensions,
+                        |id, user, ingest, payload| {
+                            let proposal = people.prepare(users, aliases, user);
+                            store(
+                                people,
+                                proposal,
+                                EventId::parse(id, &ids),
+                                user,
+                                ingest,
+                                payload,
+                            );
+                        },
+                    )
+                } else {
+                    chunk.scan_parsed(|f: [&[u8]; 7]| {
+                        if f[0].is_empty() {
+                            return;
+                        }
+                        let proposal = people.prepare(users, aliases, f[1]);
+                        let (time, ingest) = calendar.event_times(f[2], f[3]);
+                        let id = EventId::parse(f[0], &ids);
+                        let payload =
+                            crate::csv::event_payload(&f, time, ingest, window, dimensions);
+                        store(people, proposal, id, f[1], ingest, payload);
+                    })
+                }
             })?;
             #[cfg(feature = "large-input")]
             for job in waiting {
                 commit(job, people, &mut people_rows, &mut id_rows)
             }
             Ok::<_, anyhow::Error>((id_rows, people_rows))
-        })
-        .into_iter().collect::<Result<_>>()?;
+        },
+    )
+    .into_iter()
+    .collect::<Result<_>>()?;
     drop(chunks);
 
     if work {
@@ -609,34 +651,50 @@ pub fn read_events(
         let mut purchases = 0usize;
         let mut id_overflow = 0usize;
         let mut person_overflow = 0usize;
-        let mut identity = [0usize;4];
+        let mut identity = [0usize; 4];
         for (ids, people_rows) in &parsed {
-            for (total, count) in bins.iter_mut().zip(ids.rows.used) { *total += count; }
-            for (total, count) in identity.iter_mut().zip(ids.identity_work) { *total += count as usize; }
+            for (total, count) in bins.iter_mut().zip(ids.rows.used) {
+                *total += count;
+            }
+            for (total, count) in identity.iter_mut().zip(ids.identity_work) {
+                *total += count as usize;
+            }
             valid += people_rows.rows.used.iter().sum::<usize>();
             long += ids.hex.len();
             exceptional += ids.exceptional.len();
             extra += people_rows.extra.len();
-            purchases += people_rows.extra.iter().filter(|(_, p)| p.is_some()).count();
+            purchases += people_rows
+                .extra
+                .iter()
+                .filter(|(_, p)| p.is_some())
+                .count();
             id_overflow += ids.rows.overflow.iter().map(Vec::len).sum::<usize>();
-            person_overflow += people_rows.rows.overflow.iter().map(Vec::len).sum::<usize>();
+            person_overflow += people_rows
+                .rows
+                .overflow
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
         }
         bins.sort_unstable();
         let n = bins.iter().sum::<usize>();
         let (id_locks, id_wait_ns) = ids.lock_stats();
-        eprintln!("profile {}", serde_json::json!({
-            "stage":"event_work", "logical_input_bytes":input_bytes, "chunks":parsed.len(),
-            "candidates":n, "valid_before_dedup":valid, "purchases_before_dedup":purchases,
-            "candidate_bytes":n * size_of::<EntryId>(), "person_bytes":valid * size_of::<PersonEvent>(),
-            "hex_keys":long, "hex_side_bytes":long * size_of::<HexEntry>(),
-            "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
-            "exceptional_location_bytes":exceptional * size_of::<(i64,u32)>(),
-            "person_side_bytes":extra * size_of::<(Event,Option<Purchase>)>(),
-            "id_overflow_rows":id_overflow, "person_overflow_rows":person_overflow,
-            "id_bucket_median":bins[SHARDS/2], "id_bucket_max":bins[SHARDS-1],
-            "identity_ready":identity[0], "identity_directory":identity[1],
-            "identity_spill":identity[2], "identity_external":identity[3]
-        }));
+        eprintln!(
+            "profile {}",
+            serde_json::json!({
+                "stage":"event_work", "logical_input_bytes":input_bytes, "chunks":parsed.len(),
+                "candidates":n, "valid_before_dedup":valid, "purchases_before_dedup":purchases,
+                "candidate_bytes":n * size_of::<EntryId>(), "person_bytes":valid * size_of::<PersonEvent>(),
+                "hex_keys":long, "hex_side_bytes":long * size_of::<HexEntry>(),
+                "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
+                "exceptional_location_bytes":exceptional * size_of::<(i64,u32)>(),
+                "person_side_bytes":extra * size_of::<(Event,Option<Purchase>)>(),
+                "id_overflow_rows":id_overflow, "person_overflow_rows":person_overflow,
+                "id_bucket_median":bins[SHARDS/2], "id_bucket_max":bins[SHARDS-1],
+                "identity_ready":identity[0], "identity_directory":identity[1],
+                "identity_spill":identity[2], "identity_external":identity[3]
+            })
+        );
     }
     Ok(Candidates {
         compact_times: window
@@ -718,14 +776,14 @@ pub fn dedup_and_sessionize(
     candidates: Candidates,
     width: usize,
 ) -> (Vec<crate::aggregate::SessionBatch>, usize) {
-    let losses = crate::runtime::stage_map("event_dedup",(0..SHARDS).collect(),|shard| {
-            let runs = candidates
-                .blocks
-                .iter()
-                .map(|(ids, _)| ids.run(shard))
-                .collect();
-            losing_positions(runs, candidates.origin_seconds)
-        });
+    let losses = crate::runtime::stage_map("event_dedup", (0..SHARDS).collect(), |shard| {
+        let runs = candidates
+            .blocks
+            .iter()
+            .map(|(ids, _)| ids.run(shard))
+            .collect();
+        losing_positions(runs, candidates.origin_seconds)
+    });
     let mut people: Vec<_> = candidates
         .blocks
         .into_iter()
@@ -748,8 +806,11 @@ pub fn dedup_and_sessionize(
             by_person[position as usize % SHARDS].push((chunk, position as usize / SHARDS));
         }
     }
-    let parts=person_runs.into_iter().zip(by_person).enumerate().collect();
-    let events = crate::runtime::stage_map("session_partitions",parts,|(shard, (mut fragments, losers))| {
+    let parts = person_runs.into_iter().zip(by_person).enumerate().collect();
+    let events = crate::runtime::stage_map(
+        "session_partitions",
+        parts,
+        |(shard, (mut fragments, losers))| {
             let size: usize = fragments
                 .iter()
                 .map(|run| run.prefix.len() + run.overflow.len())
@@ -852,7 +913,8 @@ pub fn dedup_and_sessionize(
             }
             output.rows.par_sort_unstable_by_key(|e| (e.person, e.time));
             (crate::aggregate::sessionize(output), length)
-        });
+        },
+    );
     let event_count = events.iter().map(|(_, count)| *count).sum();
     (
         events.into_iter().map(|(batch, _)| batch).collect(),
@@ -895,11 +957,14 @@ impl ShortClick {
         })
     }
 
-    fn local(&self) -> usize { (self.person_campaign >> Self::CAMPAIGN_BITS) as usize }
+    fn local(&self) -> usize {
+        (self.person_campaign >> Self::CAMPAIGN_BITS) as usize
+    }
 
     fn expand(self, shard: usize, epoch: i64) -> Click {
         Click {
-            id: self.id, time: epoch + i64::from(self.offset),
+            id: self.id,
+            time: epoch + i64::from(self.offset),
             person: (self.local() * SHARDS + shard) as u32,
             campaign: self.person_campaign & Self::CAMPAIGN_MASK,
         }
@@ -915,13 +980,23 @@ trait ClickPiece: Default + Send {
 }
 
 impl ClickPiece for Vec<Click> {
-    fn store(&mut self, click: Click, _: bool, _: i64) { self.push(click); }
-    fn len(&self) -> usize { Vec::len(self) }
-    fn compact_count(&self) -> usize { 0 }
-    fn count_people(&self, counts: &mut [u32]) {
-        for c in self { counts[c.person as usize / SHARDS] += 1; }
+    fn store(&mut self, click: Click, _: bool, _: i64) {
+        self.push(click);
     }
-    fn rows(self, _: usize, _: i64) -> impl Iterator<Item = Click> { self.into_iter() }
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn compact_count(&self) -> usize {
+        0
+    }
+    fn count_people(&self, counts: &mut [u32]) {
+        for c in self {
+            counts[c.person as usize / SHARDS] += 1;
+        }
+    }
+    fn rows(self, _: usize, _: i64) -> impl Iterator<Item = Click> {
+        self.into_iter()
+    }
 }
 
 #[derive(Default)]
@@ -940,14 +1015,23 @@ impl ClickPiece for PackedClicks {
         }
         self.other.push(click);
     }
-    fn len(&self) -> usize { self.compact.len() + self.other.len() }
-    fn compact_count(&self) -> usize { self.compact.len() }
+    fn len(&self) -> usize {
+        self.compact.len() + self.other.len()
+    }
+    fn compact_count(&self) -> usize {
+        self.compact.len()
+    }
     fn count_people(&self, counts: &mut [u32]) {
-        for c in &self.compact { counts[c.local()] += 1; }
+        for c in &self.compact {
+            counts[c.local()] += 1;
+        }
         self.other.count_people(counts);
     }
     fn rows(self, shard: usize, epoch: i64) -> impl Iterator<Item = Click> {
-        self.compact.into_iter().map(move |c| c.expand(shard, epoch)).chain(self.other)
+        self.compact
+            .into_iter()
+            .map(move |c| c.expand(shard, epoch))
+            .chain(self.other)
     }
 }
 
@@ -967,7 +1051,10 @@ fn prefixes(offsets: &mut [u32]) {
 }
 
 fn sort_click_keys<T: Send, K: Ord, F: Fn(&T) -> K + Sync>(
-    rows: &mut [T], key: F, parallel: bool, comparisons: Option<&std::sync::atomic::AtomicU64>,
+    rows: &mut [T],
+    key: F,
+    parallel: bool,
+    comparisons: Option<&std::sync::atomic::AtomicU64>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     if let Some(comparisons) = comparisons {
@@ -991,18 +1078,34 @@ fn sort_click_keys<T: Send, K: Ord, F: Fn(&T) -> K + Sync>(
     }
 }
 
-fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(rows: &mut [T], ends: Vec<u32>, time: F, comparisons: Option<&std::sync::atomic::AtomicU64>) {
+fn sort_times<T: Send, F: Fn(&T) -> i64 + Sync>(
+    rows: &mut [T],
+    ends: Vec<u32>,
+    time: F,
+    comparisons: Option<&std::sync::atomic::AtomicU64>,
+) {
     let mut start = 0;
     for end in ends {
         let end = end as usize;
         if end - start > 1 && !crate::aggregate::skip_click_sort(end - start) {
-            sort_click_keys(&mut rows[start..end], &time, end-start>32768, comparisons);
+            sort_click_keys(
+                &mut rows[start..end],
+                &time,
+                end - start > 32768,
+                comparisons,
+            );
         }
         start = end;
     }
 }
 
-fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch: i64, comparisons: Option<&std::sync::atomic::AtomicU64>) -> Vec<Click> {
+fn order_clicks<P: ClickPiece>(
+    pieces: Vec<P>,
+    width: usize,
+    shard: usize,
+    epoch: i64,
+    comparisons: Option<&std::sync::atomic::AtomicU64>,
+) -> Vec<Click> {
     let length = pieces.iter().map(ClickPiece::len).sum();
     let mut clicks = Vec::with_capacity(length);
     if !use_counting_sort(length, width) {
@@ -1013,7 +1116,9 @@ fn order_clicks<P: ClickPiece>(pieces: Vec<P>, width: usize, shard: usize, epoch
         return clicks;
     }
     let mut ends = vec![0u32; width];
-    for piece in &pieces { piece.count_people(&mut ends); }
+    for piece in &pieces {
+        piece.count_people(&mut ends);
+    }
     prefixes(&mut ends);
     let storage = clicks.spare_capacity_mut();
     for c in pieces.into_iter().flat_map(|p| p.rows(shard, epoch)) {
@@ -1043,21 +1148,41 @@ pub fn read_clicks(
 }
 
 fn read_click_records<P: ClickPiece>(
-    data: &Path, window: Window, dimensions: &Dimensions, users: &Names, aliases: &Aliases,
+    data: &Path,
+    window: Window,
+    dimensions: &Dimensions,
+    users: &Names,
+    aliases: &Aliases,
 ) -> Result<(Vec<Vec<Click>>, ClickIds)> {
     let ids = Names::default();
     let calendar = input::Calendar::new(window);
     let work = work_enabled();
     let epoch = window.start.saturating_sub(LOOKBACK);
     let chunks = chunks(&data.join("clicks"))?;
-    let input_bytes = if work { chunks.iter().map(|c| c.byte_len()).sum::<usize>() } else { 0 };
-    let groups=crate::csv::work_groups(&chunks,1,SHARDS*size_of::<P>()).into_iter().enumerate().collect();
-    let pieces = crate::runtime::stage_map_init("decode_clicks",groups,1,PersonCache::default, |people, (index, group)| {
+    let input_bytes = if work {
+        chunks.iter().map(|c| c.byte_len()).sum::<usize>()
+    } else {
+        0
+    };
+    let groups = crate::csv::work_groups(&chunks, 1, SHARDS * size_of::<P>())
+        .into_iter()
+        .enumerate()
+        .collect();
+    let pieces = crate::runtime::stage_map_init(
+        "decode_clicks",
+        groups,
+        1,
+        PersonCache::default,
+        |people, (index, group)| {
             let mut local = shards::<P>();
             let mut keys = ClickKeyChunk::new(index);
             let mut counts = [0usize; 6];
-            let mut store = |people: &mut PersonCache, id: &[u8], user: &[u8],
-                             proposal: input::Prepared, time: i64, campaign: u32| {
+            let mut store = |people: &mut PersonCache,
+                             id: &[u8],
+                             user: &[u8],
+                             proposal: input::Prepared,
+                             time: i64,
+                             campaign: u32| {
                 let person = people.prepared(proposal, users, aliases, user);
                 let key = keys.encode(id, &ids);
                 if work {
@@ -1067,52 +1192,64 @@ fn read_click_records<P: ClickPiece>(
                         counts[5] += usize::from(input::hex_id(id, b'k').is_some());
                     }
                 }
-                local[person as usize % SHARDS].store(Click {
-                    time,
-                    id: key,
-                    person,
-                    campaign,
-                }, proposal.work_class() < 2, epoch);
+                local[person as usize % SHARDS].store(
+                    Click {
+                        time,
+                        id: key,
+                        person,
+                        campaign,
+                    },
+                    proposal.work_class() < 2,
+                    epoch,
+                );
             };
-            group.iter().try_for_each(|chunk| if crate::csv::batch_size() != 0 {
-                chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
-                    let proposal = people.prepare(users, aliases, user);
-                    store(people, id, user, proposal, time, campaign);
-                })
-            } else {
-                chunk.scan_parsed(|[id, user, campaign, ts]| {
-                    if id.is_empty() || user.is_empty() {
-                        return;
-                    }
-                    let proposal = people.prepare(users, aliases, user);
-                    let Some(campaign) = dimensions.campaign_ids.lookup(campaign) else {
-                        return;
-                    };
-                    let Some(time) = calendar.parse(ts) else {
-                        return;
-                    };
-                    if time < window.start - LOOKBACK || time >= window.end {
-                        return;
-                    }
-                    store(people, id, user, proposal, time, campaign);
-                })
+            group.iter().try_for_each(|chunk| {
+                if crate::csv::batch_size() != 0 {
+                    chunk.scan_clicks(&calendar, window, dimensions, |id, user, time, campaign| {
+                        let proposal = people.prepare(users, aliases, user);
+                        store(people, id, user, proposal, time, campaign);
+                    })
+                } else {
+                    chunk.scan_parsed(|[id, user, campaign, ts]| {
+                        if id.is_empty() || user.is_empty() {
+                            return;
+                        }
+                        let proposal = people.prepare(users, aliases, user);
+                        let Some(campaign) = dimensions.campaign_ids.lookup(campaign) else {
+                            return;
+                        };
+                        let Some(time) = calendar.parse(ts) else {
+                            return;
+                        };
+                        if time < window.start - LOOKBACK || time >= window.end {
+                            return;
+                        }
+                        store(people, id, user, proposal, time, campaign);
+                    })
+                }
             })?;
             Ok::<_, anyhow::Error>((local, keys, counts))
-        })
-        .into_iter().collect::<Result<Vec<_>>>()?;
+        },
+    )
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     drop(chunks);
     let mut partitions = shards::<Vec<P>>();
     let mut keys = Vec::with_capacity(pieces.len());
-    let mut totals = [0usize;6];
+    let mut totals = [0usize; 6];
     let mut compact_rows = 0;
     for (chunk, chunk_keys, counts) in pieces {
         if work {
-            for (total, count) in totals.iter_mut().zip(counts) { *total += count; }
+            for (total, count) in totals.iter_mut().zip(counts) {
+                *total += count;
+            }
         }
         keys.push(chunk_keys);
         for (partition, rows) in partitions.iter_mut().zip(chunk) {
             if rows.len() != 0 {
-                if work { compact_rows += rows.compact_count(); }
+                if work {
+                    compact_rows += rows.compact_count();
+                }
                 partition.push(rows);
             }
         }
@@ -1121,23 +1258,28 @@ fn read_click_records<P: ClickPiece>(
         let valid = totals[..4].iter().sum::<usize>();
         let wide = keys.iter().map(|k| k.hex.len()).sum::<usize>();
         let (id_locks, id_wait_ns) = ids.lock_stats();
-        eprintln!("profile {}",serde_json::json!({
-            "stage":"click_work", "logical_input_bytes":input_bytes, "chunks":keys.len(),
-            "valid_clicks":valid, "record_width":size_of::<Click>(),
-            "compact_record_width":size_of::<ShortClick>(), "compact_rows":compact_rows, "full_rows":valid-compact_rows,
-            "initial_record_bytes":compact_rows*size_of::<ShortClick>()+(valid-compact_rows)*size_of::<Click>(),
-            "regrouped_record_bytes":valid*size_of::<Click>(),
-            "hex_side_keys":wide, "hex_side_bytes":wide*size_of::<[u64;2]>(),
-            "dictionary_calls":totals[4], "strict_hex_dictionary_calls":totals[5],
-            "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
-            "identity_ready":totals[0], "identity_directory":totals[1],
-            "identity_spill":totals[2], "identity_external":totals[3]
-        }));
+        eprintln!(
+            "profile {}",
+            serde_json::json!({
+                "stage":"click_work", "logical_input_bytes":input_bytes, "chunks":keys.len(),
+                "valid_clicks":valid, "record_width":size_of::<Click>(),
+                "compact_record_width":size_of::<ShortClick>(), "compact_rows":compact_rows, "full_rows":valid-compact_rows,
+                "initial_record_bytes":compact_rows*size_of::<ShortClick>()+(valid-compact_rows)*size_of::<Click>(),
+                "regrouped_record_bytes":valid*size_of::<Click>(),
+                "hex_side_keys":wide, "hex_side_bytes":wide*size_of::<[u64;2]>(),
+                "dictionary_calls":totals[4], "strict_hex_dictionary_calls":totals[5],
+                "id_dictionary_lock_calls":id_locks,"id_dictionary_lock_wait_ns":id_wait_ns,
+                "identity_ready":totals[0], "identity_directory":totals[1],
+                "identity_spill":totals[2], "identity_external":totals[3]
+            })
+        );
     }
     let width = users.person_slots_per_shard();
     let comparisons = std::sync::atomic::AtomicU64::new(0);
-    let parts=partitions.into_iter().enumerate().collect();
-    let clicks = crate::runtime::stage_map("order_click_partitions",parts,|(shard,p)|order_clicks(p,width,shard,epoch,work.then_some(&comparisons)));
+    let parts = partitions.into_iter().enumerate().collect();
+    let clicks = crate::runtime::stage_map("order_click_partitions", parts, |(shard, p)| {
+        order_clicks(p, width, shard, epoch, work.then_some(&comparisons))
+    });
     if work {
         let mut scatter_rows = 0usize;
         let mut skipped_groups = 0usize;
@@ -1145,7 +1287,7 @@ fn read_click_records<P: ClickPiece>(
         for shard in &clicks {
             if use_counting_sort(shard.len(), width) {
                 scatter_rows += shard.len();
-                for group in shard.chunk_by(|a,b| a.person == b.person) {
+                for group in shard.chunk_by(|a, b| a.person == b.person) {
                     if group.len() > 1 && crate::aggregate::skip_click_sort(group.len()) {
                         skipped_groups += 1;
                         skipped_rows += group.len();
@@ -1153,11 +1295,14 @@ fn read_click_records<P: ClickPiece>(
                 }
             }
         }
-        eprintln!("profile {}",serde_json::json!({
-            "stage":"click_sort_work", "counting_scatter_rows":scatter_rows,
-            "key_comparisons":comparisons.load(std::sync::atomic::Ordering::Relaxed),
-            "person_time_sorts_skipped":skipped_groups, "click_rows_skipping_time_sort":skipped_rows
-        }));
+        eprintln!(
+            "profile {}",
+            serde_json::json!({
+                "stage":"click_sort_work", "counting_scatter_rows":scatter_rows,
+                "key_comparisons":comparisons.load(std::sync::atomic::Ordering::Relaxed),
+                "person_time_sorts_skipped":skipped_groups, "click_rows_skipping_time_sort":skipped_rows
+            })
+        );
     }
     Ok((clicks, ClickIds::new(ids, keys)))
 }
@@ -1237,7 +1382,10 @@ mod id_tests {
     #[test]
     fn wide_clicks_preserve_byte_order_and_compare_equal_across_chunks() {
         let cases: &[&[u8]] = &[
-            b"k", b"k000", b"k00000000", b"K00000000000000000000000000000000",
+            b"k",
+            b"k000",
+            b"k00000000",
+            b"K00000000000000000000000000000000",
             b"k00000000000000000000000000000000",
             b"k00000000000000000000000000000001",
             b"k00000000008000000000000000000001",
@@ -1247,7 +1395,9 @@ mod id_tests {
         ];
         let names = Names::default();
         let mut chunks = [ClickKeyChunk::new(0), ClickKeyChunk::new(1)];
-        for chunk in &mut chunks { chunk.wide = true; }
+        for chunk in &mut chunks {
+            chunk.wide = true;
+        }
         let left: Vec<_> = cases.iter().map(|s| chunks[0].encode(s, &names)).collect();
         let right: Vec<_> = cases.iter().map(|s| chunks[1].encode(s, &names)).collect();
         assert_eq!(chunks[0].hex.len(), 4);
@@ -1270,24 +1420,41 @@ mod grouping_tests {
         let shard = 7;
         let local = u32::MAX >> ShortClick::CAMPAIGN_BITS;
         let direct = Click {
-            person: local * SHARDS as u32 + shard as u32, id: HEX_CLICK | 123_456,
-            time: epoch + i64::from(u32::MAX), campaign: ShortClick::CAMPAIGN_MASK,
+            person: local * SHARDS as u32 + shard as u32,
+            id: HEX_CLICK | 123_456,
+            time: epoch + i64::from(u32::MAX),
+            campaign: ShortClick::CAMPAIGN_MASK,
         };
         let mut rows = PackedClicks::default();
         rows.store(direct, true, epoch);
         assert_eq!(rows.compact_count(), 1);
         let expected = [
-            Click { time: epoch - 1, ..direct },
-            Click { time: direct.time + 1, ..direct },
-            Click { campaign: direct.campaign + 1, ..direct },
-            Click { person: direct.person + SHARDS as u32, ..direct },
+            Click {
+                time: epoch - 1,
+                ..direct
+            },
+            Click {
+                time: direct.time + 1,
+                ..direct
+            },
+            Click {
+                campaign: direct.campaign + 1,
+                ..direct
+            },
+            Click {
+                person: direct.person + SHARDS as u32,
+                ..direct
+            },
             direct,
         ];
         for (i, row) in expected.iter().enumerate() {
             rows.store(*row, i + 1 != expected.len(), epoch);
         }
         assert_eq!(rows.compact_count(), 1);
-        assert!(rows.rows(shard, epoch).eq(std::iter::once(direct).chain(expected)));
+        assert!(
+            rows.rows(shard, epoch)
+                .eq(std::iter::once(direct).chain(expected))
+        );
     }
 
     #[test]
@@ -1472,9 +1639,7 @@ mod shard_slab_tests {
 
     #[test]
     fn earliest_invalid_can_remove_rows_in_a_different_chunks_overflow() {
-        let mut blocks: Vec<_> = (0..2)
-            .map(|_| ChunkIds::new(1))
-            .collect();
+        let mut blocks: Vec<_> = (0..2).map(|_| ChunkIds::new(1)).collect();
         let shard = 7;
         let a = SHARDS as u64 + shard as u64;
         let b = 2 * SHARDS as u64 + shard as u64;
@@ -1536,9 +1701,7 @@ mod packed_id_tests {
     #[test]
     fn equal_low_words_distinct_quotients_ties_and_invalid_winners_match_full_ids() {
         let shard = 101usize;
-        let mut blocks: Vec<_> = (0..5)
-            .map(|_| ChunkIds::new(2))
-            .collect();
+        let mut blocks: Vec<_> = (0..5).map(|_| ChunkIds::new(2)).collect();
         let mut flat: Vec<Vec<(u64, i64, u32)>> = (0..blocks.len()).map(|_| Vec::new()).collect();
         for i in 0..1900usize {
             let chunk = i % blocks.len();

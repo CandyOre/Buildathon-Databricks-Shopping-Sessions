@@ -4,10 +4,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use memchr::{memchr, memchr_iter, memrchr};
 use crate::input::{Calendar, DAY, Dimensions, LOOKBACK, Window, unsigned};
 use crate::records::Purchase;
+use anyhow::{Context, Result};
+use memchr::{memchr, memchr_iter, memrchr};
 
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -366,7 +366,11 @@ impl Source {
         };
         #[cfg(not(target_os = "linux"))]
         let _ = (len, mapped);
-        Self { path, #[cfg(target_os = "linux")] mapping }
+        Self {
+            path,
+            #[cfg(target_os = "linux")]
+            mapping,
+        }
     }
 }
 
@@ -389,21 +393,39 @@ impl Mapping {
     fn open(path: &Path, len: u64) -> Result<Self> {
         use std::os::fd::AsRawFd;
         let len = usize::try_from(len)?;
-        anyhow::ensure!(len <= isize::MAX as usize, "mapping exceeds addressable slice");
+        anyhow::ensure!(
+            len <= isize::MAX as usize,
+            "mapping exceeds addressable slice"
+        );
         let file = File::open(path)?;
         let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
         };
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error().into());
         }
         let page = if perf_on("PERF_PAGE_RELEASE") {
             usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0)
-        } else { 0 };
-        if let Some(data) = std::ptr::NonNull::new(ptr.cast()) {
-            Ok(Self { data, len, release_page_size: page })
         } else {
-            unsafe { libc::munmap(ptr, len); }
+            0
+        };
+        if let Some(data) = std::ptr::NonNull::new(ptr.cast()) {
+            Ok(Self {
+                data,
+                len,
+                release_page_size: page,
+            })
+        } else {
+            unsafe {
+                libc::munmap(ptr, len);
+            }
             anyhow::bail!("null mapping address")
         }
     }
@@ -438,7 +460,13 @@ impl Mapping {
             let first = start.div_ceil(page) * page;
             let last = end / page * page;
             if first < last {
-                unsafe { libc::madvise(self.data.as_ptr().add(first).cast(), last - first, libc::MADV_DONTNEED); }
+                unsafe {
+                    libc::madvise(
+                        self.data.as_ptr().add(first).cast(),
+                        last - first,
+                        libc::MADV_DONTNEED,
+                    );
+                }
             }
         }
         (scanned, overrun)
@@ -447,7 +475,11 @@ impl Mapping {
 
 #[cfg(target_os = "linux")]
 impl Drop for Mapping {
-    fn drop(&mut self) { unsafe { libc::munmap(self.data.as_ptr().cast(), self.len); } }
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.data.as_ptr().cast(), self.len);
+        }
+    }
 }
 
 pub(crate) fn perf_on(name: &str) -> bool {
@@ -464,7 +496,9 @@ fn each_line<'a>(bytes: &'a [u8], row: &mut impl FnMut(&'a [u8])) {
         row(&bytes[start..end]);
         start = end + 1;
     }
-    if start < bytes.len() { row(&bytes[start..]); }
+    if start < bytes.len() {
+        row(&bytes[start..]);
+    }
 }
 
 pub(crate) fn work_enabled() -> bool {
@@ -489,18 +523,43 @@ impl IoWork {
     }
 }
 
-const WORK_NAMES: [&str; 22] = ["tasks", "nominal_bytes", "read_calls", "read_bytes", "mapped_tasks",
-    "mapped_scan_bytes", "overrun_bytes", "rows", "row_bytes", "quoted_rows", "malformed_rows",
-    "canonical_id_rows", "other_id_rows", "ts_f1_shape", "ts_f2_shape", "ts_epoch_digits",
-    "ts_other", "over_128b_rows", "over_128k_rows", "ts_unparseable_or_overflow",
-    "regular_unquoted_valid_shape_rows", "other_shape_rows"];
+const WORK_NAMES: [&str; 22] = [
+    "tasks",
+    "nominal_bytes",
+    "read_calls",
+    "read_bytes",
+    "mapped_tasks",
+    "mapped_scan_bytes",
+    "overrun_bytes",
+    "rows",
+    "row_bytes",
+    "quoted_rows",
+    "malformed_rows",
+    "canonical_id_rows",
+    "other_id_rows",
+    "ts_f1_shape",
+    "ts_f2_shape",
+    "ts_epoch_digits",
+    "ts_other",
+    "over_128b_rows",
+    "over_128k_rows",
+    "ts_unparseable_or_overflow",
+    "regular_unquoted_valid_shape_rows",
+    "other_shape_rows",
+];
 const GROUPS: [&str; 4] = ["events", "clicks", "links", "dimensions"];
 type Counts = [u64; WORK_NAMES.len()];
 static TOTALS: std::sync::Mutex<[Counts; 4]> = std::sync::Mutex::new([[0; WORK_NAMES.len()]; 4]);
 
 fn profile_group(path: &Path) -> usize {
-    let folder = path.parent().and_then(Path::file_name).and_then(|s| s.to_str());
-    GROUPS[..3].iter().position(|&s| Some(s) == folder).unwrap_or(3)
+    let folder = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str());
+    GROUPS[..3]
+        .iter()
+        .position(|&s| Some(s) == folder)
+        .unwrap_or(3)
 }
 
 fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
@@ -511,7 +570,8 @@ fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
     counts[17] += u64::from(line.len() > 128);
     counts[18] += u64::from(line.len() > 128 * 1024);
     let index = |digits: &[u8]| {
-        (1..=7).contains(&digits.len()) && (digits.len() == 1 || digits[0] != b'0')
+        (1..=7).contains(&digits.len())
+            && (digits.len() == 1 || digits[0] != b'0')
             && digits.iter().all(u8::is_ascii_digit)
     };
     let pair = match group {
@@ -522,10 +582,16 @@ fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
                 _ => false,
             };
             let regular = kind && f[5].strip_prefix(b"p").is_some_and(index);
-            (f[0],f[1],f[2],b'e',regular)
+            (f[0], f[1], f[2], b'e', regular)
         }),
         1 => fields::<4>(line).map(|f| {
-            (f[0],f[1],f[3],b'k',f[2].strip_prefix(b"c_").is_some_and(index))
+            (
+                f[0],
+                f[1],
+                f[3],
+                b'k',
+                f[2].strip_prefix(b"c_").is_some_and(index),
+            )
         }),
         _ => {
             counts[10] += u64::from(fields::<2>(line).is_none());
@@ -533,39 +599,67 @@ fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
         }
     };
     let Some((id, user, ts, prefix, regular_fields)) = pair else {
-        counts[10] += 1; counts[21] += 1; return;
+        counts[10] += 1;
+        counts[21] += 1;
+        return;
     };
     let normal_key = |id: &[u8], prefix: u8| {
-        id.first() == Some(&prefix) &&
-            (matches!(id.len(), 2..=9) && id[1..].iter().all(|v| v.is_ascii_digit() || v.is_ascii_lowercase())
-             || id.len() == 33 && id[1..].iter().all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(v)))
+        id.first() == Some(&prefix)
+            && (matches!(id.len(), 2..=9)
+                && id[1..]
+                    .iter()
+                    .all(|v| v.is_ascii_digit() || v.is_ascii_lowercase())
+                || id.len() == 33
+                    && id[1..]
+                        .iter()
+                        .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(v)))
     };
     let canonical = normal_key(id, prefix);
-    counts[if canonical {11} else {12}] += 1;
-    let format = if ts.len()==20 && ts[10]==b'T' && ts[19]==b'Z' { 13 }
-        else if ts.len()==25 && ts[10]==b'T' && matches!(ts[19],b'+'|b'-') {14}
-        else if !ts.is_empty() && ts.iter().all(u8::is_ascii_digit) {15} else {16};
+    counts[if canonical { 11 } else { 12 }] += 1;
+    let format = if ts.len() == 20 && ts[10] == b'T' && ts[19] == b'Z' {
+        13
+    } else if ts.len() == 25 && ts[10] == b'T' && matches!(ts[19], b'+' | b'-') {
+        14
+    } else if !ts.is_empty() && ts.iter().all(u8::is_ascii_digit) {
+        15
+    } else {
+        16
+    };
     counts[format] += 1;
     let valid_time = crate::input::timestamp(ts).is_some();
     counts[19] += u64::from(!valid_time);
     // This measures lexical shape. Window, lateness, deduplication and
     // actual catalog membership are counted later by the processing stage.
     let regular = !quoted && canonical && normal_key(user, b'u') && regular_fields && valid_time;
-    counts[if regular {20} else {21}] += 1;
+    counts[if regular { 20 } else { 21 }] += 1;
 }
 
 fn submit_work(group: usize, nominal: u64, io: IoWork, mut counts: Counts) {
-    counts[..7].copy_from_slice(&[1, nominal, io.reads, io.read_bytes, io.mapped, io.mapped_scan_bytes, io.overrun]);
-    for (d,s) in TOTALS.lock().unwrap()[group].iter_mut().zip(counts) { *d += s; }
+    counts[..7].copy_from_slice(&[
+        1,
+        nominal,
+        io.reads,
+        io.read_bytes,
+        io.mapped,
+        io.mapped_scan_bytes,
+        io.overrun,
+    ]);
+    for (d, s) in TOTALS.lock().unwrap()[group].iter_mut().zip(counts) {
+        *d += s;
+    }
 }
 
 pub fn print_work() {
-    if !work_enabled() { return; }
+    if !work_enabled() {
+        return;
+    }
     let totals = TOTALS.lock().unwrap();
     for (name, counts) in GROUPS.into_iter().zip(totals.iter()) {
         let mut record = serde_json::Map::new();
         record.insert("stage".into(), format!("work_csv_{name}").into());
-        for (&key, &value) in WORK_NAMES.iter().zip(counts) { record.insert(key.into(), value.into()); }
+        for (&key, &value) in WORK_NAMES.iter().zip(counts) {
+            record.insert(key.into(), value.into());
+        }
         eprintln!("profile {}", serde_json::Value::Object(record));
     }
 }
@@ -614,19 +708,35 @@ impl Chunk {
 
     pub fn scan(&self, mut row: impl FnMut(&[u8])) -> Result<()> {
         let mut io = IoWork::default();
-        if !work_enabled() { return self.scan_inner::<false>(row, &mut io); }
+        if !work_enabled() {
+            return self.scan_inner::<false>(row, &mut io);
+        }
         let group = profile_group(&self.source.path);
         let mut counts = Counts::default();
-        let result = self.scan_inner::<true>(|line| { observe_line(&mut counts, group, line); row(line); }, &mut io);
-        submit_work(group, self.end-self.start, io, counts);
+        let result = self.scan_inner::<true>(
+            |line| {
+                observe_line(&mut counts, group, line);
+                row(line);
+            },
+            &mut io,
+        );
+        submit_work(group, self.end - self.start, io, counts);
         result
     }
 
-    fn scan_inner<const WORK: bool>(&self, mut row: impl FnMut(&[u8]), io: &mut IoWork) -> Result<()> {
+    fn scan_inner<const WORK: bool>(
+        &self,
+        mut row: impl FnMut(&[u8]),
+        io: &mut IoWork,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(map) = &self.source.mapping {
             let (n, extra) = map.span(self.start, self.end, &mut |span| each_line(span, &mut row));
-            if WORK { io.mapped = 1; io.mapped_scan_bytes=n as u64; io.overrun=extra as u64; }
+            if WORK {
+                io.mapped = 1;
+                io.mapped_scan_bytes = n as u64;
+                io.overrun = extra as u64;
+            }
             return Ok(());
         }
         let mut file = File::open(&self.source.path)?;
@@ -646,7 +756,9 @@ impl Chunk {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     result => result?,
                 };
-                if WORK { io.read(offset, len, self.end); }
+                if WORK {
+                    io.read(offset, len, self.end);
+                }
                 if len == 0 {
                     if !partial_line.is_empty() {
                         row(partial_line);
@@ -687,29 +799,45 @@ impl Chunk {
     // borrowed fields from several adjacent rows while their buffer is live.
     fn spans(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
         let mut io = IoWork::default();
-        if !work_enabled() { return self.spans_inner::<false>(visit,&mut io); }
+        if !work_enabled() {
+            return self.spans_inner::<false>(visit, &mut io);
+        }
         let group = profile_group(&self.source.path);
         let mut counts = Counts::default();
-        let result = self.spans_inner::<true>(|span| {
-            each_line(span, &mut |line| observe_line(&mut counts,group,line));
-            visit(span);
-        }, &mut io);
-        submit_work(group,self.end-self.start,io,counts);
+        let result = self.spans_inner::<true>(
+            |span| {
+                each_line(span, &mut |line| observe_line(&mut counts, group, line));
+                visit(span);
+            },
+            &mut io,
+        );
+        submit_work(group, self.end - self.start, io, counts);
         result
     }
 
-    fn spans_inner<const WORK: bool>(&self, mut visit: impl FnMut(&[u8]), io: &mut IoWork) -> Result<()> {
+    fn spans_inner<const WORK: bool>(
+        &self,
+        mut visit: impl FnMut(&[u8]),
+        io: &mut IoWork,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(map) = &self.source.mapping {
             let (n, extra) = map.span(self.start, self.end, &mut visit);
-            if WORK { io.mapped=1; io.mapped_scan_bytes=n as u64; io.overrun=extra as u64; }
+            if WORK {
+                io.mapped = 1;
+                io.mapped_scan_bytes = n as u64;
+                io.overrun = extra as u64;
+            }
             return Ok(());
         }
         let mut file = File::open(&self.source.path)?;
         let mut offset = self.start.saturating_sub(1);
         file.seek(SeekFrom::Start(offset))?;
         SCAN_BUFFER.with_borrow_mut(|buf| {
-            let ScanBuffer { bytes, partial_line } = buf;
+            let ScanBuffer {
+                bytes,
+                partial_line,
+            } = buf;
             partial_line.clear();
             let mut skip = true;
             loop {
@@ -717,9 +845,13 @@ impl Chunk {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     result => result?,
                 };
-                if WORK { io.read(offset,n,self.end); }
+                if WORK {
+                    io.read(offset, n, self.end);
+                }
                 if n == 0 {
-                    if !partial_line.is_empty() { visit(partial_line); }
+                    if !partial_line.is_empty() {
+                        visit(partial_line);
+                    }
                     return Ok(());
                 }
                 let block = &bytes[..n];
@@ -731,13 +863,15 @@ impl Chunk {
                         skip = false;
                     } else {
                         offset += n as u64;
-                        if offset >= self.end { return Ok(()); }
+                        if offset >= self.end {
+                            return Ok(());
+                        }
                         continue;
                     }
                 }
                 if !partial_line.is_empty() {
                     if let Some(i) = memchr(b'\n', &block[pos..]) {
-                        partial_line.extend_from_slice(&block[pos..=pos+i]);
+                        partial_line.extend_from_slice(&block[pos..=pos + i]);
                         visit(partial_line);
                         partial_line.clear();
                         pos += i + 1;
@@ -747,17 +881,19 @@ impl Chunk {
                         continue;
                     }
                 }
-                if offset + pos as u64 >= self.end { return Ok(()); }
+                if offset + pos as u64 >= self.end {
+                    return Ok(());
+                }
                 let remaining = self.end - offset;
                 if remaining <= n as u64 {
                     let boundary = remaining as usize - 1;
                     if let Some(i) = memchr(b'\n', &block[boundary..]) {
-                        visit(&block[pos..=boundary+i]);
+                        visit(&block[pos..=boundary + i]);
                         return Ok(());
                     }
                 }
                 if let Some(i) = memrchr(b'\n', &block[pos..]) {
-                    visit(&block[pos..=pos+i]);
+                    visit(&block[pos..=pos + i]);
                     pos += i + 1;
                 }
                 partial_line.extend_from_slice(&block[pos..]);
@@ -768,7 +904,7 @@ impl Chunk {
 
     pub fn scan_parsed<const N: usize>(&self, mut row: impl FnMut([&[u8]; N])) -> Result<()> {
         if structural::enabled::<N>() {
-            return self.spans(|span| structural::scan::<N>(span,&mut row));
+            return self.spans(|span| structural::scan::<N>(span, &mut row));
         }
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2")
@@ -820,7 +956,10 @@ pub fn chunks(directory: &Path) -> Result<Vec<Chunk>> {
             let target = total / (rayon::current_num_threads().max(1) as u64 * 256);
             target.clamp(64 << 10, 2 << 20).next_power_of_two()
         }
-        Ok(n) => n.parse::<u64>().unwrap_or(CHUNK_BYTES).clamp(4096, CHUNK_BYTES),
+        Ok(n) => n
+            .parse::<u64>()
+            .unwrap_or(CHUNK_BYTES)
+            .clamp(4096, CHUNK_BYTES),
         Err(_) => CHUNK_BYTES,
     };
     let mapped = use_mmap();
@@ -840,12 +979,21 @@ pub fn chunks(directory: &Path) -> Result<Vec<Chunk>> {
 // Tiny chunks and header-only files must not each retain a complete matrix
 // of per-bucket Vec headers/slab padding for the duration of event ingestion.
 // Grouping changes neither file reads nor ownership of crossing records.
-pub(crate) fn work_groups(chunks: &[Chunk], requested: usize, metadata_per_task: usize) -> Vec<&[Chunk]> {
+pub(crate) fn work_groups(
+    chunks: &[Chunk],
+    requested: usize,
+    metadata_per_task: usize,
+) -> Vec<&[Chunk]> {
     const METADATA_TARGET: usize = 128 << 20;
     group_slices(chunks, requested, metadata_per_task, METADATA_TARGET)
 }
 
-fn group_slices(chunks: &[Chunk], requested: usize, metadata: usize, budget: usize) -> Vec<&[Chunk]> {
+fn group_slices(
+    chunks: &[Chunk],
+    requested: usize,
+    metadata: usize,
+    budget: usize,
+) -> Vec<&[Chunk]> {
     let requested = requested.max(1);
     let max_groups = (budget / metadata.max(1)).max(1);
     let count = chunks.len().div_ceil(max_groups).max(requested);
@@ -867,7 +1015,9 @@ fn group_slices(chunks: &[Chunk], requested: usize, metadata: usize, budget: usi
         }
         bytes += len;
     }
-    if first < chunks.len() { groups.push(&chunks[first..]); }
+    if first < chunks.len() {
+        groups.push(&chunks[first..]);
+    }
     groups
 }
 
@@ -883,7 +1033,9 @@ mod scan_tests {
             b"\"e1\",u1,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,",
             b"e1,u1,2027-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,",
             b"missing,columns",
-        ] { observe_line(&mut counts, 0, line); }
+        ] {
+            observe_line(&mut counts, 0, line);
+        }
         assert_eq!((counts[9], counts[10], counts[13]), (1, 1, 3));
         assert_eq!((counts[19], counts[20], counts[21]), (1, 1, 3));
     }
@@ -891,16 +1043,27 @@ mod scan_tests {
     #[test]
     fn task_metadata_groups_small_inputs_without_overflowing_packed_positions() {
         let source = Arc::new(Source::new(PathBuf::new(), 0, false));
-        let make = |sizes: &[usize]| sizes.iter().map(|&n| Chunk {
-            source: source.clone(), start: 0, end: n as u64,
-        }).collect::<Vec<_>>();
+        let make = |sizes: &[usize]| {
+            sizes
+                .iter()
+                .map(|&n| Chunk {
+                    source: source.clone(),
+                    start: 0,
+                    end: n as u64,
+                })
+                .collect::<Vec<_>>()
+        };
         let tiny = make(&[4096; 128]);
         assert_eq!(group_slices(&tiny, 1, 64, 128).len(), 2);
         let sizes = [1, 3 << 20, 1, 2 << 20, 2, 3 << 20];
         let varied = make(&sizes);
         let groups = group_slices(&varied, 1, 1024, 1);
         assert_eq!(groups.iter().map(|g| g.len()).sum::<usize>(), sizes.len());
-        assert!(groups.iter().all(|g| g.iter().map(Chunk::byte_len).sum::<usize>() <= CHUNK_BYTES as usize));
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.iter().map(Chunk::byte_len).sum::<usize>() <= CHUNK_BYTES as usize)
+        );
         assert_eq!(group_slices(&varied, 1, 64, 1 << 20).len(), varied.len());
         assert!(group_slices(&[], 1, 64, 1).is_empty());
     }
@@ -929,9 +1092,12 @@ mod scan_tests {
         for chunk in chunks(&directory)? {
             let mut lengths = Vec::new();
             chunk.scan(|line| lengths.push(line.len()))?;
-            let expected: Vec<_> = rows.iter().filter_map(|&(start, len)| {
-                (chunk.start <= start as u64 && (start as u64) < chunk.end).then_some(len)
-            }).collect();
+            let expected: Vec<_> = rows
+                .iter()
+                .filter_map(|&(start, len)| {
+                    (chunk.start <= start as u64 && (start as u64) < chunk.end).then_some(len)
+                })
+                .collect();
             assert_eq!(lengths, expected, "chunk {}..{}", chunk.start, chunk.end);
         }
         fs::remove_file(part)?;
@@ -961,7 +1127,9 @@ mod scan_tests {
         for mapped in [false, true] {
             let source = Arc::new(Source::new(path.clone(), data.len() as u64, mapped));
             #[cfg(target_os = "linux")]
-            if mapped { assert!(source.mapping.is_some()); }
+            if mapped {
+                assert!(source.mapping.is_some());
+            }
             let mut actual = Vec::new();
             for start in (0..data.len()).step_by(block) {
                 let chunk = Chunk {
@@ -1004,14 +1172,21 @@ const MAX_BATCH: usize = 64;
 pub fn batch_size() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        if !std::env::var_os("PERF_DECODER").is_some_and(|v| v == "batch") { return 0; }
-        std::env::var("PERF_BATCH").ok().and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(16).clamp(1, MAX_BATCH)
+        if !std::env::var_os("PERF_DECODER").is_some_and(|v| v == "batch") {
+            return 0;
+        }
+        std::env::var("PERF_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+            .clamp(1, MAX_BATCH)
     })
 }
 
 fn parsed_groups<'a, const N: usize>(
-    span: &'a [u8], size: usize, visit: &mut impl FnMut(&[[&'a [u8]; N]]),
+    span: &'a [u8],
+    size: usize,
+    visit: &mut impl FnMut(&[[&'a [u8]; N]]),
 ) {
     let mut rows = [[&[][..]; N]; MAX_BATCH];
     let mut len = 0;
@@ -1028,29 +1203,51 @@ fn parsed_groups<'a, const N: usize>(
         }
     };
     if structural::enabled::<N>() {
-        structural::scan::<N>(span,&mut accept);
+        structural::scan::<N>(span, &mut accept);
     } else {
-        each_line(span,&mut |line| {
-            if let Some(parts) = fields::<N>(line) { accept(parts); }
+        each_line(span, &mut |line| {
+            if let Some(parts) = fields::<N>(line) {
+                accept(parts);
+            }
         });
     }
-    if len != 0 { visit(&rows[..len]); }
+    if len != 0 {
+        visit(&rows[..len]);
+    }
 }
 
 #[inline]
 pub(crate) fn event_payload(
-    fields: &[&[u8]; 7], time: Option<i64>, ingested: i64, window: Window, dim: &Dimensions,
+    fields: &[&[u8]; 7],
+    time: Option<i64>,
+    ingested: i64,
+    window: Window,
+    dim: &Dimensions,
 ) -> Option<(i64, Option<Purchase>)> {
     let time = time?;
-    if fields[1].is_empty() || fields[5].is_empty() || time < window.start
-        || time >= window.end || time < ingested - DAY { return None; }
+    if fields[1].is_empty()
+        || fields[5].is_empty()
+        || time < window.start
+        || time >= window.end
+        || time < ingested - DAY
+    {
+        return None;
+    }
     let purchase = match fields[4] {
         b"view" | b"cart" => None,
         b"purchase" => {
             let cents = unsigned(fields[6])?;
-            if !(1..=10_000_000).contains(&cents) { return None; }
-            let category = dim.products.lookup(fields[5]).unwrap_or(dim.unknown_category);
-            Some(Purchase { category, cents: cents as u32 })
+            if !(1..=10_000_000).contains(&cents) {
+                return None;
+            }
+            let category = dim
+                .products
+                .lookup(fields[5])
+                .unwrap_or(dim.unknown_category);
+            Some(Purchase {
+                category,
+                cents: cents as u32,
+            })
         }
         _ => return None,
     };
@@ -1058,57 +1255,83 @@ pub(crate) fn event_payload(
 }
 
 impl Chunk {
-    pub fn scan_events(&self, calendar: &Calendar, window: Window, dim: &Dimensions,
+    pub fn scan_events(
+        &self,
+        calendar: &Calendar,
+        window: Window,
+        dim: &Dimensions,
         mut emit: impl FnMut(&[u8], &[u8], i64, Option<(i64, Option<Purchase>)>),
     ) -> Result<()> {
         let size = batch_size();
         if size == 0 {
             return self.scan_parsed(|f: [&[u8]; 7]| {
-                if f[0].is_empty() { return; }
+                if f[0].is_empty() {
+                    return;
+                }
                 let (time, ingest) = calendar.event_times(f[2], f[3]);
                 let payload = event_payload(&f, time, ingest, window, dim);
                 emit(f[0], f[1], ingest, payload)
             });
         }
-        self.spans(|span| parsed_groups::<7>(span, size, &mut |rows| {
-            if calendar.paired_times {
-                for f in rows {
-                    let (time, ingest) = calendar.event_times(f[2], f[3]);
+        self.spans(|span| {
+            parsed_groups::<7>(span, size, &mut |rows| {
+                if calendar.paired_times {
+                    for f in rows {
+                        let (time, ingest) = calendar.event_times(f[2], f[3]);
+                        let payload = event_payload(f, time, ingest, window, dim);
+                        emit(f[0], f[1], ingest, payload);
+                    }
+                    return;
+                }
+                let mut times = [None; MAX_BATCH];
+                calendar.times(rows, 2, &mut times[..rows.len()]);
+                for (f, time) in rows.iter().zip(times) {
+                    let ingest = calendar.ingest(f[3]);
                     let payload = event_payload(f, time, ingest, window, dim);
                     emit(f[0], f[1], ingest, payload);
                 }
-                return;
-            }
-            let mut times = [None; MAX_BATCH];
-            calendar.times(rows, 2, &mut times[..rows.len()]);
-            for (f, time) in rows.iter().zip(times) {
-                let ingest = calendar.ingest(f[3]);
-                let payload = event_payload(f, time, ingest, window, dim);
-                emit(f[0], f[1], ingest, payload);
-            }
-        }))
+            })
+        })
     }
 
-    pub fn scan_clicks(&self, calendar: &Calendar, window: Window, dim: &Dimensions,
+    pub fn scan_clicks(
+        &self,
+        calendar: &Calendar,
+        window: Window,
+        dim: &Dimensions,
         mut emit: impl FnMut(&[u8], &[u8], i64, u32),
     ) -> Result<()> {
-        let mut valid = |f: &[&[u8];4], time: Option<i64>| {
+        let mut valid = |f: &[&[u8]; 4], time: Option<i64>| {
             if let Some(time) = time {
-                if !f[0].is_empty() && !f[1].is_empty() && time >= window.start - LOOKBACK && time < window.end {
-                    if let Some(campaign) = dim.campaign_ids.lookup(f[2]) { emit(f[0], f[1], time, campaign); }
+                if !f[0].is_empty()
+                    && !f[1].is_empty()
+                    && time >= window.start - LOOKBACK
+                    && time < window.end
+                {
+                    if let Some(campaign) = dim.campaign_ids.lookup(f[2]) {
+                        emit(f[0], f[1], time, campaign);
+                    }
                 }
             }
         };
         let size = batch_size();
-        if size == 0 { return self.scan_parsed(|f| valid(&f, calendar.parse(f[3]))); }
-        self.spans(|span| parsed_groups::<4>(span, size, &mut |rows| {
-            if calendar.paired_times {
-                for f in rows { valid(f, calendar.parse(f[3])); }
-                return;
-            }
-            let mut times = [None; MAX_BATCH];
-            calendar.times(rows, 3, &mut times[..rows.len()]);
-            for (f, time) in rows.iter().zip(times) { valid(f, time); }
-        }))
+        if size == 0 {
+            return self.scan_parsed(|f| valid(&f, calendar.parse(f[3])));
+        }
+        self.spans(|span| {
+            parsed_groups::<4>(span, size, &mut |rows| {
+                if calendar.paired_times {
+                    for f in rows {
+                        valid(f, calendar.parse(f[3]));
+                    }
+                    return;
+                }
+                let mut times = [None; MAX_BATCH];
+                calendar.times(rows, 3, &mut times[..rows.len()]);
+                for (f, time) in rows.iter().zip(times) {
+                    valid(f, time);
+                }
+            })
+        })
     }
 }

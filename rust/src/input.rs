@@ -30,20 +30,24 @@ const HEX: [u8; 256] = {
 };
 
 pub fn hex_id(bytes: &[u8], prefix: u8) -> Option<[u64; 2]> {
-    if bytes.len() != 33 || bytes[0] != prefix { return None; }
+    if bytes.len() != 33 || bytes[0] != prefix {
+        return None;
+    }
     let digits = <&[u8; 32]>::try_from(&bytes[1..]).unwrap();
     #[cfg(target_arch = "x86_64")]
     {
         static SIMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SIMD.get_or_init(|| std::is_x86_feature_detected!("avx2")
-                && std::env::var_os("PERF_HEX").is_some_and(|v| v == "simd")) {
+        if *SIMD.get_or_init(|| {
+            std::is_x86_feature_detected!("avx2")
+                && std::env::var_os("PERF_HEX").is_some_and(|v| v == "simd")
+        }) {
             return unsafe { hex_avx2(digits) };
         }
     }
     hex_scalar(digits)
 }
 
-fn hex_scalar(digits: &[u8;32]) -> Option<[u64;2]> {
+fn hex_scalar(digits: &[u8; 32]) -> Option<[u64; 2]> {
     let mut bytes = [0; 16];
     let mut invalid = 0;
     for (pair, dest) in digits.chunks_exact(2).zip(&mut bytes) {
@@ -52,28 +56,41 @@ fn hex_scalar(digits: &[u8;32]) -> Option<[u64;2]> {
         invalid |= high | low;
         *dest = (high << 4) | low;
     }
-    if invalid & 128 != 0 { return None; }
-    Some([u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-          u64::from_be_bytes(bytes[8..].try_into().unwrap())])
+    if invalid & 128 != 0 {
+        return None;
+    }
+    Some([
+        u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_be_bytes(bytes[8..].try_into().unwrap()),
+    ])
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable="avx2")]
+#[target_feature(enable = "avx2")]
 unsafe fn hex_avx2(digits: &[u8; 32]) -> Option<[u64; 2]> {
     use std::arch::x86_64::*;
     unsafe {
         let input = _mm256_loadu_si256(digits.as_ptr().cast());
         let in_range = |lo: i8, hi: i8| {
-            _mm256_and_si256(_mm256_cmpgt_epi8(input, _mm256_set1_epi8(lo - 1)),
-                             _mm256_cmpgt_epi8(_mm256_set1_epi8(hi + 1), input))
+            _mm256_and_si256(
+                _mm256_cmpgt_epi8(input, _mm256_set1_epi8(lo - 1)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(hi + 1), input),
+            )
         };
         let decimal = in_range(b'0' as i8, b'9' as i8);
         let letter = in_range(b'a' as i8, b'f' as i8);
-        if _mm256_movemask_epi8(_mm256_or_si256(decimal, letter)) != -1 { return None; }
-        let nibbles = _mm256_add_epi8(_mm256_and_si256(input, _mm256_set1_epi8(15)),
-                                      _mm256_and_si256(letter, _mm256_set1_epi8(9)));
+        if _mm256_movemask_epi8(_mm256_or_si256(decimal, letter)) != -1 {
+            return None;
+        }
+        let nibbles = _mm256_add_epi8(
+            _mm256_and_si256(input, _mm256_set1_epi8(15)),
+            _mm256_and_si256(letter, _mm256_set1_epi8(9)),
+        );
         let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
-        let bytes = _mm_packus_epi16(_mm256_castsi256_si128(pairs), _mm256_extracti128_si256::<1>(pairs));
+        let bytes = _mm_packus_epi16(
+            _mm256_castsi256_si128(pairs),
+            _mm256_extracti128_si256::<1>(pairs),
+        );
         let mut key = [0u64; 2];
         _mm_storeu_si128(key.as_mut_ptr().cast(), bytes);
         Some(key.map(u64::from_be))
@@ -388,7 +405,7 @@ impl Calendar {
 
     #[inline]
     pub fn parse(&self, s: &[u8]) -> Option<i64> {
-        #[cfg(target_arch="x86_64")]
+        #[cfg(target_arch = "x86_64")]
         if self.paired_times {
             return unsafe { fastdecode::single(self, s) };
         }
@@ -397,7 +414,7 @@ impl Calendar {
 
     #[inline]
     pub(crate) fn event_times(&self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64) {
-        #[cfg(target_arch="x86_64")]
+        #[cfg(target_arch = "x86_64")]
         if self.paired_times {
             return unsafe { fastdecode::pair(self, event, ingest) };
         }
@@ -435,7 +452,10 @@ impl Calendar {
     }
 
     pub(crate) fn times<const N: usize>(
-        &self, rows: &[[&[u8]; N]], column: usize, output: &mut [Option<i64>],
+        &self,
+        rows: &[[&[u8]; N]],
+        column: usize,
+        output: &mut [Option<i64>],
     ) {
         debug_assert_eq!(rows.len(), output.len());
         #[cfg(target_arch = "x86_64")]
@@ -450,13 +470,18 @@ impl Calendar {
                     lanes[count] = i;
                     count += 1;
                     if count == 4 {
-                        let words = lanes.map(|j| u64::from_le_bytes(rows[j][column][11..19].try_into().unwrap()));
+                        let words = lanes.map(|j| {
+                            u64::from_le_bytes(rows[j][column][11..19].try_into().unwrap())
+                        });
                         let seconds = unsafe { four_clocks(words) };
                         for (j, sec) in lanes.into_iter().zip(seconds) {
                             let s = rows[j][column];
-                            output[j] = if sec == u64::MAX { None } else {
-                                self.date(s).zip(zone_offset(s)).map(|(day, zone)|
-                                    day + (sec as i64) * 1000 - zone)
+                            output[j] = if sec == u64::MAX {
+                                None
+                            } else {
+                                self.date(s)
+                                    .zip(zone_offset(s))
+                                    .map(|(day, zone)| day + (sec as i64) * 1000 - zone)
                             };
                         }
                         count = 0;
@@ -465,48 +490,82 @@ impl Calendar {
                     output[i] = self.parse(s);
                 }
             }
-            for &j in &lanes[..count] { output[j] = self.parse(rows[j][column]); }
+            for &j in &lanes[..count] {
+                output[j] = self.parse(rows[j][column]);
+            }
             return;
         }
-        for (value, row) in output.iter_mut().zip(rows) { *value = self.parse(row[column]); }
+        for (value, row) in output.iter_mut().zip(rows) {
+            *value = self.parse(row[column]);
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn zone_offset(s: &[u8]) -> Option<i64> {
-    if s.len() == 20 { return Some(0); }
+    if s.len() == 20 {
+        return Some(0);
+    }
     let h = two_digits(s[20], s[21])?;
     let m = two_digits(s[23], s[24])?;
-    if h > 23 || m > 59 || s[22] != b':' { return None; }
+    if h > 23 || m > 59 || s[22] != b':' {
+        return None;
+    }
     Some(i64::from(h * 60 + m) * if s[19] == b'+' { 60_000 } else { -60_000 })
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable="avx2")]
-unsafe fn four_clocks(words: [u64;4]) -> [u64;4] {
+#[target_feature(enable = "avx2")]
+unsafe fn four_clocks(words: [u64; 4]) -> [u64; 4] {
     use std::arch::x86_64::*;
     unsafe {
         let s = _mm256_loadu_si256(words.as_ptr().cast());
         let colons = _mm256_set1_epi64x(CLOCK_COLONS as i64);
-        let colon_ok = _mm256_cmpeq_epi64(_mm256_and_si256(s, colons), _mm256_set1_epi64x(0x3a00_003a_0000));
+        let colon_ok = _mm256_cmpeq_epi64(
+            _mm256_and_si256(s, colons),
+            _mm256_set1_epi64x(0x3a00_003a_0000),
+        );
         let digits = _mm256_blendv_epi8(s, _mm256_set1_epi8(b'0' as i8), colons);
-        let decimal = _mm256_and_si256(_mm256_cmpgt_epi8(digits, _mm256_set1_epi8(b'/' as i8)),
-                                       _mm256_cmpgt_epi8(_mm256_set1_epi8(b':' as i8), digits));
-        let ok = _mm256_and_si256(colon_ok, _mm256_cmpeq_epi64(decimal, _mm256_set1_epi64x(-1)));
+        let decimal = _mm256_and_si256(
+            _mm256_cmpgt_epi8(digits, _mm256_set1_epi8(b'/' as i8)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(b':' as i8), digits),
+        );
+        let ok = _mm256_and_si256(
+            colon_ok,
+            _mm256_cmpeq_epi64(decimal, _mm256_set1_epi64x(-1)),
+        );
         let values = _mm256_and_si256(s, _mm256_set1_epi64x(0x0f0f_000f_0f00_0f0f));
-        let pairs = _mm256_add_epi64(_mm256_srli_epi64::<8>(values),
-                      _mm256_add_epi64(_mm256_slli_epi64::<3>(values), _mm256_slli_epi64::<1>(values)));
+        let pairs = _mm256_add_epi64(
+            _mm256_srli_epi64::<8>(values),
+            _mm256_add_epi64(
+                _mm256_slli_epi64::<3>(values),
+                _mm256_slli_epi64::<1>(values),
+            ),
+        );
         let mask = _mm256_set1_epi64x(255);
         let h = _mm256_and_si256(pairs, mask);
         let m = _mm256_and_si256(_mm256_srli_epi64::<24>(pairs), mask);
         let sec = _mm256_and_si256(_mm256_srli_epi64::<48>(pairs), mask);
-        let hm = _mm256_and_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(24), h),
-                                  _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), m));
-        let valid = _mm256_and_si256(ok, _mm256_and_si256(hm, _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), sec)));
-        let result = _mm256_add_epi64(sec, _mm256_add_epi64(_mm256_mul_epu32(h, _mm256_set1_epi64x(3600)),
-                                                           _mm256_mul_epu32(m, _mm256_set1_epi64x(60))));
-        let mut out = [0;4];
-        _mm256_storeu_si256(out.as_mut_ptr().cast(), _mm256_blendv_epi8(_mm256_set1_epi64x(-1), result, valid));
+        let hm = _mm256_and_si256(
+            _mm256_cmpgt_epi64(_mm256_set1_epi64x(24), h),
+            _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), m),
+        );
+        let valid = _mm256_and_si256(
+            ok,
+            _mm256_and_si256(hm, _mm256_cmpgt_epi64(_mm256_set1_epi64x(60), sec)),
+        );
+        let result = _mm256_add_epi64(
+            sec,
+            _mm256_add_epi64(
+                _mm256_mul_epu32(h, _mm256_set1_epi64x(3600)),
+                _mm256_mul_epu32(m, _mm256_set1_epi64x(60)),
+            ),
+        );
+        let mut out = [0; 4];
+        _mm256_storeu_si256(
+            out.as_mut_ptr().cast(),
+            _mm256_blendv_epi8(_mm256_set1_epi64x(-1), result, valid),
+        );
         out
     }
 }
@@ -549,12 +608,16 @@ impl<const C: bool> DimIndex<C> {
     pub fn lookup(&self, name: &[u8]) -> Option<u32> {
         if let Some(n) = Self::number(name) {
             match &self.dense {
-                DenseValues::Wide(values) => if let Some(&id) = values.get(n) {
-                    return (id != u32::MAX).then_some(id);
-                },
-                DenseValues::Byte(values) => if let Some(&id) = values.get(n) {
-                    return (id != u8::MAX).then_some(u32::from(id));
-                },
+                DenseValues::Wide(values) => {
+                    if let Some(&id) = values.get(n) {
+                        return (id != u32::MAX).then_some(id);
+                    }
+                }
+                DenseValues::Byte(values) => {
+                    if let Some(&id) = values.get(n) {
+                        return (id != u8::MAX).then_some(u32::from(id));
+                    }
+                }
             }
         }
         self.other.get(text(name)).copied()
@@ -576,8 +639,10 @@ impl<const C: bool> FromIterator<(String, u32)> for DimIndex<C> {
                 other.insert(s, id);
             }
         }
-        let dense = if !C && perf_on("PERF_DIM_NARROW")
-            && dense.iter().all(|&value| value < 255 || value == u32::MAX) {
+        let dense = if !C
+            && perf_on("PERF_DIM_NARROW")
+            && dense.iter().all(|&value| value < 255 || value == u32::MAX)
+        {
             // Casting the wide missing-value sentinel yields the byte sentinel.
             DenseValues::Byte(dense.into_iter().map(|value| value as u8).collect())
         } else {
@@ -604,7 +669,8 @@ impl Dimensions {
                     pairs.push((text(product).to_owned(), text(category).to_owned()));
                 }
             })?;
-            let mut categories: Vec<_> = pairs.iter().map(|(_, category)| category.clone()).collect();
+            let mut categories: Vec<_> =
+                pairs.iter().map(|(_, category)| category.clone()).collect();
             categories.push("unknown".into());
             categories.sort_unstable();
             categories.dedup();
@@ -658,7 +724,7 @@ struct NameShard {
     lock_ns: u64,
     keys: Vec<u64>,
     ids: AHashMap<Arc<str>, u32>,
-    wide: Option<AHashMap<[u64;2], u32>>,
+    wide: Option<AHashMap<[u64; 2], u32>>,
     names: Vec<Arc<str>>,
 }
 
@@ -699,7 +765,9 @@ impl Default for Names {
 impl Names {
     #[inline]
     fn lock_for_intern(&self, shard: usize) -> std::sync::MutexGuard<'_, NameShard> {
-        if !self.profile_locks { return self.shards[shard].lock().unwrap(); }
+        if !self.profile_locks {
+            return self.shards[shard].lock().unwrap();
+        }
         let start = std::time::Instant::now();
         let mut state = self.shards[shard].lock().unwrap();
         state.lock_ns += start.elapsed().as_nanos() as u64;
@@ -708,7 +776,9 @@ impl Names {
     }
 
     pub(crate) fn lock_stats(&self) -> (u64, u64) {
-        if !self.profile_locks { return (0, 0); }
+        if !self.profile_locks {
+            return (0, 0);
+        }
         self.shards.iter().fold((0, 0), |(calls, ns), shard| {
             let state = shard.lock().unwrap();
             (calls + state.lock_calls, ns + state.lock_ns)
@@ -730,18 +800,25 @@ impl Names {
         self.lock_for_intern(shard).intern(shard, name)
     }
 
-    fn intern_wide(&self, shard: usize, key: [u64;2], name: &str) -> u32 {
+    fn intern_wide(&self, shard: usize, key: [u64; 2], name: &str) -> u32 {
         let mut state = self.lock_for_intern(shard);
-        if let Some(&id) = state.wide.as_ref().and_then(|map| map.get(&key)) { return id; }
+        if let Some(&id) = state.wide.as_ref().and_then(|map| map.get(&key)) {
+            return id;
+        }
         let id = id_for(shard, state.offset + state.keys.len());
         let spelling = EXTERNAL_NAME | state.names.len() as u64;
         state.keys.push(spelling);
         let name: Arc<str> = name.into();
         // Graph construction still needs the spelling both for its lexical
         // representative and for remapping all external endpoints at finish.
-        if self.packed.is_none() { state.ids.insert(name.clone(), id); }
+        if self.packed.is_none() {
+            state.ids.insert(name.clone(), id);
+        }
         state.names.push(name);
-        state.wide.get_or_insert_with(AHashMap::default).insert(key, id);
+        state
+            .wide
+            .get_or_insert_with(AHashMap::default)
+            .insert(key, id);
         id
     }
 
@@ -861,7 +938,7 @@ fn linked_spelling<'a>(names: &'a [Vec<Arc<str>>], key: u64, buffer: &'a mut [u8
 pub struct Aliases {
     table: Arc<NameTable>,
     external: Vec<AHashMap<Arc<str>, u32>>,
-    wide: Option<Vec<AHashMap<[u64;2],u32>>>,
+    wide: Option<Vec<AHashMap<[u64; 2], u32>>>,
     wide_cache: Option<crate::wide_cache::WideCache>,
 }
 
@@ -872,7 +949,10 @@ impl Aliases {
             if let Some(key) = hex_id(bytes, b'u') {
                 let lookup = || {
                     let shard = users.hash.hash_one(key) as usize % SHARDS;
-                    wide[shard].get(&key).copied().unwrap_or_else(|| users.intern_wide(shard,key,text(bytes)))
+                    wide[shard]
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_else(|| users.intern_wide(shard, key, text(bytes)))
                 };
                 return match &self.wide_cache {
                     Some(cache) => cache.resolve(key, lookup),
@@ -882,7 +962,10 @@ impl Aliases {
         }
         let shard = users.hash.hash_one(bytes) as usize % SHARDS;
         let name = text(bytes);
-        self.external[shard].get(name).copied().unwrap_or_else(|| users.intern_in(shard,name))
+        self.external[shard]
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| users.intern_in(shard, name))
     }
 
     pub(crate) fn is_linked_person(&self, id: u32) -> bool {
@@ -1196,7 +1279,8 @@ impl LinkGraph {
     }
 
     fn slot_for_link(&self, key: u64, hash: usize) -> u32 {
-        self.find_slot::<false>(key, hash).expect("the full graph has room for all endpoints")
+        self.find_slot::<false>(key, hash)
+            .expect("the full graph has room for all endpoints")
     }
 
     fn find_slot<const BOUNDED: bool>(&self, key: u64, hash: usize) -> Option<u32> {
@@ -1206,7 +1290,9 @@ impl LinkGraph {
         loop {
             if BOUNDED {
                 probes += 1;
-                if probes > 64 { return None; }
+                if probes > 64 {
+                    return None;
+                }
             }
             let slot = &self.entries[index];
             let stored = slot.key.load(Ordering::Acquire);
@@ -1228,50 +1314,73 @@ impl LinkGraph {
     }
 
     fn connect<const BOUNDED: bool>(
-        &self, batches: &[Vec<(u64, u64)>], hash: &RandomState, prefetch: bool, prefetched: &AtomicU64,
+        &self,
+        batches: &[Vec<(u64, u64)>],
+        hash: &RandomState,
+        prefetch: bool,
+        prefetched: &AtomicU64,
     ) -> bool {
         let edge = |l, lh, r, rh| -> Option<()> {
-            self.join(self.find_slot::<BOUNDED>(l, lh)?, self.find_slot::<BOUNDED>(r, rh)?);
+            self.join(
+                self.find_slot::<BOUNDED>(l, lh)?,
+                self.find_slot::<BOUNDED>(r, rh)?,
+            );
             Some(())
         };
         let profile = crate::csv::work_enabled();
-        batches.par_iter().all(|edges| edges.par_chunks(4096).all(|part| {
-            let mut local = 0;
-            let complete = (|| {
-            if !prefetch {
-                return part.iter().all(|&(l,r)| {
-                    edge(l, hash.hash_one(l) as usize, r, hash.hash_one(r) as usize).is_some()
-                });
-            }
-            for group in part.chunks(32) {
-                let mut short = [(0, 0, 0, 0); 32];
-                let mut n = 0;
-                for &(l,r) in group {
-                    let lh = hash.hash_one(l) as usize;
-                    let rh = hash.hash_one(r) as usize;
-                    if l >= EXTERNAL_NAME || r >= EXTERNAL_NAME {
-                        if edge(l, lh, r, rh).is_none() { return false; }
-                    } else {
-                        if profile { local += 2; }
-                        #[cfg(target_arch = "x86_64")]
-                        for h in [lh,rh] {
-                            let address = &self.entries[h & (self.entries.len()-1)];
-                            unsafe { std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(
-                                (address as *const Entry).cast()); }
-                        }
-                        short[n] = (l,lh,r,rh);
-                        n += 1;
+        batches.par_iter().all(|edges| {
+            edges.par_chunks(4096).all(|part| {
+                let mut local = 0;
+                let complete = (|| {
+                    if !prefetch {
+                        return part.iter().all(|&(l, r)| {
+                            edge(l, hash.hash_one(l) as usize, r, hash.hash_one(r) as usize)
+                                .is_some()
+                        });
                     }
+                    for group in part.chunks(32) {
+                        let mut short = [(0, 0, 0, 0); 32];
+                        let mut n = 0;
+                        for &(l, r) in group {
+                            let lh = hash.hash_one(l) as usize;
+                            let rh = hash.hash_one(r) as usize;
+                            if l >= EXTERNAL_NAME || r >= EXTERNAL_NAME {
+                                if edge(l, lh, r, rh).is_none() {
+                                    return false;
+                                }
+                            } else {
+                                if profile {
+                                    local += 2;
+                                }
+                                #[cfg(target_arch = "x86_64")]
+                                for h in [lh, rh] {
+                                    let address = &self.entries[h & (self.entries.len() - 1)];
+                                    unsafe {
+                                        std::arch::x86_64::_mm_prefetch::<
+                                            { std::arch::x86_64::_MM_HINT_T0 },
+                                        >(
+                                            (address as *const Entry).cast()
+                                        );
+                                    }
+                                }
+                                short[n] = (l, lh, r, rh);
+                                n += 1;
+                            }
+                        }
+                        for &(l, lh, r, rh) in &short[..n] {
+                            if edge(l, lh, r, rh).is_none() {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })();
+                if profile {
+                    prefetched.fetch_add(local, Ordering::Relaxed);
                 }
-                for &(l,lh,r,rh) in &short[..n] {
-                    if edge(l, lh, r, rh).is_none() { return false; }
-                }
-            }
-            true
-            })();
-            if profile { prefetched.fetch_add(local, Ordering::Relaxed); }
-            complete
-        }))
+                complete
+            })
+        })
     }
 
     fn root(&self, mut id: u32) -> u32 {
@@ -1462,7 +1571,9 @@ fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> R
     let prefetched = AtomicU64::new(0);
     let mut retried = false;
     let graph = if compact {
-        let capacity = (edge_count + edge_count / 4 + 1).max(1024).next_power_of_two();
+        let capacity = (edge_count + edge_count / 4 + 1)
+            .max(1024)
+            .next_power_of_two();
         let graph = LinkGraph::with_capacity(capacity, external_names);
         if graph.connect::<true>(&batches, &users.hash, prefetch, &prefetched) {
             graph
@@ -1482,27 +1593,44 @@ fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> R
     if crate::csv::work_enabled() {
         let mut sizes: Vec<_> = batches.iter().map(Vec::len).collect();
         sizes.sort_unstable();
-        let short_pairs: usize = batches.iter().map(|b| b.iter().filter(|&&(l,r)| l<EXTERNAL_NAME && r<EXTERNAL_NAME).count()).sum();
-        eprintln!("profile {}", serde_json::json!({
-            "stage":"work_link_graph", "edges":edge_count, "short_pairs":short_pairs,
-            "max_task_edges":sizes.last().copied().unwrap_or(0),
-            "median_task_edges":sizes.get(sizes.len()/2).copied().unwrap_or(0),
-            "requested_prefetches":prefetched.load(Ordering::Relaxed),
-            "capacity_retries":usize::from(retried), "final_slots":graph.entries.len(),
-        }));
+        let short_pairs: usize = batches
+            .iter()
+            .map(|b| {
+                b.iter()
+                    .filter(|&&(l, r)| l < EXTERNAL_NAME && r < EXTERNAL_NAME)
+                    .count()
+            })
+            .sum();
+        eprintln!(
+            "profile {}",
+            serde_json::json!({
+                "stage":"work_link_graph", "edges":edge_count, "short_pairs":short_pairs,
+                "max_task_edges":sizes.last().copied().unwrap_or(0),
+                "median_task_edges":sizes.get(sizes.len()/2).copied().unwrap_or(0),
+                "requested_prefetches":prefetched.load(Ordering::Relaxed),
+                "capacity_retries":usize::from(retried), "final_slots":graph.entries.len(),
+            })
+        );
     }
     drop(batches);
     let table = graph.finish(&mut external, &users.hash);
-    let wide: Option<Vec<AHashMap<[u64;2],u32>>> = wide_users.then(|| external.par_iter_mut().map(|names| {
-        let mut packed = AHashMap::default();
-        names.retain(|spelling,id| {
-            if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
-                packed.insert(key,*id);
-                false
-            } else { true }
-        });
-        packed
-    }).collect());
+    let wide: Option<Vec<AHashMap<[u64; 2], u32>>> = wide_users.then(|| {
+        external
+            .par_iter_mut()
+            .map(|names| {
+                let mut packed = AHashMap::default();
+                names.retain(|spelling, id| {
+                    if let Some(key) = hex_id(spelling.as_bytes(), b'u') {
+                        packed.insert(key, *id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                packed
+            })
+            .collect()
+    });
     let dynamic_start = table.canonical.len().div_ceil(SHARDS);
     for shard in &mut users.shards {
         shard.get_mut().unwrap().offset = dynamic_start;
@@ -1510,9 +1638,16 @@ fn read_aliases_with_wide(data: &Path, users: &mut Names, wide_users: bool) -> R
     let table = Arc::new(table);
     users.packed = Some(Arc::clone(&table));
     users.wide_users = wide_users;
-    let wide_cache = wide.as_ref().filter(|_| perf_on("PERF_WIDE_CACHE"))
+    let wide_cache = wide
+        .as_ref()
+        .filter(|_| perf_on("PERF_WIDE_CACHE"))
         .map(|maps| crate::wide_cache::WideCache::new(maps.iter().map(|m| m.len()).sum()));
-    Ok(Aliases { table, external, wide, wide_cache })
+    Ok(Aliases {
+        table,
+        external,
+        wide,
+        wide_cache,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1561,12 +1696,22 @@ const EXTERNAL: u64 = u64::MAX;
 impl Prepared {
     #[cfg(not(feature = "large-input"))]
     pub(crate) fn work_class(self) -> usize {
-        match self { Self::Ready(_) => 0, Self::Compact(..) => 1, Self::Spill(_) => 2, Self::External => 3 }
+        match self {
+            Self::Ready(_) => 0,
+            Self::Compact(..) => 1,
+            Self::Spill(_) => 2,
+            Self::External => 3,
+        }
     }
 
     #[cfg(feature = "large-input")]
     pub(crate) fn work_class(self) -> usize {
-        match self.0 { SPILL => 2, EXTERNAL => 3, word if word & READY != 0 => 0, _ => 1 }
+        match self.0 {
+            SPILL => 2,
+            EXTERNAL => 3,
+            word if word & READY != 0 => 0,
+            _ => 1,
+        }
     }
 }
 
@@ -1693,30 +1838,33 @@ mod person_tests {
 
     #[test]
     fn wide_people_preserve_linked_dynamic_and_unusual_spellings() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("shopping-wide-user-{}",std::process::id()));
+        let dir = std::env::temp_dir().join(format!("shopping-wide-user-{}", std::process::id()));
         let links = dir.join("links");
         std::fs::create_dir_all(&links)?;
         let paired = "u0000000000000000000000000000000f";
         let other = "u0000000000000001000000000000000f";
         let different_case = "u0000000000000000000000000000000F";
         let path = links.join("part.csv");
-        std::fs::write(&path,format!("user_id_a,user_id_b\n{paired},U7\nU7,ordinary-alias\n"))?;
+        std::fs::write(
+            &path,
+            format!("user_id_a,user_id_b\n{paired},U7\nU7,ordinary-alias\n"),
+        )?;
         let mut users = Names::default();
         let aliases = read_aliases_with_wide(&dir, &mut users, true)?;
         let mut cache = PersonCache::default();
-        let owner = cache.resolve(&users,&aliases,paired.as_bytes());
-        assert_eq!(owner, cache.resolve(&users,&aliases,b"ordinary-alias"));
-        assert_eq!(owner, cache.resolve(&users,&aliases,b"U7"));
-        let new = cache.resolve(&users,&aliases,other.as_bytes());
-        let mixed = cache.resolve(&users,&aliases,different_case.as_bytes());
-        assert_ne!(new,owner);
-        assert_ne!(new,mixed);
-        assert_ne!(owner,mixed);
-        assert_eq!(new, cache.resolve(&users,&aliases,other.as_bytes()));
+        let owner = cache.resolve(&users, &aliases, paired.as_bytes());
+        assert_eq!(owner, cache.resolve(&users, &aliases, b"ordinary-alias"));
+        assert_eq!(owner, cache.resolve(&users, &aliases, b"U7"));
+        let new = cache.resolve(&users, &aliases, other.as_bytes());
+        let mixed = cache.resolve(&users, &aliases, different_case.as_bytes());
+        assert_ne!(new, owner);
+        assert_ne!(new, mixed);
+        assert_ne!(owner, mixed);
+        assert_eq!(new, cache.resolve(&users, &aliases, other.as_bytes()));
         let names = users.into_people();
-        assert_eq!(names.get(owner,&mut [0;9]),"U7");
-        assert_eq!(names.get(new,&mut [0;9]),other);
-        assert_eq!(names.get(mixed,&mut [0;9]),different_case);
+        assert_eq!(names.get(owner, &mut [0; 9]), "U7");
+        assert_eq!(names.get(new, &mut [0; 9]), other);
+        assert_eq!(names.get(mixed, &mut [0; 9]), different_case);
         std::fs::remove_file(path)?;
         std::fs::remove_dir(links)?;
         std::fs::remove_dir(dir)?;
@@ -1726,7 +1874,9 @@ mod person_tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn hex_vectors_and_batch_dates_match_scalar_even_on_bad_bytes() {
-        if !std::is_x86_feature_detected!("avx2") { return; }
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let word = *b"0123456789abcdeffedcba9876543210";
         for i in 0..32 {
             for b in 0..=255 {
@@ -1735,17 +1885,24 @@ mod person_tests {
                 assert_eq!(unsafe { hex_avx2(&test) }, hex_scalar(&test));
             }
         }
-        let cal = Calendar::new(Window{start:0,end:DAY});
+        let cal = Calendar::new(Window { start: 0, end: DAY });
         let valid: &[u8] = b"2028-02-29T00:00:00Z";
         let offset = *b"2028-02-29T23:59:59-23:59";
         for i in 0..offset.len() {
             for b in 0..=255 {
-                let mut test=offset;
-                test[i]=b;
-                let rows=[[valid],[&test],[b"0000000001234".as_slice()],[b"123".as_slice()],[valid],[&test]];
-                let mut values=[None;6];
-                cal.times(&rows,0,&mut values);
-                assert_eq!(values,rows.map(|row|cal.parse(row[0])));
+                let mut test = offset;
+                test[i] = b;
+                let rows = [
+                    [valid],
+                    [&test],
+                    [b"0000000001234".as_slice()],
+                    [b"123".as_slice()],
+                    [valid],
+                    [&test],
+                ];
+                let mut values = [None; 6];
+                cal.times(&rows, 0, &mut values);
+                assert_eq!(values, rows.map(|row| cal.parse(row[0])));
             }
         }
     }
@@ -1759,11 +1916,16 @@ mod person_tests {
         assert!(!small.connect::<true>(&batches, &hash, true, &counted));
         let full = LinkGraph::new(batches[0].len(), Vec::new());
         assert!(full.connect::<false>(&batches, &hash, true, &counted));
-        for &(a,b) in &batches[0] {
+        for &(a, b) in &batches[0] {
             let a_slot = full.slot_for_link(a, hash.hash_one(a) as usize);
             let b_slot = full.slot_for_link(b, hash.hash_one(b) as usize);
             assert_eq!(full.root(a_slot), full.root(b_slot));
-            assert_eq!(full.entries[full.root(a_slot) as usize].key.load(Ordering::Relaxed), a);
+            assert_eq!(
+                full.entries[full.root(a_slot) as usize]
+                    .key
+                    .load(Ordering::Relaxed),
+                a
+            );
         }
     }
 

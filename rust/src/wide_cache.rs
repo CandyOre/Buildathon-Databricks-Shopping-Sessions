@@ -15,24 +15,32 @@ pub(crate) struct WideCache {
 
 impl WideCache {
     pub(crate) fn new(linked: usize) -> Self {
-        let len = linked.saturating_mul(4).clamp(4096, 1 << 22).next_power_of_two();
+        let len = linked
+            .saturating_mul(4)
+            .clamp(4096, 1 << 22)
+            .next_power_of_two();
         let cells = (0..len).map(|_| OnceLock::new()).collect();
         Self { cells }
     }
 
     #[inline]
-    fn home(&self, [hi,lo]: [u64;2]) -> usize {
+    fn home(&self, [hi, lo]: [u64; 2]) -> usize {
         let x = (hi.rotate_left(23) ^ lo).wrapping_mul(0xa24b_aed4_963e_e407);
-        ((x ^ (x >> 33)) as usize) & (self.cells.len()-1)
+        ((x ^ (x >> 33)) as usize) & (self.cells.len() - 1)
     }
 
     #[inline]
-    pub(crate) fn resolve(&self, key: [u64;2], lookup: impl Fn() -> u32) -> u32 {
+    pub(crate) fn resolve(&self, key: [u64; 2], lookup: impl Fn() -> u32) -> u32 {
         let home = self.home(key);
         for offset in 0..4 {
-            let cell = &self.cells[(home + offset) & (self.cells.len()-1)];
-            let entry = cell.get_or_init(|| Entry {key, person:lookup()});
-            if entry.key == key { return entry.person; }
+            let cell = &self.cells[(home + offset) & (self.cells.len() - 1)];
+            let entry = cell.get_or_init(|| Entry {
+                key,
+                person: lookup(),
+            });
+            if entry.key == key {
+                return entry.person;
+            }
         }
         lookup()
     }
