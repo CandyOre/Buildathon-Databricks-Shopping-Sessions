@@ -489,10 +489,11 @@ impl IoWork {
     }
 }
 
-const WORK_NAMES: [&str; 19] = ["tasks", "nominal_bytes", "read_calls", "read_bytes", "mapped_tasks",
+const WORK_NAMES: [&str; 22] = ["tasks", "nominal_bytes", "read_calls", "read_bytes", "mapped_tasks",
     "mapped_scan_bytes", "overrun_bytes", "rows", "row_bytes", "quoted_rows", "malformed_rows",
     "canonical_id_rows", "other_id_rows", "ts_f1_shape", "ts_f2_shape", "ts_epoch_digits",
-    "ts_other", "over_128b_rows", "over_128k_rows"];
+    "ts_other", "over_128b_rows", "over_128k_rows", "ts_unparseable_or_overflow",
+    "regular_unquoted_valid_shape_rows", "other_shape_rows"];
 const GROUPS: [&str; 4] = ["events", "clicks", "links", "dimensions"];
 type Counts = [u64; WORK_NAMES.len()];
 static TOTALS: std::sync::Mutex<[Counts; 4]> = std::sync::Mutex::new([[0; WORK_NAMES.len()]; 4]);
@@ -505,26 +506,52 @@ fn profile_group(path: &Path) -> usize {
 fn observe_line(counts: &mut Counts, group: usize, line: &[u8]) {
     counts[7] += 1;
     counts[8] += line.len() as u64;
-    counts[9] += u64::from(memchr(b'"', line).is_some());
+    let quoted = memchr(b'"', line).is_some();
+    counts[9] += u64::from(quoted);
     counts[17] += u64::from(line.len() > 128);
     counts[18] += u64::from(line.len() > 128 * 1024);
+    let index = |digits: &[u8]| {
+        (1..=7).contains(&digits.len()) && (digits.len() == 1 || digits[0] != b'0')
+            && digits.iter().all(u8::is_ascii_digit)
+    };
     let pair = match group {
-        0 => fields::<7>(line).map(|f| (f[0],f[2],b'e')),
-        1 => fields::<4>(line).map(|f| (f[0],f[3],b'k')),
+        0 => fields::<7>(line).map(|f| {
+            let kind = match f[4] {
+                b"view" | b"cart" => true,
+                b"purchase" => unsigned(f[6]).is_some_and(|v| (1..=10_000_000).contains(&v)),
+                _ => false,
+            };
+            let regular = kind && f[5].strip_prefix(b"p").is_some_and(index);
+            (f[0],f[1],f[2],b'e',regular)
+        }),
+        1 => fields::<4>(line).map(|f| {
+            (f[0],f[1],f[3],b'k',f[2].strip_prefix(b"c_").is_some_and(index))
+        }),
         _ => {
             counts[10] += u64::from(fields::<2>(line).is_none());
             return;
         }
     };
-    let Some((id, ts, prefix)) = pair else { counts[10] += 1; return; };
-    let canonical = id.first() == Some(&prefix) &&
-        (matches!(id.len(), 2..=9) && id[1..].iter().all(|v| v.is_ascii_digit() || v.is_ascii_lowercase())
-         || id.len() == 33 && id[1..].iter().all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(v)));
+    let Some((id, user, ts, prefix, regular_fields)) = pair else {
+        counts[10] += 1; counts[21] += 1; return;
+    };
+    let normal_key = |id: &[u8], prefix: u8| {
+        id.first() == Some(&prefix) &&
+            (matches!(id.len(), 2..=9) && id[1..].iter().all(|v| v.is_ascii_digit() || v.is_ascii_lowercase())
+             || id.len() == 33 && id[1..].iter().all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(v)))
+    };
+    let canonical = normal_key(id, prefix);
     counts[if canonical {11} else {12}] += 1;
     let format = if ts.len()==20 && ts[10]==b'T' && ts[19]==b'Z' { 13 }
         else if ts.len()==25 && ts[10]==b'T' && matches!(ts[19],b'+'|b'-') {14}
         else if !ts.is_empty() && ts.iter().all(u8::is_ascii_digit) {15} else {16};
     counts[format] += 1;
+    let valid_time = crate::input::timestamp(ts).is_some();
+    counts[19] += u64::from(!valid_time);
+    // This measures lexical shape. Window, lateness, deduplication and
+    // actual catalog membership are counted later by the processing stage.
+    let regular = !quoted && canonical && normal_key(user, b'u') && regular_fields && valid_time;
+    counts[if regular {20} else {21}] += 1;
 }
 
 fn submit_work(group: usize, nominal: u64, io: IoWork, mut counts: Counts) {
@@ -847,6 +874,19 @@ fn group_slices(chunks: &[Chunk], requested: usize, metadata: usize, budget: usi
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn work_counts_distinguish_bad_calendar_values_from_well_shaped_timestamps() {
+        let mut counts = Counts::default();
+        for line in [
+            b"e1,u1,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,".as_slice(),
+            b"\"e1\",u1,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,",
+            b"e1,u1,2027-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,",
+            b"missing,columns",
+        ] { observe_line(&mut counts, 0, line); }
+        assert_eq!((counts[9], counts[10], counts[13]), (1, 1, 3));
+        assert_eq!((counts[19], counts[20], counts[21]), (1, 1, 3));
+    }
 
     #[test]
     fn task_metadata_groups_small_inputs_without_overflowing_packed_positions() {
