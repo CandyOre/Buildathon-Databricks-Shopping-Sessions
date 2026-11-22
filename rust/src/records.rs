@@ -48,7 +48,16 @@ const HEX_DIGITS: [u8; 256] = {
 };
 
 fn hex_event_id(id: &[u8]) -> Option<[u64; 2]> {
-    let digits: &[u8; 32] = id.strip_prefix(b"e")?.try_into().ok()?;
+    hex_key(id, b'e')
+}
+
+#[inline]
+fn hex_key(id: &[u8], prefix: u8) -> Option<[u64; 2]> {
+    let (&first, digits) = id.split_first()?;
+    if first != prefix {
+        return None;
+    }
+    let digits: &[u8; 32] = digits.try_into().ok()?;
     let mut bytes = [0u8; 16];
     let mut invalid = 0;
     for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
@@ -90,24 +99,78 @@ fn mix_event_word(word: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-pub struct ClickIds(Vec<Vec<Arc<str>>>);
+const HEX_CLICK: u64 = EXTERNAL_ID | (1 << 62);
+
+pub(crate) struct ClickKeyChunk {
+    index: usize,
+    hex: Vec<[u64; 2]>,
+}
+
+impl ClickKeyChunk {
+    pub(crate) fn new(index: usize) -> Self {
+        Self { index, hex: Vec::new() }
+    }
+
+    pub(crate) fn encode(&mut self, id: &[u8], names: &Names) -> u64 {
+        if id.len() == 33 && self.index < 1 << 30 {
+            if let Some(words) = hex_key(id, b'k') {
+                if let Ok(slot) = u32::try_from(self.hex.len()) {
+                    self.hex.push(words);
+                    return HEX_CLICK | ((self.index as u64) << 32) | u64::from(slot);
+                }
+            }
+        }
+        id_for(id, b'k', names)
+    }
+}
+
+pub struct ClickIds {
+    external: Vec<Vec<Arc<str>>>,
+    hex: Vec<Vec<[u64; 2]>>,
+}
 
 impl ClickIds {
+    pub(crate) fn new(names: Names, chunks: Vec<ClickKeyChunk>) -> Self {
+        let mut hex = vec![Vec::new(); chunks.len()];
+        for chunk in chunks {
+            hex[chunk.index] = chunk.hex;
+        }
+        Self { external: names.into_names(), hex }
+    }
+
+    #[inline]
+    fn words(&self, id: u64) -> [u64; 2] {
+        self.hex[((id ^ HEX_CLICK) >> 32) as usize][id as u32 as usize]
+    }
+
     pub fn compare(&self, left: u64, right: u64) -> Ordering {
         if left < EXTERNAL_ID && right < EXTERNAL_ID {
             return left.cmp(&right);
         }
-        let (mut left_buffer, mut right_buffer) = ([0; 9], [0; 9]);
+        if left >= HEX_CLICK && right >= HEX_CLICK {
+            return self.words(left).cmp(&self.words(right));
+        }
+        let (mut left_buffer, mut right_buffer) = ([0; 33], [0; 33]);
         self.bytes(left, &mut left_buffer)
             .cmp(self.bytes(right, &mut right_buffer))
     }
 
-    fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; 9]) -> &'a [u8] {
-        if id >= EXTERNAL_ID {
-            return input::name_for(&self.0, id as u32).as_bytes();
-        }
+    fn bytes<'a>(&'a self, id: u64, buffer: &'a mut [u8; 33]) -> &'a [u8] {
         buffer[0] = b'k';
-        buffer[1..].copy_from_slice(&id.to_be_bytes());
+        if id >= HEX_CLICK {
+            let alphabet = b"0123456789abcdef";
+            let words = self.words(id);
+            for (out, byte) in buffer[1..].chunks_exact_mut(2)
+                .zip(words.into_iter().flat_map(u64::to_be_bytes)) {
+                out[0] = alphabet[(byte >> 4) as usize];
+                out[1] = alphabet[(byte & 15) as usize];
+            }
+            return buffer;
+        }
+        if id >= EXTERNAL_ID {
+            return input::name_for(&self.external, id as u32).as_bytes();
+        }
+        buffer[1..9].copy_from_slice(&id.to_be_bytes());
         let end = 9 - (id.trailing_zeros() / 8) as usize;
         &buffer[..end]
     }
@@ -898,8 +961,10 @@ pub fn read_clicks(
     let calendar = input::Calendar::new(window);
     let pieces = chunks(&data.join("clicks"))?
         .into_par_iter()
-        .map_init(PersonCache::default, |people, chunk| {
+        .enumerate()
+        .map_init(PersonCache::default, |people, (index, chunk)| {
             let mut local = shards::<Vec<Click>>();
+            let mut keys = ClickKeyChunk::new(index);
             chunk.scan_parsed(|[id, user, campaign, ts]| {
                 if id.is_empty() || user.is_empty() {
                     return;
@@ -915,7 +980,7 @@ pub fn read_clicks(
                     return;
                 }
                 let person = people.prepared(proposal, users, aliases, user);
-                let id = id_for(id, b'k', &ids);
+                let id = keys.encode(id, &ids);
                 local[person as usize % SHARDS].push(Click {
                     time,
                     id,
@@ -923,11 +988,13 @@ pub fn read_clicks(
                     campaign,
                 });
             })?;
-            Ok::<_, anyhow::Error>(local)
+            Ok::<_, anyhow::Error>((local, keys))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut partitions = shards::<Vec<Vec<Click>>>();
-    for chunk in pieces {
+    let mut keys = Vec::with_capacity(pieces.len());
+    for (chunk, chunk_keys) in pieces {
+        keys.push(chunk_keys);
         for (partition, rows) in partitions.iter_mut().zip(chunk) {
             if !rows.is_empty() {
                 partition.push(rows);
@@ -939,7 +1006,7 @@ pub fn read_clicks(
         .into_par_iter()
         .map(|p| order_clicks(p, width))
         .collect();
-    Ok((clicks, ClickIds(ids.into_names())))
+    Ok((clicks, ClickIds::new(ids, keys)))
 }
 
 #[cfg(test)]
@@ -1005,11 +1072,35 @@ mod id_tests {
             .iter()
             .map(|value| id_for(value, b'k', &fallback))
             .collect();
-        let ids = ClickIds(fallback.into_names());
+        let ids = ClickIds::new(fallback, vec![]);
         for (i, a) in cases.iter().enumerate() {
             for (j, b) in cases.iter().enumerate() {
                 assert_eq!(ids.compare(codes[i], codes[j]), a.cmp(b));
                 assert_eq!(codes[i] == codes[j], a == b);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_clicks_preserve_byte_order_and_compare_equal_across_chunks() {
+        let cases: &[&[u8]] = &[
+            b"k", b"k000", b"k00000000", b"K00000000000000000000000000000000",
+            b"k00000000000000000000000000000000",
+            b"k00000000000000000000000000000001",
+            b"k00000000008000000000000000000001",
+            b"kffffffffffffffffffffffffffffffff",
+            b"k0000000000000000000000000000000A",
+            b"k000000000000000000000000000000010",
+        ];
+        let names = Names::default();
+        let mut chunks = [ClickKeyChunk::new(0), ClickKeyChunk::new(1)];
+        let left: Vec<_> = cases.iter().map(|s| chunks[0].encode(s, &names)).collect();
+        let right: Vec<_> = cases.iter().map(|s| chunks[1].encode(s, &names)).collect();
+        assert_eq!(chunks[0].hex.len(), 4);
+        let ids = ClickIds::new(names, chunks.into());
+        for (i, a) in cases.iter().enumerate() {
+            for (j, b) in cases.iter().enumerate() {
+                assert_eq!(ids.compare(left[i], right[j]), a.cmp(b));
             }
         }
     }
