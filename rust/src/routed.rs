@@ -9,6 +9,9 @@
 //! Packed records use a separate 16-byte lane and also write directly.
 //! `PERF_ROUTE_ARENA` controls later page-backed scans and is independent
 //! of the reader's writes.
+//! With `PERF_ROUTE_INPUT_PAGES=1`, both full and packed lanes write
+//! directly into 4 KiB pages. WRITES selects ordinary, batched, or streaming
+//! stores for these lanes. Native pages take priority over a slab.
 mod packed;
 mod storage;
 mod forward;
@@ -298,6 +301,14 @@ struct RawClick {
     chunk: u32,
 }
 
+// Each of these records consists entirely of initialized integers. Its size
+// equals the sum of its field widths, so byte-wise SIMD copies see no padding.
+const _:()=assert!(size_of::<RawClick>()==8*3+4*2&&size_of::<EventRow>()==8*2+4*2);
+unsafe impl storage::PageRecord for EventRow {}
+unsafe impl storage::PageRecord for RawClick {}
+unsafe impl storage::PageRecord for packed::ShortEvent {}
+unsafe impl storage::PageRecord for packed::ShortClick {}
+
 type Pieces<T> = Vec<Vec<T>>;
 
 #[derive(Default)]
@@ -365,11 +376,13 @@ struct Plan {
     forward_blocks: bool,
     chunk_group: usize,
     slab:bool,
+    input_pages:bool,
 }
 
 impl Plan {
     fn chunks_per_task(self, n:usize) -> usize {
-        self.chunk_group.min((n/(rayon::current_num_threads()*2)).max(1))
+        let target=if self.input_pages {self.chunk_group.max(16)} else {self.chunk_group};
+        target.min((n/(rayon::current_num_threads()*2)).max(1))
     }
     fn new(bytes: usize) -> Result<Self> {
         let event_parts = bytes.div_ceil(3 << 20).clamp(8, 2048).next_power_of_two();
@@ -396,6 +409,7 @@ impl Plan {
             forward_blocks: switch("PERF_ROUTE_FORWARD", "rows") == "blocks",
             chunk_group,
             slab:switch("PERF_ROUTE_SLAB","0")=="1",
+            input_pages:switch("PERF_ROUTE_INPUT_PAGES","0")=="1",
             overlap: switch("PERF_ROUTE_LINKS", "overlap") != "serial",
             p1: switch("PERF_ROUTE_P1", "1") != "0",
             early_clicks: switch("PERF_ROUTE_CLICKS", "late") == "early",
@@ -485,11 +499,48 @@ struct Fragment {
     prefix_len: u32,
     full: Vec<EventRow>,
     short: Vec<packed::ShortEvent>,
+    pages:NativeBlock<EventRow,packed::ShortEvent>,
+}
+
+struct NativeBlock<T:Copy,S:Copy> {
+    // Ordinary Vec/slab fragments need just one null pointer per fragment.
+    lanes:Option<Box<(Option<storage::Pages<T>>,Option<storage::Pages<S>>)>>,
+}
+
+impl<T:Copy,S:Copy> Default for NativeBlock<T,S> {
+    fn default()->Self {Self{lanes:None}}
+}
+
+impl<T:Copy,S:Copy> NativeBlock<T,S> {
+    fn new(full:Option<storage::Pages<T>>,short:Option<storage::Pages<S>>)->Self {
+        Self{lanes:if full.is_some()||short.is_some() {Some(Box::new((full,short)))}else{None}}
+    }
+    fn full(&self)->Option<&storage::Pages<T>> {self.lanes.as_deref()?.0.as_ref()}
+    fn short(&self)->Option<&storage::Pages<S>> {self.lanes.as_deref()?.1.as_ref()}
+    fn len(&self)->usize {self.full().map_or(0,|p|p.len())+self.narrow_len()}
+    fn narrow_len(&self)->usize {self.short().map_or(0,|p|p.len())}
+    fn capacity_bytes(&self)->usize {self.full().map_or(0,|p|p.capacity_bytes())+self.short().map_or(0,|p|p.capacity_bytes())}
+}
+
+struct NativeWriters<T:storage::PageRecord,S:storage::PageRecord> {
+    full:storage::InputWriter<T>,
+    short:Option<storage::InputWriter<S>>,
+}
+
+impl<T:storage::PageRecord,S:storage::PageRecord> NativeWriters<T,S> {
+    fn new(arena:&storage::Arena,parts:usize,plan:Plan)->Self {
+        Self {full:storage::InputWriter::new(arena,parts,plan.writes),
+              short:plan.packed.then(||storage::InputWriter::new(arena,parts,plan.writes))}
+    }
+    fn finish(self)->Vec<NativeBlock<T,S>> {
+        let mut short=self.short.map(storage::InputWriter::finish).unwrap_or_default().into_iter();
+        self.full.finish().into_iter().map(|full|NativeBlock::new(full,short.next().flatten())).collect()
+    }
 }
 
 impl Fragment {
     fn len(&self) -> usize {
-        self.full.len() + self.short.len()+self.prefix_len as usize
+        self.full.len() + self.short.len()+self.prefix_len as usize+self.pages.len()
     }
     fn rows<'a>(
         &'a self,
@@ -500,9 +551,10 @@ impl Fragment {
         let k = &keys[chunk as usize];
         let p = &payloads[chunk as usize];
         let (full,small)=k.prefixes(self.bucket as usize);
-        full.iter().chain(&self.full)
-            .copied()
-            .chain(small.iter().chain(&self.short).map(move |&s| s.unpack(k, p)))
+        full.iter().chain(&self.full).copied()
+            .chain(self.pages.full().into_iter().flat_map(|p|p.iter()))
+            .chain(small.iter().chain(&self.short).copied()
+                .chain(self.pages.short().into_iter().flat_map(|p|p.iter())).map(move |s| s.unpack(k, p)))
             .map(move |row| Candidate { row, chunk })
     }
 }
@@ -520,6 +572,8 @@ impl Rows {
                 let (full,short)=keys.prefixes(p.bucket as usize);
                 for row in full.iter().chain(&p.full) {emit(row.id);}
                 for row in short.iter().chain(&p.short) {emit(row.key(keys));}
+                if let Some(page)=p.pages.full() {for row in page.iter(){emit(row.id);}}
+                if let Some(page)=p.pages.short() {for row in page.iter(){emit(row.key(keys));}}
             },
             Self::Pages(p)=>p.iter().for_each(|c| emit(c.row.id)),
         }
@@ -554,14 +608,15 @@ fn event_winners(
     let groups=crate::csv::work_groups(&plans,plan.chunks_per_task(plans.len()),plan.event_parts*(bucket_header+stripe_padding));
     let chunks = groups.into_par_iter()
         .map(|sources| {
-            let mut sink = BucketWriter::new(plan.event_parts, plan.writes);
-            let mut narrow = if plan.packed {
+            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.event_parts,plan));
+            let mut sink = BucketWriter::new(if plan.input_pages {0} else {plan.event_parts}, plan.writes);
+            let mut narrow = if plan.packed && !plan.input_pages {
                 empty_buckets(plan.event_parts)
             } else {
                 Vec::new()
             };
             let (mut keys, mut data) = (EventKeys::default(), EventData::default());
-            let mut stripe=plan.slab.then(||{
+            let mut stripe=(plan.slab && !plan.input_pages).then(||{
                 // This reserve uses the same conservative byte density as
                 // the original scorer. Actual keys still determine all rows.
                 let bytes=sources.iter().map(Chunk::byte_len).sum::<usize>();
@@ -592,6 +647,7 @@ fn event_winners(
                 let bucket = hash(key) as usize & (plan.event_parts - 1);
                 if plan.packed {
                     if let Some(s) = packed::ShortEvent::pack(row) {
+                        if let Some(w)=&mut pages {w.short.as_mut().unwrap().push(bucket,s);return;}
                         if let Some(EventStripe::Short(slab))=&mut stripe {
                             if slab.push(bucket,s) {return;}
                         }
@@ -599,6 +655,7 @@ fn event_winners(
                         return;
                     }
                 }
+                if let Some(w)=&mut pages {w.full.push(bucket,row);return;}
                 if let Some(EventStripe::Full(slab))=&mut stripe {
                     if slab.push(bucket,row) {return;}
                 }
@@ -606,7 +663,7 @@ fn event_winners(
                 })?;
             }
             keys.stripe=stripe;
-            Ok::<_, anyhow::Error>((sink.finish(), narrow, keys, data, valid_count))
+            Ok::<_, anyhow::Error>((sink.finish(), narrow, pages.map(NativeWriters::finish).unwrap_or_default(),keys, data, valid_count))
         })
         .collect::<Result<Vec<_>>>()?;
     drop(other_ids);
@@ -618,7 +675,7 @@ fn event_winners(
     let mut work = Work::default();
     work.scan_time=exchange_start.duration_since(scan_start);
     work.scan_tasks=chunks.len();
-    for (i, (buckets, narrow, k, p, valid)) in chunks.into_iter().enumerate() {
+    for (i, (buckets, narrow, pages,k, p, valid)) in chunks.into_iter().enumerate() {
         let chunk = u32::try_from(i)?;
         work.valid += valid;
         work.wide_events += k.wide.len();
@@ -630,17 +687,21 @@ fn event_winners(
         }
         payloads.push(p);
         let mut narrow = narrow.into_iter();
-        for (part,(dest, full)) in pieces.iter_mut().zip(buckets).enumerate() {
+        let mut full=buckets.into_iter();
+        let mut pages=pages.into_iter();
+        for (part,dest) in pieces.iter_mut().enumerate() {
+            let full=full.next().unwrap_or_default();
+            let page=pages.next().unwrap_or_default();
             let short = narrow.next().unwrap_or_default();
             let (full_prefix,short_prefix)=k.prefixes(part);
             let prefix_len=u32::try_from(full_prefix.len()+short_prefix.len())?;
             work.stripe_rows+=prefix_len as usize;
-            work.parsed += full.len() + short.len()+prefix_len as usize;
-            work.packed_events += short.len()+short_prefix.len();
+            work.parsed += full.len() + short.len()+prefix_len as usize+page.len();
+            work.packed_events += short.len()+short_prefix.len()+page.narrow_len();
             work.event_capacity += full.capacity() * size_of::<EventRow>()
-                + short.capacity() * size_of::<packed::ShortEvent>();
-            if prefix_len!=0 || !(full.is_empty() && short.is_empty()) {
-                dest.push(Fragment { chunk, bucket:part as u16, prefix_len, full, short });
+                + short.capacity() * size_of::<packed::ShortEvent>()+page.capacity_bytes();
+            if page.len()!=0 || prefix_len!=0 || !(full.is_empty() && short.is_empty()) {
+                dest.push(Fragment { chunk, bucket:part as u16, prefix_len, full, short, pages:page });
             }
         }
         keys.push(k);
@@ -669,7 +730,7 @@ fn event_winners(
             // bitmap slots. Avoid allocating unreachable addresses.
             let reachable=1usize<<(30-plan.event_parts.trailing_zeros());
             let slots=n.saturating_mul(plan.factor).clamp(64,reachable).next_power_of_two();
-            let rows = if plan.arena {
+            let rows = if plan.arena && !plan.input_pages {
                 let all = pieces.iter().flat_map(|p| p.rows(&keys, &payloads));
                 Rows::Pages(arena.pack(all))
             } else {
@@ -777,6 +838,18 @@ struct ClickBlock {
     chunk: u32,
     full: Vec<RawClick>,
     short: Vec<packed::ShortClick>,
+    pages:NativeBlock<RawClick,packed::ShortClick>,
+}
+
+impl ClickBlock {
+    fn decoded(self,base:i64,wide:&[[u64;2]])->impl Iterator<Item=RawClick> + '_ {
+        let chunk=self.chunk;
+        let (full,short)=self.pages.lanes.map(|p|*p).unwrap_or_default();
+        self.full.into_iter()
+            .chain(full.into_iter().flatten())
+            .chain(self.short.into_iter().chain(short.into_iter().flatten())
+                .map(move |c|c.unpack(chunk,base,wide)))
+    }
 }
 
 struct ClickInput {
@@ -792,6 +865,7 @@ fn raw_clicks(
     window: Window,
     dimensions: &Dimensions,
     raw_users: &Names,
+    arena:&storage::Arena,
 ) -> Result<ClickInput> {
     let fallback = Names::default();
     let calendar = Calendar::new(window);
@@ -802,8 +876,9 @@ fn raw_clicks(
     let pieces = groups.into_par_iter()
         .enumerate()
         .map(|(i, sources)| {
-            let mut output: Pieces<RawClick> = empty_buckets(plan.user_parts);
-            let mut narrow = if plan.packed {
+            let mut pages=plan.input_pages.then(||NativeWriters::new(arena,plan.user_parts,plan));
+            let mut output: Pieces<RawClick> = if plan.input_pages { Vec::new() } else {empty_buckets(plan.user_parts)};
+            let mut narrow = if plan.packed && !plan.input_pages {
                 empty_buckets(plan.user_parts)
             } else {
                 Vec::new()
@@ -837,37 +912,45 @@ fn raw_clicks(
                         )
                     });
                     if let Some(c) = compact {
-                        narrow[part].push(c);
+                        if let Some(w)=&mut pages {w.short.as_mut().unwrap().push(part,c);}
+                        else {narrow[part].push(c);}
                         return;
                     }
                 }
                 let id = encoded.unwrap_or_else(|| ids.encode(id, &fallback));
-                output[part].push(RawClick {
+                let row=RawClick {
                     user,
                     time,
                     id,
                     campaign,
                     chunk: chunk_id,
-                });
+                };
+                if let Some(w)=&mut pages {w.full.push(part,row);}
+                else {output[part].push(row);}
                 })?;
             }
-            Ok::<_, anyhow::Error>((output, narrow, users, ids))
+            Ok::<_, anyhow::Error>((output, narrow, pages.map(NativeWriters::finish).unwrap_or_default(),users, ids))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut partitions: Vec<Vec<ClickBlock>> = empty_buckets(plan.user_parts);
     let mut users = Vec::with_capacity(pieces.len());
     let mut ids = Vec::with_capacity(pieces.len());
-    for (i, (out, narrow, u, k)) in pieces.into_iter().enumerate() {
+    for (i, (out, narrow, pages,u, k)) in pieces.into_iter().enumerate() {
         users.push(u);
         ids.push(k);
         let mut narrow = narrow.into_iter();
-        for (dest, full) in partitions.iter_mut().zip(out) {
+        let mut full=out.into_iter();
+        let mut pages=pages.into_iter();
+        for dest in &mut partitions {
+            let full=full.next().unwrap_or_default();
+            let page=pages.next().unwrap_or_default();
             let short = narrow.next().unwrap_or_default();
-            if !(full.is_empty() && short.is_empty()) {
+            if page.len()!=0 || !(full.is_empty() && short.is_empty()) {
                 dest.push(ClickBlock {
                     chunk: i as u32,
                     full,
                     short,
+                    pages:page,
                 });
             }
         }
@@ -1179,7 +1262,7 @@ fn first_pass(
 ) -> P1 {
     let start = Instant::now();
     let cap=if plan.flat {
-        let rows=events.iter().map(Vec::len).sum::<usize>()+clicks.iter().map(|c|c.full.len()+c.short.len()).sum::<usize>();
+        let rows=events.iter().map(Vec::len).sum::<usize>()+clicks.iter().map(|c|c.full.len()+c.short.len()+c.pages.len()).sum::<usize>();
         (rows/8).clamp(128,32768).next_power_of_two()
     } else {0};
     let mut ids = Resolver {
@@ -1231,14 +1314,9 @@ fn first_pass(
     let decoded = clicks.into_iter().flat_map(|block| {
         let chunk = block.chunk;
         let wide = &click_users[chunk as usize];
-        block.full.into_iter().chain(
-            block
-                .short
-                .into_iter()
-                .map(move |s| s.unpack(chunk, base, wide)),
-        )
+        block.decoded(base,wide)
     });
-    if plan.arena {
+    if plan.arena && !plan.input_pages {
         arena.pack(decoded).iter().for_each(accept_click);
     } else {
         decoded.for_each(&mut accept_click);
@@ -1339,7 +1417,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
     let read_data = || -> Result<_> {
         let users = Names::default();
         let events = || event_winners(tasks, plan, window, dimensions, &users, &arena);
-        let clicks = || raw_clicks(data, plan, window, dimensions, &users);
+        let clicks = || raw_clicks(data, plan, window, dimensions, &users,&arena);
         let (winners, clicks) = if plan.early_clicks {
             let (ev, cl) = rayon::join(events, clicks);
             (ev?, cl?)
@@ -1372,7 +1450,7 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             .iter()
             .flatten()
             .fold((0usize, 0usize), |(total, small), c| {
-                (total + c.full.len() + c.short.len(), small + c.short.len())
+                (total + c.full.len() + c.short.len()+c.pages.len(), small + c.short.len()+c.pages.narrow_len())
             })
     } else {
         (0, 0)
@@ -1445,6 +1523,8 @@ pub fn run(data: &Path, window: Window, dimensions: &Dimensions) -> Result<Route
             "stage":"route_storage","exact_duplicate_rows":work.real_duplicates,"linear_probes":work.linear_probes,
             "arena_2mib_regions":arena.stats.regions.load(Relaxed),"arena_pages_claimed":arena.stats.pages.load(Relaxed),
             "arena_pages_reused":arena.stats.reused.load(Relaxed),"bitmap_slots_per_row":plan.factor,
+            "native_reader_pages":arena.stats.input_pages.load(Relaxed),"native_reader_bytes":arena.stats.input_bytes.load(Relaxed),
+            "native_stream_store_bytes":arena.stats.streaming_bytes.load(Relaxed),
             "packed_events":work.packed_events,"packed_clicks":packed_clicks,
             "event_scan_s":work.scan_time.as_secs_f64(),"event_exchange_s":work.exchange_time.as_secs_f64(),
             "event_winner_route_s":work.winner_time.as_secs_f64(),"click_scan_route_s":click_time.as_secs_f64(),
