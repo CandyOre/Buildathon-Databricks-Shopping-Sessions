@@ -104,6 +104,17 @@ pub fn sessionize(batch: Batch<Event>) -> SessionBatch {
 const SESSION_GAP: u32 = 1_800_000;
 
 #[cfg(feature = "large-input")]
+fn purchase_bins() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PERF_PURCHASE_BINS").is_none_or(|v| v != "0"))
+}
+
+fn use_radix_time_sort() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PERF_TIME_SORT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(feature = "large-input")]
 #[derive(Clone, Copy)]
 struct TimeBin {
     first: u32,
@@ -139,12 +150,15 @@ fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec
     positions.clear();
     let mut count = 0usize;
     let mut previous = 0;
-    for bin in bins.iter().filter(|bin| bin.count != 0) {
+    for bin in bins.iter_mut().filter(|bin| bin.count != 0) {
         if count == 0 || bin.first - previous > SESSION_GAP {
             positions.push(count);
             times[count] = bin.first;
         }
         count += bin.count as usize;
+        // Every purchase is an event. Its populated bin can reuse this
+        // counter as the exact session index after the prefix pass.
+        bin.count = (positions.len() - 1) as u32;
         previous = bin.last;
     }
     positions.push(count);
@@ -152,6 +166,53 @@ fn binned_starts(times: &mut [u32], bins: &mut Vec<TimeBin>, positions: &mut Vec
 }
 
 fn sorted_time_offsets(values: &mut [u32], scratch: &mut Vec<u32>) {
+    if use_radix_time_sort() {
+        if values.len() <= 16 {
+            for i in 1..values.len() {
+                let v = values[i];
+                let mut j = i;
+                while j != 0 && v < values[j - 1] {
+                    values[j] = values[j - 1];
+                    j -= 1;
+                }
+                values[j] = v;
+            }
+            return;
+        }
+        if values.len() >= 2048 {
+            let first = values[0];
+            let changed = values.iter().fold(0, |changed, &x| changed | (first ^ x));
+            scratch.resize(values.len(), 0);
+            let mut in_scratch = false;
+            for shift in [0, 8, 16, 24] {
+                if (changed >> shift) & 255 == 0 {
+                    continue;
+                }
+                let (source, dest) = if in_scratch {
+                    (&scratch[..], &mut values[..])
+                } else {
+                    (&values[..], &mut scratch[..])
+                };
+                let bucket = |x: u32| ((x >> shift) & 255) as usize;
+                let mut heads = [0usize; 256];
+                for &x in source { heads[bucket(x)] += 1; }
+                let mut total = 0;
+                for head in &mut heads {
+                    let n = *head;
+                    *head = total;
+                    total += n;
+                }
+                for &x in source {
+                    let head = &mut heads[bucket(x)];
+                    dest[*head] = x;
+                    *head += 1;
+                }
+                in_scratch = !in_scratch;
+            }
+            if in_scratch { values.copy_from_slice(scratch); }
+            return;
+        }
+    }
     if values.len() < 2048 {
         values.sort_unstable();
         return;
@@ -280,6 +341,28 @@ pub fn compact_sessions(
     sales: &mut [(u32, crate::records::Purchase)],
     ends: Vec<(u32, u32)>,
 ) -> SessionBatch {
+    compact_for_people(start, times, sales, ends, |index| {
+        (index * crate::input::SHARDS + shard) as u32
+    })
+}
+
+pub(crate) fn compact_named_sessions(
+    start: i64,
+    times: &mut [u32],
+    sales: &mut [(u32, crate::records::Purchase)],
+    ends: Vec<(u32, u32)>,
+    people: &[u32],
+) -> SessionBatch {
+    compact_for_people(start, times, sales, ends, |index| people[index])
+}
+
+fn compact_for_people(
+    start: i64,
+    times: &mut [u32],
+    sales: &mut [(u32, crate::records::Purchase)],
+    ends: Vec<(u32, u32)>,
+    person_at: impl Fn(usize) -> u32,
+) -> SessionBatch {
     let mut daily = DailyColumns::default();
     let mut sessions = Vec::new();
     let mut starts_at = Vec::new();
@@ -311,13 +394,19 @@ pub fn compact_sessions(
             heads.resize(count, 0_u32);
             next_purchase.clear();
             for &(time, _) in purchases {
-                // The sale is itself an event, so its owning session always exists.
-                let s = starts_at[..count].partition_point(|&pos| local[pos] <= time) - 1;
+                #[cfg(feature = "large-input")]
+                let bin = if binned && purchase_bins() {
+                    Some(time_bins[(time / SESSION_GAP) as usize].count as usize)
+                } else { None };
+                #[cfg(not(feature = "large-input"))]
+                let bin: Option<usize> = None;
+                let s = bin.unwrap_or_else(||
+                    starts_at[..count].partition_point(|&pos| local[pos] <= time) - 1);
                 next_purchase.push(heads[s]);
                 heads[s] = next_purchase.len() as u32;
             }
         }
-        let person = (index * crate::input::SHARDS + shard) as u32;
+        let person = person_at(index);
         let mut row = UserDay {
             person,
             ..UserDay::default()
